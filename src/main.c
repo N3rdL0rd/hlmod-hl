@@ -123,6 +123,43 @@ void hlmod_register_hook(int findex, PyObject* callback) {
     entry->callback = callback;
 }
 
+static PyObject* hlmod_py_register_hook(PyObject *self, PyObject *args) {
+    int findex;
+    PyObject* callback;
+
+	// int, PyObject*
+    if (!PyArg_ParseTuple(args, "iO", &findex, &callback)) {
+        return NULL;
+    }
+
+    if (!PyCallable_Check(callback)) {
+        PyErr_SetString(PyExc_TypeError, "Second argument must be a Callable!");
+        return NULL;
+    }
+
+    hlmod_register_hook(findex, callback);
+
+    Py_RETURN_NONE;
+}
+
+static PyMethodDef HlmodMethods[] = {
+    // { Python-visible Name, C Function Pointer, Argument Type, Docstring }
+    {"register_hook", hlmod_py_register_hook, METH_VARARGS, "Hooks a function by its findex."},
+    
+    {NULL, NULL, 0, NULL}
+};
+static struct PyModuleDef hlmod_module_def = {
+    PyModuleDef_HEAD_INIT,
+    "hlmod",                        // The name of the module in Python
+    "Low-level hlmod framework API.", // Module's docstring
+    -1,
+    HlmodMethods                    // Link to the method table
+};
+PyMODINIT_FUNC PyInit_hlmod(void) {
+    return PyModule_Create(&hlmod_module_def);
+}
+
+
 const char *g_sorter_script =
     "import os\n"
     "import ast\n"
@@ -152,24 +189,34 @@ const char *g_sorter_script =
     "                    'dependencies': set(info['dependencies'])\n"
     "                }\n"
     "\n"
-    "    graph = {mod_id: set(data['dependencies']) for mod_id, data in mods.items()}\n"
-    "    in_degree = {mod_id: 0 for mod_id in graph}\n"
-    "    for mod_id, deps in graph.items():\n"
-    "        for dep_id in deps:\n"
+    "    # --- TOPOLOGICAL SORT (Kahn's Algorithm) --- \n"
+    "    # Create a reverse graph to find who depends on whom\n"
+    "    reverse_graph = {mod_id: set() for mod_id in mods}\n"
+    "    in_degree = {}\n"
+    "\n"
+    "    for mod_id, data in mods.items():\n"
+    "        # The in-degree is simply the number of dependencies a mod has.\n"
+    "        in_degree[mod_id] = len(data['dependencies'])\n"
+    "        for dep_id in data['dependencies']:\n"
     "            if dep_id not in mods:\n"
     "                return {'status': 'error', 'message': f'Mod \\'{mod_id}\\' has an unmet dependency: \\'{dep_id}\\' '}\n"
-    "            in_degree[dep_id] += 1\n"
+    "            # Add an edge from the dependency to the current mod\n"
+    "            reverse_graph[dep_id].add(mod_id)\n"
     "\n"
+    "    # Queue of all nodes with no dependencies (in-degree of 0)\n"
     "    queue = deque([mod_id for mod_id, degree in in_degree.items() if degree == 0])\n"
+    "    \n"
     "    sorted_order = []\n"
     "    while queue:\n"
     "        mod_id = queue.popleft()\n"
     "        sorted_order.append({'id': mod_id, 'filepath': mods[mod_id]['filepath']})\n"
-    "        for other_mod_id, other_deps in graph.items():\n"
-    "            if mod_id in other_deps:\n"
-    "                in_degree[other_mod_id] -= 1\n"
-    "                if in_degree[other_mod_id] == 0:\n"
-    "                    queue.append(other_mod_id)\n"
+    "        \n"
+    "        # For each mod that depended on the one we just processed...\n"
+    "        for dependent_mod_id in reverse_graph[mod_id]:\n"
+    "            # ...decrement its in-degree.\n"
+    "            in_degree[dependent_mod_id] -= 1\n"
+    "            if in_degree[dependent_mod_id] == 0:\n"
+    "                queue.append(dependent_mod_id)\n"
     "\n"
     "    if len(sorted_order) == len(mods):\n"
     "        return {'status': 'ok', 'order': sorted_order}\n"
@@ -357,6 +404,10 @@ int wmain(int argc, pchar *argv[]) {
 #else
 int main(int argc, pchar *argv[]) {
 #endif
+	if (PyImport_AppendInittab("hlmod", PyInit_hlmod) == -1) {
+        fprintf(stderr, "Fatal Error: Could not add 'hlmod' to the built-in module table\n");
+        return 1;
+    }
 	Py_InitializeEx(1);
     if (!Py_IsInitialized()) {
         fprintf(stderr, "Error: Could not initialize Python interpreter\n");

@@ -1637,7 +1637,11 @@ void jit_dispatch_hook(int findex, void *frame_pointer) {
     HASH_FIND_INT(g_hook_registry, &findex, entry);
 
     if (entry != NULL) {
-        // TODO call hook
+        PyObject* pResult = PyObject_CallObject(entry->callback, NULL);
+
+		if (pResult == NULL) {
+			PyErr_Print();
+		}
     }
 }
 
