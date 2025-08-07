@@ -170,6 +170,8 @@ set_target_properties(libhl
 )
 
 if (WITH_VM)
+    find_package(Python COMPONENTS Interpreter Development REQUIRED)
+
     add_executable(hl
         src/code.c
         src/jit.c
@@ -182,9 +184,10 @@ if (WITH_VM)
     if (UNIX AND NOT APPLE)
         set_target_properties(hl PROPERTIES INSTALL_RPATH "$ORIGIN;${CMAKE_INSTALL_PREFIX}/lib")
     endif()
-
-    target_link_libraries(hl libhl)
-
+          
+    target_link_libraries(hl libhl Python::Python)  
+    target_include_directories(hl PRIVATE ${Python_INCLUDE_DIRS})
+    
     if (WIN32)
         target_link_libraries(hl user32)
     endif()
