@@ -34,6 +34,10 @@
 #	define JIT_DEBUG
 #endif
 
+#include <Python.h>
+#include <hlmod_hooks.h>
+
+
 typedef enum {
 	Eax = 0,
 	Ecx = 1,
@@ -272,6 +276,8 @@ static const int RCPU_SCRATCH_REGS[] = { Eax, Ecx, Edx };
 
 static preg _unused = { RUNUSED, 0, 0, NULL };
 static preg *UNUSED = &_unused;
+
+void jit_dispatch_hook(int findex, void *args);
 
 struct jit_ctx {
 	union {
@@ -1569,10 +1575,70 @@ static void op_call_fun( jit_ctx *ctx, vreg *dst, int findex, int count, int *ar
 }
 
 static void op_enter( jit_ctx *ctx ) {
-	preg p;
-	op64(ctx, PUSH, PEBP, UNUSED);
-	op64(ctx, MOV, PEBP, PESP);
-	if( ctx->totalRegsSize ) op64(ctx, SUB, PESP, pconst(&p,ctx->totalRegsSize));
+    preg p;
+    op64(ctx, PUSH, PEBP, UNUSED);
+    op64(ctx, MOV, PEBP, PESP);
+    if( ctx->totalRegsSize ) op64(ctx, SUB, PESP, pconst(&p,ctx->totalRegsSize));
+
+#if defined(HL_64) && !defined(HL_VCC) // For Linux/macOS x64
+    // 1. Save all caller-saved registers that might be modified by our C call.
+    op64(ctx, PUSH, PEAX, UNUSED);
+    op64(ctx, PUSH, REG_AT(Ecx), UNUSED);
+    op64(ctx, PUSH, REG_AT(Edx), UNUSED);
+    op64(ctx, PUSH, REG_AT(Esi), UNUSED);
+    op64(ctx, PUSH, REG_AT(Edi), UNUSED);
+    op64(ctx, PUSH, REG_AT(R8), UNUSED);
+    op64(ctx, PUSH, REG_AT(R9), UNUSED);
+    op64(ctx, PUSH, REG_AT(R10), UNUSED);
+    op64(ctx, PUSH, REG_AT(R11), UNUSED);
+
+    // 2. Align the stack to a 16-byte boundary. We pushed 9 registers (72 bytes),
+    // so we need to subtract 8 more bytes to make the stack aligned.
+    op64(ctx, SUB, PESP, pconst(&p, 8));
+
+    // 3. Set up the arguments for our C function: jit_dispatch_hook(findex, ebp)
+    //    Arg 1 (goes in RDI): the function index.
+    op64(ctx, MOV, REG_AT(Edi), pconst64(&p, (int_val)ctx->f->findex));
+    //    Arg 2 (goes in RSI): the frame pointer.
+    op64(ctx, MOV, REG_AT(Esi), PEBP);
+
+    // 4. Make the direct call to our C function.
+    //    We load the absolute address into a temporary register (RAX) and call it.
+    op64(ctx, MOV, PEAX, pconst64(&p, (int_val)jit_dispatch_hook));
+    op_call(ctx, PEAX, -1); // The -1 tells op_call not to touch the stack pointer.
+
+    // 5. Restore the stack pointer after the call.
+    op64(ctx, ADD, PESP, pconst(&p, 8));
+
+    // 6. Restore all saved registers in reverse order.
+    op64(ctx, POP, REG_AT(R11), UNUSED);
+    op64(ctx, POP, REG_AT(R10), UNUSED);
+    op64(ctx, POP, REG_AT(R9), UNUSED);
+    op64(ctx, POP, REG_AT(R8), UNUSED);
+    op64(ctx, POP, REG_AT(Edi), UNUSED);
+    op64(ctx, POP, REG_AT(Esi), UNUSED);
+    op64(ctx, POP, REG_AT(Edx), UNUSED);
+    op64(ctx, POP, REG_AT(Ecx), UNUSED);
+    op64(ctx, POP, PEAX, UNUSED);
+
+#else // For Windows or 32-bit builds
+    op64(ctx, PUSH, PEAX, UNUSED); // Save return register
+    int size = begin_native_call(ctx, 2);
+    set_native_arg(ctx, PEBP);
+    set_native_arg(ctx, pconst(&p, ctx->f->findex));
+    call_native(ctx, jit_dispatch_hook, size);
+    op64(ctx, POP, PEAX, UNUSED);  // Restore return register
+#endif
+}
+
+void jit_dispatch_hook(int findex, void *frame_pointer) {
+    HookRegistryEntry* entry;
+
+    HASH_FIND_INT(g_hook_registry, &findex, entry);
+
+    if (entry != NULL) {
+        // TODO call hook
+    }
 }
 
 static void op_ret( jit_ctx *ctx, vreg *r ) {

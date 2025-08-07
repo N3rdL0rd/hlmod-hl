@@ -24,6 +24,7 @@
 #include "hlsystem.h"
 
 #include <Python.h>
+#include <hlmod_hooks.h>
 
 #ifdef HL_WIN
 #	include <locale.h>
@@ -104,6 +105,22 @@ static bool check_reload( main_context *m ) {
 	m->file_time = time;
 	hl_code_free(code);
 	return changed;
+}
+
+HookRegistryEntry* g_hook_registry = NULL;
+
+void hlmod_register_hook(int findex, PyObject* callback) {
+    HookRegistryEntry* entry;
+    HASH_FIND_INT(g_hook_registry, &findex, entry);
+    if (entry == NULL) {
+        entry = (HookRegistryEntry*)malloc(sizeof(HookRegistryEntry));
+        entry->findex = findex;
+        HASH_ADD_INT(g_hook_registry, findex, entry);
+    } else {
+        Py_DECREF(entry->callback);
+    }
+    Py_INCREF(callback);
+    entry->callback = callback;
 }
 
 const char *g_sorter_script =
