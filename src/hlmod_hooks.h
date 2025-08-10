@@ -3,6 +3,8 @@
 
 #include <Python.h>
 #include "uthash.h"
+#include <hl.h>
+#include <hlmodule.h>
 
 typedef struct HookRegistryEntry {
     int findex;         // fIndex to hook
@@ -11,6 +13,7 @@ typedef struct HookRegistryEntry {
 } HookRegistryEntry;
 
 extern HookRegistryEntry* g_hook_registry;
+extern hl_module *g_runtime_module;
 
 void hlmod_register_hook(int findex, PyObject* callback);
 

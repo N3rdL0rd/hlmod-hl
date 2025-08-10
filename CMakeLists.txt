@@ -179,6 +179,7 @@ if (WITH_VM)
         src/module.c
         src/debugger.c
         src/profile.c
+        src/hlmod.c
     )
 
     if (UNIX AND NOT APPLE)
