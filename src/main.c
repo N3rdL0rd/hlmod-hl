@@ -326,18 +326,19 @@ void load_mod(const char* module_name) {
 
     if (pModule != NULL) {
         pFunc = PyObject_GetAttrString(pModule, "initialize");
-        if (pFunc && PyCallable_Check(pFunc)) {
-            pValue = PyObject_CallObject(pFunc, NULL);
-            if (pValue == NULL) {
-                fprintf(stderr, "      [!] Error calling initialize() in mod '%s'\n", module_name);
-                PyErr_Print();
+        if (pFunc) {
+            if (PyCallable_Check(pFunc)) {
+                pValue = PyObject_CallObject(pFunc, NULL);
+                if (pValue == NULL) {
+                    fprintf(stderr, "      [!] Error calling initialize() in mod '%s'\n", module_name);
+                    PyErr_Print();
+                }
+                Py_XDECREF(pValue);
             }
-            Py_XDECREF(pValue);
+            Py_XDECREF(pFunc);
         } else {
-            if (PyErr_Occurred()) PyErr_Print();
-            fprintf(stderr, "      [!] Error: Cannot find function 'initialize' in mod '%s'\n", module_name);
+            PyErr_Clear();
         }
-        Py_XDECREF(pFunc);
         Py_DECREF(pModule);
     } else {
         PyErr_Print();
@@ -475,15 +476,10 @@ int main(int argc, pchar *argv[]) {
 		return 2;
 	if( !hl_module_init(ctx.m,hot_reload,vtune_later) )
 		return 3;
-	if( hot_reload ) {
-		ctx.file_time = pfiletime(ctx.file);
-		hl_setup_reload_check(check_reload,&ctx);
-	}
+
+    g_runtime_module = ctx.m; // Make the module available to hooks
+
 	hl_code_free(ctx.code);
-	if( debug_port > 0 && !hl_module_debug(ctx.m,debug_port,debug_wait) ) {
-		fprintf(stderr,"Could not start debugger on port %d\n",debug_port);
-		return 4;
-	}
 
 	printf("[hlmod] Initializing mods...\n");
     const char* mods_directory = "./mods";

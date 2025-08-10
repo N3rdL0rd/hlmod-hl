@@ -36,7 +36,9 @@
 
 #include <Python.h>
 #include <hlmod_hooks.h>
+#include <hlmod.h>
 
+hl_module *g_runtime_module = NULL;
 
 typedef enum {
 	Eax = 0,
@@ -1579,70 +1581,6 @@ static void op_enter( jit_ctx *ctx ) {
     op64(ctx, PUSH, PEBP, UNUSED);
     op64(ctx, MOV, PEBP, PESP);
     if( ctx->totalRegsSize ) op64(ctx, SUB, PESP, pconst(&p,ctx->totalRegsSize));
-
-#if defined(HL_64) && !defined(HL_VCC) // For Linux/macOS x64
-    // 1. Save all caller-saved registers that might be modified by our C call.
-    op64(ctx, PUSH, PEAX, UNUSED);
-    op64(ctx, PUSH, REG_AT(Ecx), UNUSED);
-    op64(ctx, PUSH, REG_AT(Edx), UNUSED);
-    op64(ctx, PUSH, REG_AT(Esi), UNUSED);
-    op64(ctx, PUSH, REG_AT(Edi), UNUSED);
-    op64(ctx, PUSH, REG_AT(R8), UNUSED);
-    op64(ctx, PUSH, REG_AT(R9), UNUSED);
-    op64(ctx, PUSH, REG_AT(R10), UNUSED);
-    op64(ctx, PUSH, REG_AT(R11), UNUSED);
-
-    // 2. Align the stack to a 16-byte boundary. We pushed 9 registers (72 bytes),
-    // so we need to subtract 8 more bytes to make the stack aligned.
-    op64(ctx, SUB, PESP, pconst(&p, 8));
-
-    // 3. Set up the arguments for our C function: jit_dispatch_hook(findex, ebp)
-    //    Arg 1 (goes in RDI): the function index.
-    op64(ctx, MOV, REG_AT(Edi), pconst64(&p, (int_val)ctx->f->findex));
-    //    Arg 2 (goes in RSI): the frame pointer.
-    op64(ctx, MOV, REG_AT(Esi), PEBP);
-
-    // 4. Make the direct call to our C function.
-    //    We load the absolute address into a temporary register (RAX) and call it.
-    op64(ctx, MOV, PEAX, pconst64(&p, (int_val)jit_dispatch_hook));
-    op_call(ctx, PEAX, -1); // The -1 tells op_call not to touch the stack pointer.
-
-    // 5. Restore the stack pointer after the call.
-    op64(ctx, ADD, PESP, pconst(&p, 8));
-
-    // 6. Restore all saved registers in reverse order.
-    op64(ctx, POP, REG_AT(R11), UNUSED);
-    op64(ctx, POP, REG_AT(R10), UNUSED);
-    op64(ctx, POP, REG_AT(R9), UNUSED);
-    op64(ctx, POP, REG_AT(R8), UNUSED);
-    op64(ctx, POP, REG_AT(Edi), UNUSED);
-    op64(ctx, POP, REG_AT(Esi), UNUSED);
-    op64(ctx, POP, REG_AT(Edx), UNUSED);
-    op64(ctx, POP, REG_AT(Ecx), UNUSED);
-    op64(ctx, POP, PEAX, UNUSED);
-
-#else // For Windows or 32-bit builds
-    op64(ctx, PUSH, PEAX, UNUSED); // Save return register
-    int size = begin_native_call(ctx, 2);
-    set_native_arg(ctx, PEBP);
-    set_native_arg(ctx, pconst(&p, ctx->f->findex));
-    call_native(ctx, jit_dispatch_hook, size);
-    op64(ctx, POP, PEAX, UNUSED);  // Restore return register
-#endif
-}
-
-void jit_dispatch_hook(int findex, void *frame_pointer) {
-    HookRegistryEntry* entry;
-
-    HASH_FIND_INT(g_hook_registry, &findex, entry);
-
-    if (entry != NULL) {
-        PyObject* pResult = PyObject_CallObject(entry->callback, NULL);
-
-		if (pResult == NULL) {
-			PyErr_Print();
-		}
-    }
 }
 
 static void op_ret( jit_ctx *ctx, vreg *r ) {
@@ -3004,6 +2942,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 	size += hl_pad_size(size,&hlt_dyn); // align on word size
 #	endif
 	ctx->totalRegsSize = size;
+
 	jit_buf(ctx);
 	ctx->functionPos = BUF_POS();
 	// make sure currentPos is > 0 before any reg allocations happen
@@ -3030,6 +2969,89 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 		debug16[0] = (unsigned short)(BUF_POS() - codePos);
 	}
 	ctx->opsPos[0] = BUF_POS();
+
+
+	// Only inject the hook if the function has arguments and a hook is registered.
+	// You might want to pre-calculate this for performance. For now, we always inject.
+	if (nargs > 0) {
+		// --- START OF DYNAMIC HOOK INJECTION ---
+
+		// 1. FLUSH JIT STATE & CACHE
+		// This is critical to prevent state corruption from the C call.
+		for(i = 0; i < REG_COUNT; i++) {
+			preg *p_reg = REG_AT(i);
+			if (p_reg->holds) store(ctx, p_reg->holds, p_reg, false);
+		}
+		discard_regs(ctx, false);
+
+		// 2. SAVE MACHINE STATE (ABI COMPLIANCE)
+		// Save all registers that our C hook might clobber.
+		op64(ctx, PUSH, PEAX, UNUSED);
+		op64(ctx, PUSH, REG_AT(Ecx), UNUSED);
+		op64(ctx, PUSH, REG_AT(Edx), UNUSED);
+		op64(ctx, PUSH, REG_AT(Esi), UNUSED);
+		op64(ctx, PUSH, REG_AT(Edi), UNUSED);
+		op64(ctx, PUSH, REG_AT(R8), UNUSED);
+		op64(ctx, PUSH, REG_AT(R9), UNUSED);
+		op64(ctx, PUSH, REG_AT(R10), UNUSED);
+		op64(ctx, PUSH, REG_AT(R11), UNUSED);
+		// Note: XMM registers are not needed here since our hook doesn't use floats.
+
+		// 3. ALLOCATE SPACE ON STACK FOR THE `void** args` ARRAY
+		// The size must be a multiple of 16 for stack alignment before the CALL.
+		int args_array_size = nargs * sizeof(void*);
+		int stack_alloc_size = (args_array_size + 15) & ~15;
+		op64(ctx, SUB, PESP, pconst(&p, stack_alloc_size));
+
+		// 4. POPULATE THE `void** args` ARRAY
+		// We will use R11 as a pointer to our new array on the stack.
+		op64(ctx, LEA, REG_AT(R11), pmem(&p, Esp, 0)); // R11 now points to the start of our array.
+
+		for(i = 0; i < nargs; i++) {
+			vreg *arg_vreg = R(i);
+			int stack_offset = arg_vreg->stackPos;
+
+			// Use RAX as a temporary register to hold the address of the argument.
+			// LEA: Load Effective Address of the argument's stack slot into RAX.
+			op64(ctx, LEA, PEAX, pmem(&p, Ebp, stack_offset));
+
+			// MOV [R11 + i*8], RAX
+			// Store the pointer from RAX into the i-th slot of our args array.
+			op64(ctx, MOV, pmem(&p, R11, i * sizeof(void*)), PEAX);
+		}
+
+		// 5. SET UP ARGUMENTS FOR THE C HOOK CALL & ABI COMPLIANCE
+		op64(ctx, MOV, REG_AT(Edi), pconst64(&p, (int_val)ctx->f->findex));
+		op64(ctx, MOV, REG_AT(Esi), pconst64(&p, (int_val)nargs));
+		op64(ctx, MOV, REG_AT(Edx), REG_AT(R11));
+
+		// Zero out RAX for variadic function ABI compliance.
+		op64(ctx, XOR, PEAX, PEAX);
+
+		// 6. CALL THE HOOK
+		// Load the function address into R10, not RAX.
+		op64(ctx, MOV, REG_AT(R10), pconst64(&p, (int_val)hlmod_dispatch_hook));
+		op_call(ctx, REG_AT(R10), -1); // Call the address in R10.
+
+		// 7. CLEAN UP THE STACK
+		// Deallocate the space we used for the void** array.
+		op64(ctx, ADD, PESP, pconst(&p, stack_alloc_size));
+		
+		// 8. RESTORE MACHINE STATE
+		// Pop registers in reverse order.
+		op64(ctx, POP, REG_AT(R11), UNUSED);
+		op64(ctx, POP, REG_AT(R10), UNUSED);
+		op64(ctx, POP, REG_AT(R9), UNUSED);
+		op64(ctx, POP, REG_AT(R8), UNUSED);
+		op64(ctx, POP, REG_AT(Edi), UNUSED);
+		op64(ctx, POP, REG_AT(Esi), UNUSED);
+		op64(ctx, POP, REG_AT(Edx), UNUSED);
+		op64(ctx, POP, REG_AT(Ecx), UNUSED);
+		op64(ctx, POP, PEAX, UNUSED);
+
+		// --- END OF DYNAMIC HOOK INJECTION ---
+	}
+
 
 	for(opCount=0;opCount<f->nops;opCount++) {
 		int jump;
