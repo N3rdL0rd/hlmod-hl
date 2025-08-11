@@ -93,7 +93,7 @@ PyObject* hlmod_cast_to_py(hl_type* type, void* ptr) {
         Py_RETURN_NONE;
     }
     if (type == NULL) {
-        fprintf(stderr, "[hlmod] [ERROR] Received NULL type in cast function.\n");
+        fprintf(stderr, "[hlmod] [ERROR] [hl->py] Received NULL type in cast function.\n");
         Py_RETURN_NONE;
     }
 
@@ -116,7 +116,7 @@ PyObject* hlmod_cast_to_py(hl_type* type, void* ptr) {
             // then we can create apis on the python side in modcore to work with obj values transparently
     }
 
-    // Default fallback
+    printf("[hlmod] [ERROR] [hl->py] Something goofed!\n");
     Py_RETURN_NONE;
 }
 
@@ -127,7 +127,7 @@ void* hlmod_cast_to_hl(PyObject* obj, hl_type* type) {
     }
 
     if (type == NULL) {
-        fprintf(stderr, "[hlmod] [ERROR] Received NULL type in cast function.\n");
+        fprintf(stderr, "[hlmod] [ERROR] [py->hl] Received NULL type in cast function.\n");
         return NULL;
     }
 
