@@ -2934,7 +2934,57 @@ static void jit_hook_call(jit_ctx *ctx, hl_function *f) {
 	// PLUS the space we manually allocated for our temporary array
 	call_native(ctx, jit_dispatch_hook, native_args_stack_size + temp_stack_size);
 
-	// This MUST be in the exact reverse order of the PUSH operations.
+    int jcontinue;
+    
+    op64(ctx, CMP, PEAX, pconst(&p, 1));
+    XJump(JNeq, jcontinue);
+    
+	if (f->type->fun->ret->kind == HF32 || f->type->fun->ret->kind == HF64) {
+	#ifdef HL_64
+		preg* tmp = alloc_reg(ctx, RCPU);
+		op64(ctx, MOV, tmp, pconst64(&p, (int_val)&g_return_value_double));
+		op64(ctx, MOVSD, PXMM(0), pmem(&p, tmp->id, 0));
+		RUNLOCK(tmp);
+	#else
+		op64(ctx, MOVSD, PXMM(0), paddr(&p, &g_return_value_double));
+	#endif
+	} else {
+	#ifdef HL_64
+		preg* tmp = alloc_reg(ctx, RCPU);
+		op64(ctx, MOV, tmp, pconst64(&p, (int_val)&g_return_value_int));
+		op64(ctx, MOV, PEAX, pmem(&p, tmp->id, 0));
+		RUNLOCK(tmp);
+	#else
+		op64(ctx, MOV, PEAX, paddr(&p, &g_return_value_int));
+	#endif
+	}
+
+	#ifdef HL_64
+		op64(ctx, POP, REG_AT(R15), UNUSED);
+		op64(ctx, POP, REG_AT(R14), UNUSED);
+		op64(ctx, POP, REG_AT(R13), UNUSED);
+		op64(ctx, POP, REG_AT(R12), UNUSED);
+		op64(ctx, POP, REG_AT(Ebp), UNUSED);
+		op64(ctx, POP, REG_AT(Edi), UNUSED);
+		op64(ctx, POP, REG_AT(Esi), UNUSED);
+		op64(ctx, POP, REG_AT(Ebx), UNUSED);
+	#else
+		op32(ctx, POP, REG_AT(Edi), UNUSED);
+		op32(ctx, POP, REG_AT(Esi), UNUSED);
+		op32(ctx, POP, REG_AT(Ebx), UNUSED);
+	#endif
+
+	// NOTE: We do NOT pop EBP here because the PUSH EBP was part of the original op_enter,
+	// and we are effectively replacing the entire function body.
+	// Instead, we just restore the stack pointer to what it was before our locals.
+	op64(ctx, MOV, PESP, PEBP);
+	op64(ctx, POP, PEBP, UNUSED);
+
+	op64(ctx, RET, UNUSED, UNUSED);
+
+	// --------------------
+	patch_jump(ctx, jcontinue);
+
 #ifdef HL_64
 	op64(ctx, POP, REG_AT(R15), UNUSED);
 	op64(ctx, POP, REG_AT(R14), UNUSED);

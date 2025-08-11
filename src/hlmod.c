@@ -1,9 +1,203 @@
 #include <stdio.h>
+#include <hl.h>
 #include <hlmod.h>
 #include <Python.h>
 
+_Thread_local int64 g_return_value_int = 0;
+_Thread_local double g_return_value_double = 0.0;
+_Thread_local bool g_is_passthrough_call = false;
+
+static PyObject* HlHook_call_original(HlHook* self, PyObject* py_args) {
+    hl_function* f = g_runtime_module->code->functions + g_runtime_module->functions_indexes[self->findex];
+    hl_type_fun* fun_type = f->type->fun;
+    int nargs = fun_type->nargs;
+
+    if (PyTuple_Size(py_args) != nargs) {
+        PyErr_Format(PyExc_TypeError, "call_original() expected %d arguments, but got %zd", nargs, PyTuple_Size(py_args));
+        return NULL;
+    }
+
+    vdynamic* vargs[HL_MAX_ARGS]; // HashLink's dynamic call requires vdynamic**
+    if (nargs > HL_MAX_ARGS) {
+        PyErr_SetString(PyExc_ValueError, "Too many arguments for call_original");
+        return NULL;
+    }
+
+    for (int i = 0; i < nargs; i++) {
+        PyObject* py_arg = PyTuple_GetItem(py_args, i); // Borrows reference
+        hl_type* hl_arg_type = fun_type->args[i];
+
+        // First, cast python obj to a raw, GC-allocated HL value
+        void* hl_val_ptr = hlmod_cast_to_hl(py_arg, hl_arg_type);
+        if (hl_val_ptr == NULL) {
+            // An error occurred in casting
+            return NULL;
+        }
+
+        // Then, wrap it in a vdynamic for the dynamic call
+        vargs[i] = hl_make_dyn(hl_val_ptr, hl_arg_type);
+    }
+    
+    vclosure cl;
+    cl.t = f->type;
+    cl.fun = g_runtime_module->functions_ptrs[self->findex];
+    cl.hasValue = 0;
+
+    g_is_passthrough_call = true; // --- Set the flag to prevent re-hooking ---
+    
+    bool is_exc;
+    vdynamic* hl_result = hl_dyn_call_safe(&cl, nargs > 0 ? vargs : NULL, nargs, &is_exc);
+    
+    g_is_passthrough_call = false; // --- Unset the flag ---
+
+    if (is_exc) {
+        PyErr_SetString(PyExc_RuntimeError, "An exception occurred in the original Haxe function.");
+        return NULL;
+    }
+
+    if (fun_type->ret->kind == HVOID) {
+        Py_RETURN_NONE;
+    }
+
+    PyObject* py_result = hlmod_cast_to_py(fun_type->ret, &hl_result->v);
+    
+    return py_result;
+}
+
+static PyMethodDef HlHook_methods[] = {
+    {"call_original", (PyCFunction)HlHook_call_original, METH_VARARGS, "Calls the original Haxe function."},
+    {NULL}
+};
+
+PyTypeObject HlHookType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "hlmod.Hook",
+    .tp_doc = "Hook context object",
+    .tp_basicsize = sizeof(HlHook),
+    .tp_itemsize = 0,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_new = PyType_GenericNew,
+    .tp_methods = HlHook_methods,
+};
+
 /**
- * The C hook that will be called from the JIT-compiled code.
+ * @brief Cast an HL value to Python as a PyObject
+ * 
+ * @param type The type of the HL value
+ * @param ptr A pointer to the HL value
+ * @returns a PyObject* that is a casted version of the HL value
+ */
+PyObject* hlmod_cast_to_py(hl_type* type, void* ptr) {
+    void* obj_ptr = *(void**)ptr;
+    if (obj_ptr == NULL) {
+        Py_RETURN_NONE;
+    }
+    if (type == NULL) {
+        fprintf(stderr, "[hlmod] [ERROR] Received NULL type in cast function.\n");
+        Py_RETURN_NONE;
+    }
+
+    switch (type->kind) {
+        case HF64:
+            return PyFloat_FromDouble( *(double*)ptr );
+        case HF32:
+            return PyFloat_FromDouble( (double)(*(float*)ptr) );
+        case HI32:
+            return PyLong_FromLong( *(int*)ptr );
+        case HBOOL:
+            return PyBool_FromLong( *(bool*)ptr );
+        case HUI16:
+            return PyLong_FromLong( *(unsigned short*)ptr );
+        case HUI8:
+            return PyLong_FromLong( *(unsigned char*)ptr );
+
+        default:
+            return PyLong_FromVoidPtr( *(void**)ptr ); // TODO: pass as capsule or another type to mark this being an obj specifically
+            // then we can create apis on the python side in modcore to work with obj values transparently
+    }
+
+    // Default fallback
+    Py_RETURN_NONE;
+}
+
+void* hlmod_cast_to_hl(PyObject* obj, hl_type* type) {
+    if (obj == Py_None) {
+        hl_null_access();
+        return NULL;
+    }
+
+    if (type == NULL) {
+        fprintf(stderr, "[hlmod] [ERROR] Received NULL type in cast function.\n");
+        return NULL;
+    }
+
+    void* ptr = NULL;
+
+    switch (type->kind) {
+        case HF64: {
+            double val = PyFloat_AsDouble(obj);
+            if (PyErr_Occurred()) return NULL;
+            double* mem = (double*)hl_gc_alloc_noptr(sizeof(double));
+            *mem = val;
+            ptr = mem;
+            break;
+        }
+        case HF32: {
+            double val = PyFloat_AsDouble(obj);
+            if (PyErr_Occurred()) return NULL;
+            float* mem = (float*)hl_gc_alloc_noptr(sizeof(float));
+            *mem = (float)val;
+            ptr = mem;
+            break;
+        }
+        case HI32: {
+            long val = PyLong_AsLong(obj);
+            if (PyErr_Occurred()) return NULL;
+            int* mem = (int*)hl_gc_alloc_noptr(sizeof(int));
+            *mem = (int)val;
+            ptr = mem;
+            break;
+        }
+        case HBOOL: {
+            int val = PyObject_IsTrue(obj);
+            if (val == -1) return NULL;
+            bool* mem = (bool*)hl_gc_alloc_noptr(sizeof(bool));
+            *mem = (bool)val;
+            ptr = mem;
+            break;
+        }
+        case HUI16: {
+            unsigned long val = PyLong_AsUnsignedLong(obj);
+            if (PyErr_Occurred()) return NULL;
+            unsigned short* mem = (unsigned short*)hl_gc_alloc_noptr(sizeof(unsigned short));
+            *mem = (unsigned short)val;
+            ptr = mem;
+            break;
+        }
+        case HUI8: {
+            unsigned long val = PyLong_AsUnsignedLong(obj);
+            if (PyErr_Occurred()) return NULL;
+            unsigned char* mem = (unsigned char*)hl_gc_alloc_noptr(sizeof(unsigned char));
+            *mem = (unsigned char)val;
+            ptr = mem;
+            break;
+        }
+        default: {
+            void* inner_ptr = PyLong_AsVoidPtr(obj);
+            if (PyErr_Occurred()) return NULL;
+
+            void** outer_ptr = (void**)hl_gc_alloc_raw(sizeof(void*));
+            *outer_ptr = inner_ptr;
+            ptr = outer_ptr;
+            break;
+        }
+    }
+
+    return ptr;
+}
+
+/**
+ * @brief The C hook that will be called from the JIT-compiled code.
  *
  * @param findex The function index.
  * @param nargs  The number of arguments being passed.
@@ -11,13 +205,24 @@
  *               location on the stack. For Haxe values (Int, Float), it's a pointer
  *               to the value. For Haxe pointers (String, Object), it's a pointer
  *               to the pointer.
+ * @return 1 if the function should return early with a new value.
+ * @return 0 if the original function logic should continue.
  */
-void jit_dispatch_hook(int findex, int nargs, void** args) {
+
+int jit_dispatch_hook(int findex, int nargs, void** args) {
+    if (g_is_passthrough_call) {
+        g_is_passthrough_call = false;
+        return 0;
+    }
+
     HookRegistryEntry* entry;
     HASH_FIND_INT(g_hook_registry, &findex, entry);
 
+    g_return_value_int = 0;
+    g_return_value_double = 0.0;
+
     if (entry == NULL) {
-        return;
+        return 0;
     }
 
     hl_blocking(true);
@@ -30,28 +235,67 @@ void jit_dispatch_hook(int findex, int nargs, void** args) {
     //printf("[hlmod] Intercepted call to function f@%d with %d args\n",
     //    findex, nargs);
 
+    PyObject* pArgs = PyTuple_New(nargs + 1); // for hook
+    if (!pArgs) {
+        PyErr_Print();
+        PyGILState_Release(gstate);
+        hl_blocking(false);
+        return 0;
+    }
+
+    HlHook* hook_obj = (HlHook*)HlHookType.tp_new(&HlHookType, NULL, NULL);
+    if (!hook_obj) {
+        PyErr_Print();
+        Py_DECREF(pArgs);
+        PyGILState_Release(gstate);
+        hl_blocking(false);
+        return 0;
+    }
+    hook_obj->findex = findex;
+    PyTuple_SetItem(pArgs, 0, (PyObject*)hook_obj);
+
     for (int i = 0; i < nargs; i++) {
-        hl_type* arg_type = fun_type->args[i];
-        void* p_arg_value = args[i];
-
-        switch (arg_type->kind) {
-            default:
-                printf("[hlmod] [WARN] Unknown arg %d [type %d]: %p\n", i, arg_type->kind, *(void**)p_arg_value);
-                break;
+        PyObject* pValue = hlmod_cast_to_py(fun_type->args[i], args[i]);
+        if (pValue == NULL) {
+            PyErr_Print();
+            Py_DECREF(pArgs);
+            PyGILState_Release(gstate);
+            hl_blocking(false);
+            return 0;
         }
+
+        PyTuple_SetItem(pArgs, i + 1, pValue);
     }
 
-    if (!PyCallable_Check(entry->callback)) {
-        fprintf(stderr, "[hlmod] [ERROR] Hook object is not callable!\n");
-        return;
-    }
+    PyObject* pResult = PyObject_CallObject(entry->callback, pArgs);
+    Py_DECREF(pArgs);
 
-    PyObject* pResult = PyObject_CallFunctionObjArgs(entry->callback, NULL);
     if (pResult == NULL) {
         PyErr_Print();
-    }
-    Py_DECREF(pResult);
 
-    PyGILState_Release(gstate);
-    hl_blocking(false);
+        PyGILState_Release(gstate);
+        hl_blocking(false);
+        return 0;
+    } else {
+        int res = 1;
+        if (Py_IsNone(pResult) != 1) {
+            if (f->type->fun->ret->kind == HF32 || f->type->fun->ret->kind == HF64) {
+                g_return_value_double = PyFloat_AsDouble(pResult);
+                if (PyErr_Occurred()) {
+                    PyErr_Print();
+                }
+            } else {
+                void** temp_ptr = (void**)hlmod_cast_to_hl(pResult, fun_type->ret);
+                if (temp_ptr != NULL) {
+                    g_return_value_int = (int64)(*temp_ptr);
+                }
+            }
+            res = 1;
+            // printf("[hlmod] Patching return!\n");
+        }
+        Py_DECREF(pResult);
+        PyGILState_Release(gstate);
+        hl_blocking(false);
+        return res;
+    }
 }

@@ -143,9 +143,7 @@ static PyObject* hlmod_py_register_hook(PyObject *self, PyObject *args) {
 }
 
 static PyMethodDef HlmodMethods[] = {
-    // { Python-visible Name, C Function Pointer, Argument Type, Docstring }
     {"register_hook", hlmod_py_register_hook, METH_VARARGS, "Hooks a function by its findex."},
-    
     {NULL, NULL, 0, NULL}
 };
 static struct PyModuleDef hlmod_module_def = {
@@ -156,7 +154,21 @@ static struct PyModuleDef hlmod_module_def = {
     HlmodMethods                    // Link to the method table
 };
 PyMODINIT_FUNC PyInit_hlmod(void) {
-    return PyModule_Create(&hlmod_module_def);
+    if (PyType_Ready(&HlHookType) < 0)
+        return NULL;
+
+    PyObject* m = PyModule_Create(&hlmod_module_def);
+    if (m == NULL)
+        return NULL;
+    
+    Py_INCREF(&HlHookType);
+    if (PyModule_AddObject(m, "Hook", (PyObject*)&HlHookType) < 0) {
+        Py_DECREF(&HlHookType);
+        Py_DECREF(m);
+        return NULL;
+    }
+
+    return m;
 }
 
 
@@ -314,11 +326,11 @@ int get_mod_load_order(const char *mods_dir, PyObject **load_order_list) {
 
 /**
  * @brief Imports a Python module by name and calls its initialize() function.
- * @param module_name The name of the module to import (e.g., "core_api").
+ * @param module_name The name of the module to import (e.g., "modcore").
  */
 void load_mod(const char* module_name) {
     PyObject *pName, *pModule, *pFunc, *pValue;
-    printf("    -> Loading mod: %s\n", module_name);
+    printf("    -> Loading `%s`\n", module_name);
 
     pName = PyUnicode_FromString(module_name);
     pModule = PyImport_Import(pName);
@@ -491,15 +503,10 @@ int main(int argc, pchar *argv[]) {
 
     PyObject* load_order_list = NULL;
     if (get_mod_load_order(mods_directory, &load_order_list)) {
-        printf("[hlmod] Determined load order:\n");
         Py_ssize_t mod_count = PyList_Size(load_order_list);
-        for (Py_ssize_t i = 0; i < mod_count; i++) {
-            PyObject* mod_info_dict = PyList_GetItem(load_order_list, i);
-            PyObject* mod_id_obj = PyDict_GetItemString(mod_info_dict, "id");
-            printf("  %ld. %s\n", (long)i + 1, PyUnicode_AsUTF8(mod_id_obj));
-        }
+        printf("[hlmod] Done. Found %i mods.\n", mod_count);
 
-        printf("[hlmod] Executing mod initializers...\n");
+        printf("[hlmod] Loading mods:\n");
         for (Py_ssize_t i = 0; i < mod_count; i++) {
             PyObject* mod_info_dict = PyList_GetItem(load_order_list, i);
             PyObject* filepath_obj = PyDict_GetItemString(mod_info_dict, "filepath");
