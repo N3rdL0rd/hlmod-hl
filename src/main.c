@@ -24,7 +24,7 @@
 #include "hlsystem.h"
 
 #include <Python.h>
-#include <hlmod_hooks.h>
+#include <hlmod.h>
 
 #ifdef HL_WIN
 #	include <locale.h>

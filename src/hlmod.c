@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include <hlmod.h>
-#include <hlmod_hooks.h>
+#include <Python.h>
 
 /**
  * The C hook that will be called from the JIT-compiled code.
@@ -12,8 +12,17 @@
  *               to the value. For Haxe pointers (String, Object), it's a pointer
  *               to the pointer.
  */
-void hlmod_dispatch_hook(int findex, int nargs, void** args) {
+void jit_dispatch_hook(int findex, int nargs, void** args) {
+    HookRegistryEntry* entry;
+    HASH_FIND_INT(g_hook_registry, &findex, entry);
+
+    if (entry == NULL) {
+        return;
+    }
+
     hl_blocking(true);
+    PyGILState_STATE gstate;
+    gstate = PyGILState_Ensure();
 
     hl_function* f = g_runtime_module->code->functions + g_runtime_module->functions_indexes[findex];
     hl_type_fun* fun_type = f->type->fun;
@@ -31,25 +40,18 @@ void hlmod_dispatch_hook(int findex, int nargs, void** args) {
                 break;
         }
     }
-    
-    HookRegistryEntry* entry;
-    HASH_FIND_INT(g_hook_registry, &findex, entry);
 
-    if (entry != NULL) {
-        if (!PyCallable_Check(entry->callback)) {
-            fprintf(stderr, "[hlmod] [ERROR] Hook object is not callable!\n");
-            return;
-        }
-
-
-        PyObject* pResult = PyObject_CallFunctionObjArgs(entry->callback, NULL);
-
-		if (pResult == NULL) {
-			PyErr_Print();
-		}
-        
-        Py_DECREF(pResult);
+    if (!PyCallable_Check(entry->callback)) {
+        fprintf(stderr, "[hlmod] [ERROR] Hook object is not callable!\n");
+        return;
     }
 
+    PyObject* pResult = PyObject_CallFunctionObjArgs(entry->callback, NULL);
+    if (pResult == NULL) {
+        PyErr_Print();
+    }
+    Py_DECREF(pResult);
+
+    PyGILState_Release(gstate);
     hl_blocking(false);
 }

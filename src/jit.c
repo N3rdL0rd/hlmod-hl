@@ -35,7 +35,6 @@
 #endif
 
 #include <Python.h>
-#include <hlmod_hooks.h>
 #include <hlmod.h>
 
 hl_module *g_runtime_module = NULL;
@@ -278,8 +277,6 @@ static const int RCPU_SCRATCH_REGS[] = { Eax, Ecx, Edx };
 
 static preg _unused = { RUNUSED, 0, 0, NULL };
 static preg *UNUSED = &_unused;
-
-void jit_dispatch_hook(int findex, void *args);
 
 struct jit_ctx {
 	union {
@@ -2875,6 +2872,86 @@ static void make_dyn_cast( jit_ctx *ctx, vreg *dst, vreg *v ) {
 	store_result(ctx, dst);
 }
 
+static void jit_hook_call(jit_ctx *ctx, hl_function *f) {
+
+	int i;
+	preg p; // Temporary preg for constants
+
+	// Python might modify these.
+	// We need to preserve them for the rest of the JIT'd function to work correctly
+#ifdef HL_64
+	// We save 8 registers = 64 bytes, 16-byte aligned
+	op64(ctx, PUSH, REG_AT(Ebx), UNUSED);
+	op64(ctx, PUSH, REG_AT(Esi), UNUSED);
+	op64(ctx, PUSH, REG_AT(Edi), UNUSED);
+	op64(ctx, PUSH, REG_AT(Ebp), UNUSED); // Technically saved by op_enter, but for good measure...
+	op64(ctx, PUSH, REG_AT(R12), UNUSED);
+	op64(ctx, PUSH, REG_AT(R13), UNUSED);
+	op64(ctx, PUSH, REG_AT(R14), UNUSED);
+	op64(ctx, PUSH, REG_AT(R15), UNUSED);
+	int pushed_regs_size = 8 * HL_WSIZE;
+#else
+	// We save 3 registers = 12 bytes.
+	op32(ctx, PUSH, REG_AT(Ebx), UNUSED);
+	op32(ctx, PUSH, REG_AT(Esi), UNUSED);
+	op32(ctx, PUSH, REG_AT(Edi), UNUSED);
+	int pushed_regs_size = 3 * HL_WSIZE;
+#endif
+
+	int nargs = f->type->fun->nargs;
+	int args_array_size = nargs * HL_WSIZE;
+	// Total stack space needed for our prep work
+	int temp_stack_size = (args_array_size + 15) & ~15;
+
+	// Allocate space on the stack for the args array
+	if (temp_stack_size > 0) {
+		op64(ctx, SUB, PESP, pconst(&p, temp_stack_size));
+	}
+
+	// Get a pointer to the start of the args array
+	preg* r_args_array = alloc_reg(ctx, RCPU_CALL);
+	op64(ctx, LEA, r_args_array, pmem(&p, Esp, 0));
+	RLOCK(r_args_array); // Keep this register alive during the loop
+
+	preg* r_arg_addr = alloc_reg(ctx, RCPU_CALL);
+	for (i = 0; i < nargs; i++) {
+		vreg* arg_vreg = R(i);
+		// Get the address of the original argument [EBP + stackPos] into a temp register
+		op64(ctx, LEA, r_arg_addr, pmem(&p, Ebp, arg_vreg->stackPos));
+		// Store that address into our array: array[i] = &original_arg;
+		op64(ctx, MOV, pmem(&p, r_args_array->id, i * HL_WSIZE), r_arg_addr);
+	}
+	RUNLOCK(r_arg_addr); // Done with this temp register
+
+	// Prepare for a native C call with 3 arguments
+	int native_args_stack_size = begin_native_call(ctx, 3);
+	
+	set_native_arg(ctx, r_args_array);								// Arg 3: void** args
+	set_native_arg(ctx, pconst(&p, nargs));							// Arg 2: int nargs
+	set_native_arg(ctx, pconst(&p, f->findex));						// Arg 1: int findex
+	
+	// The total stack space to clean up includes what `begin_native_call` allocated
+	// PLUS the space we manually allocated for our temporary array
+	call_native(ctx, jit_dispatch_hook, native_args_stack_size + temp_stack_size);
+
+	// This MUST be in the exact reverse order of the PUSH operations.
+#ifdef HL_64
+	op64(ctx, POP, REG_AT(R15), UNUSED);
+	op64(ctx, POP, REG_AT(R14), UNUSED);
+	op64(ctx, POP, REG_AT(R13), UNUSED);
+	op64(ctx, POP, REG_AT(R12), UNUSED);
+	op64(ctx, POP, REG_AT(Ebp), UNUSED);
+	op64(ctx, POP, REG_AT(Edi), UNUSED);
+	op64(ctx, POP, REG_AT(Esi), UNUSED);
+	op64(ctx, POP, REG_AT(Ebx), UNUSED);
+#else
+	op32(ctx, POP, REG_AT(Edi), UNUSED);
+	op32(ctx, POP, REG_AT(Esi), UNUSED);
+	op32(ctx, POP, REG_AT(Ebx), UNUSED);
+#endif
+}
+
+
 int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 	int i, size = 0, opCount;
 	int codePos = BUF_POS();
@@ -2949,6 +3026,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 	// otherwise `alloc_reg` thinks that all registers are locked
 	ctx->currentPos = 1;
 	op_enter(ctx);
+
 #	ifdef HL_64
 	{
 		// store in local var
@@ -2970,88 +3048,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 	}
 	ctx->opsPos[0] = BUF_POS();
 
-
-	// Only inject the hook if the function has arguments and a hook is registered.
-	// You might want to pre-calculate this for performance. For now, we always inject.
-	if (nargs > 0) {
-		// --- START OF DYNAMIC HOOK INJECTION ---
-
-		// 1. FLUSH JIT STATE & CACHE
-		// This is critical to prevent state corruption from the C call.
-		for(i = 0; i < REG_COUNT; i++) {
-			preg *p_reg = REG_AT(i);
-			if (p_reg->holds) store(ctx, p_reg->holds, p_reg, false);
-		}
-		discard_regs(ctx, false);
-
-		// 2. SAVE MACHINE STATE (ABI COMPLIANCE)
-		// Save all registers that our C hook might clobber.
-		op64(ctx, PUSH, PEAX, UNUSED);
-		op64(ctx, PUSH, REG_AT(Ecx), UNUSED);
-		op64(ctx, PUSH, REG_AT(Edx), UNUSED);
-		op64(ctx, PUSH, REG_AT(Esi), UNUSED);
-		op64(ctx, PUSH, REG_AT(Edi), UNUSED);
-		op64(ctx, PUSH, REG_AT(R8), UNUSED);
-		op64(ctx, PUSH, REG_AT(R9), UNUSED);
-		op64(ctx, PUSH, REG_AT(R10), UNUSED);
-		op64(ctx, PUSH, REG_AT(R11), UNUSED);
-		// Note: XMM registers are not needed here since our hook doesn't use floats.
-
-		// 3. ALLOCATE SPACE ON STACK FOR THE `void** args` ARRAY
-		// The size must be a multiple of 16 for stack alignment before the CALL.
-		int args_array_size = nargs * sizeof(void*);
-		int stack_alloc_size = (args_array_size + 15) & ~15;
-		op64(ctx, SUB, PESP, pconst(&p, stack_alloc_size));
-
-		// 4. POPULATE THE `void** args` ARRAY
-		// We will use R11 as a pointer to our new array on the stack.
-		op64(ctx, LEA, REG_AT(R11), pmem(&p, Esp, 0)); // R11 now points to the start of our array.
-
-		for(i = 0; i < nargs; i++) {
-			vreg *arg_vreg = R(i);
-			int stack_offset = arg_vreg->stackPos;
-
-			// Use RAX as a temporary register to hold the address of the argument.
-			// LEA: Load Effective Address of the argument's stack slot into RAX.
-			op64(ctx, LEA, PEAX, pmem(&p, Ebp, stack_offset));
-
-			// MOV [R11 + i*8], RAX
-			// Store the pointer from RAX into the i-th slot of our args array.
-			op64(ctx, MOV, pmem(&p, R11, i * sizeof(void*)), PEAX);
-		}
-
-		// 5. SET UP ARGUMENTS FOR THE C HOOK CALL & ABI COMPLIANCE
-		op64(ctx, MOV, REG_AT(Edi), pconst64(&p, (int_val)ctx->f->findex));
-		op64(ctx, MOV, REG_AT(Esi), pconst64(&p, (int_val)nargs));
-		op64(ctx, MOV, REG_AT(Edx), REG_AT(R11));
-
-		// Zero out RAX for variadic function ABI compliance.
-		op64(ctx, XOR, PEAX, PEAX);
-
-		// 6. CALL THE HOOK
-		// Load the function address into R10, not RAX.
-		op64(ctx, MOV, REG_AT(R10), pconst64(&p, (int_val)hlmod_dispatch_hook));
-		op_call(ctx, REG_AT(R10), -1); // Call the address in R10.
-
-		// 7. CLEAN UP THE STACK
-		// Deallocate the space we used for the void** array.
-		op64(ctx, ADD, PESP, pconst(&p, stack_alloc_size));
-		
-		// 8. RESTORE MACHINE STATE
-		// Pop registers in reverse order.
-		op64(ctx, POP, REG_AT(R11), UNUSED);
-		op64(ctx, POP, REG_AT(R10), UNUSED);
-		op64(ctx, POP, REG_AT(R9), UNUSED);
-		op64(ctx, POP, REG_AT(R8), UNUSED);
-		op64(ctx, POP, REG_AT(Edi), UNUSED);
-		op64(ctx, POP, REG_AT(Esi), UNUSED);
-		op64(ctx, POP, REG_AT(Edx), UNUSED);
-		op64(ctx, POP, REG_AT(Ecx), UNUSED);
-		op64(ctx, POP, PEAX, UNUSED);
-
-		// --- END OF DYNAMIC HOOK INJECTION ---
-	}
-
+	jit_hook_call(ctx, f);
 
 	for(opCount=0;opCount<f->nops;opCount++) {
 		int jump;
