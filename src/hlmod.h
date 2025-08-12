@@ -10,6 +10,14 @@
 
 typedef struct {
     PyObject_HEAD
+    void* ptr;
+    int kind;
+} HlPtr;
+
+extern PyTypeObject HlPtrType;
+
+typedef struct {
+    PyObject_HEAD
     int findex;
 } HlHook;
 

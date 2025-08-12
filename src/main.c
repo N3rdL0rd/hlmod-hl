@@ -154,6 +154,8 @@ static struct PyModuleDef hlmod_module_def = {
     HlmodMethods                    // Link to the method table
 };
 PyMODINIT_FUNC PyInit_hlmod(void) {
+    if (PyType_Ready(&HlPtrType) < 0)
+        return NULL;
     if (PyType_Ready(&HlHookType) < 0)
         return NULL;
 
@@ -161,9 +163,17 @@ PyMODINIT_FUNC PyInit_hlmod(void) {
     if (m == NULL)
         return NULL;
     
+    Py_INCREF(&HlPtrType);
+    if (PyModule_AddObject(m, "HlPtr", (PyObject*)&HlPtrType) < 0) {
+        Py_DECREF(&HlPtrType);
+        Py_DECREF(m);
+        return NULL;
+    }
+
     Py_INCREF(&HlHookType);
     if (PyModule_AddObject(m, "Hook", (PyObject*)&HlHookType) < 0) {
         Py_DECREF(&HlHookType);
+        Py_DECREF(&HlPtrType);
         Py_DECREF(m);
         return NULL;
     }
