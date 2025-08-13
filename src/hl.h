@@ -205,6 +205,14 @@
 #	define C_FUNCTION_END
 #endif
 
+#if defined(_MSC_VER)
+#define THREAD_LOCAL __declspec(thread)
+#elif defined(__GNUC__) || defined(__clang__)
+#define THREAD_LOCAL _Thread_local
+#else
+#define THREAD_LOCAL
+#endif
+
 typedef intptr_t int_val;
 typedef long long int64;
 typedef unsigned long long uint64;

@@ -4,9 +4,9 @@
 #include <Python.h>
 #include <structmember.h>
 
-_Thread_local int64 g_return_value_int = 0;
-_Thread_local double g_return_value_double = 0.0;
-_Thread_local bool g_is_passthrough_call = false;
+THREAD_LOCAL int64 g_return_value_int = 0;
+THREAD_LOCAL double g_return_value_double = 0.0;
+THREAD_LOCAL bool g_is_passthrough_call = false;
 
 #pragma region HlPtr
 static PyObject* HlPtr_New(void* ptr, int kind);

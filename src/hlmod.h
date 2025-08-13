@@ -23,9 +23,9 @@ typedef struct {
 
 extern PyTypeObject HlHookType;
 
-extern _Thread_local int64 g_return_value_int;
-extern _Thread_local double g_return_value_double;
-extern _Thread_local bool g_is_passthrough_call;
+extern THREAD_LOCAL int64 g_return_value_int;
+extern THREAD_LOCAL double g_return_value_double;
+extern THREAD_LOCAL bool g_is_passthrough_call;
 
 int jit_dispatch_hook(int findex, int nargs, void** args);
 void* hlmod_cast_to_hl(PyObject* obj, hl_type* type);
