@@ -507,12 +507,20 @@ hl_code *hl_code_read( const unsigned char *data, int size, char **error_msg ) {
 		if( c->hasdebug ) {
 			c->functions[i].debug = hl_read_debug_infos(r,c->functions[i].nops);
 			if( c->version >= 3 ) {
-				// skip assigns (no need here)
+				hl_function *f = c->functions + i;
+
 				int nassigns = UINDEX();
-				int j;
-				for(j=0;j<nassigns;j++) {
-					UINDEX();
-					INDEX();
+				f->nassigns = nassigns;
+
+				if( nassigns > 0 ) {
+					f->assigns = (hl_debug_assign*)hl_malloc(&c->falloc, sizeof(hl_debug_assign) * nassigns);
+					int j;
+					for(j=0; j<nassigns; j++) {
+						f->assigns[j].str_index = UINDEX();
+						f->assigns[j].op_index = INDEX();
+					}
+				} else {
+					f->assigns = NULL;
 				}
 			}
 		}

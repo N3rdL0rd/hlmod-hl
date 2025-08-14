@@ -41,6 +41,11 @@ typedef struct {
 	int *extra;
 } hl_opcode;
 
+typedef struct {
+    int str_index;
+    int op_index; // op_index 0 is a special value for function arguments
+} hl_debug_assign;
+
 typedef struct hl_function hl_function;
 
 struct hl_function {
@@ -52,6 +57,9 @@ struct hl_function {
 	hl_type **regs;
 	hl_opcode *ops;
 	int *debug;
+
+	int nassigns;
+    hl_debug_assign *assigns;
 
 	hl_type_obj *obj;
 	union {

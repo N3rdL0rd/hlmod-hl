@@ -1,8 +1,17 @@
 #include "hlmod_codegen.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <time.h>
+#include <hl.h>
+
+/*=================================================================================================
+ *
+ *                             STUB GENERATOR IMPLEMENTATION
+ *
+ *=================================================================================================*/
+
 
 #ifdef HL_WIN
 #	include <direct.h>
@@ -12,12 +21,26 @@
 #	define MKDIR(path) mkdir(path, 0755)
 #endif
 
-// --- Forward declaration for recursive type conversion ---
-const uchar* python_type_str(hl_type *t);
+typedef struct hl_type_set {
+    hl_type** items;
+    int count;
+    int capacity;
+} hl_type_set;
 
-/**
- * @brief Appends a uchar string to a buffer, managing position and bounds.
- */
+const uchar* python_type_str(hl_type *t);
+static void mkdir_p(const char *path);
+static hl_function* find_function_by_findex(hl_code* code, int findex);
+static void to_python_safe_name(const uchar* u_name, char* buffer, size_t buffer_size);
+static void print_method_stub_from_func(FILE *f, const char* name, hl_function *func, int findex, hl_code *code);
+static void print_method_stub_from_type(FILE *f, const char* name, hl_type_fun* fun_type);
+static void type_set_init(hl_type_set* set);
+static void type_set_add(hl_type_set* set, hl_type* t);
+static void type_set_free(hl_type_set* set);
+static void collect_type_dependencies(hl_type* t, hl_type_set* deps);
+static void get_python_path_for_type(hl_type* t, const char* base_dir, char* dir_path_out, char* class_name_out, size_t out_size);
+static void print_absolute_import_for_type(FILE* f, hl_type* importer_type, hl_type* dependency_type, const char* base_dir, bool is_indented);
+static void _python_type_str_rec(hl_type *t, uchar* buf, int* pos, int buf_size);
+
 static void _str_append(uchar* buf, int* pos, int buf_size, const uchar* str) {
     if (!str) return;
     int len = ustrlen(str);
@@ -27,15 +50,8 @@ static void _str_append(uchar* buf, int* pos, int buf_size, const uchar* str) {
     }
 }
 
-/**
- * @brief Recursively builds a Python type string from an hl_type.
- */
 static void _python_type_str_rec(hl_type *t, uchar* buf, int* pos, int buf_size) {
-    if (t == NULL) {
-        _str_append(buf, pos, buf_size, USTR("Any"));
-        return;
-    }
-
+    if (t == NULL) { _str_append(buf, pos, buf_size, USTR("Any")); return; }
     switch(t->kind) {
         case HVOID: _str_append(buf, pos, buf_size, USTR("None")); break;
         case HUI8: case HUI16: case HI32: case HI64: _str_append(buf, pos, buf_size, USTR("int")); break;
@@ -46,9 +62,8 @@ static void _python_type_str_rec(hl_type *t, uchar* buf, int* pos, int buf_size)
         case HTYPE: _str_append(buf, pos, buf_size, USTR("type")); break;
         case HREF: _python_type_str_rec(t->tparam, buf, pos, buf_size); break;
         case HDYNOBJ: _str_append(buf, pos, buf_size, USTR("dict[str, Any]")); break;
-
         case HARRAY:
-            _str_append(buf, pos, buf_size, USTR("List["));
+            _str_append(buf, pos, buf_size, USTR("list["));
             _python_type_str_rec(t->tparam, buf, pos, buf_size);
             _str_append(buf, pos, buf_size, USTR("]"));
             break;
@@ -58,15 +73,23 @@ static void _python_type_str_rec(hl_type *t, uchar* buf, int* pos, int buf_size)
             _str_append(buf, pos, buf_size, USTR("]"));
             break;
         case HABSTRACT:
-            if (ucmp(t->abs_name, USTR("String")) == 0) {
+            if (t->abs_name && ucmp(t->abs_name, USTR("String")) == 0) {
                  _str_append(buf, pos, buf_size, USTR("str"));
             } else {
-                 _str_append(buf, pos, buf_size, t->abs_name);
+                 _str_append(buf, pos, buf_size, t->abs_name ? t->abs_name : USTR("Any"));
             }
             break;
         case HOBJ: case HSTRUCT: case HENUM:
             _str_append(buf, pos, buf_size, USTR("\""));
-            _str_append(buf, pos, buf_size, t->obj->name);
+            if (t->obj && t->obj->name) {
+                char safe_name_utf8[1024];
+                to_python_safe_name(t->obj->name, safe_name_utf8, sizeof(safe_name_utf8));
+                char* last_dot = strrchr(safe_name_utf8, '.');
+                const char* name_to_append = last_dot ? last_dot + 1 : safe_name_utf8;
+                uchar u_name_to_append[512];
+                hl_from_utf8(u_name_to_append, sizeof(u_name_to_append)/sizeof(uchar), name_to_append);
+                _str_append(buf, pos, buf_size, u_name_to_append);
+            } else { _str_append(buf, pos, buf_size, USTR("Any")); }
             _str_append(buf, pos, buf_size, USTR("\""));
             break;
         case HFUN: case HMETHOD:
@@ -79,230 +102,323 @@ static void _python_type_str_rec(hl_type *t, uchar* buf, int* pos, int buf_size)
             _python_type_str_rec(t->fun->ret, buf, pos, buf_size);
             _str_append(buf, pos, buf_size, USTR("]"));
             break;
-        default:
-            _str_append(buf, pos, buf_size, USTR("Any")); // Fallback
-            break;
+        default: _str_append(buf, pos, buf_size, USTR("Any")); break;
     }
 }
 
-/**
- * @brief Converts an hl_type to its Python equivalent as a string.
- *        The returned pointer is to a static buffer and should be used immediately.
- */
 const uchar* python_type_str(hl_type *t) {
     static uchar buffer[2048];
     int pos = 0;
+    memset(buffer, 0, sizeof(buffer));
     _python_type_str_rec(t, buffer, &pos, 2048);
-    buffer[pos] = 0;
     return buffer;
 }
 
-
-/**
- * @brief Finds a function definition in the bytecode by its unique function index (findex).
- */
 static hl_function* find_function_by_findex(hl_code* code, int findex) {
     for (int i = 0; i < code->nfunctions; i++) {
-        if (code->functions[i].findex == findex) {
-            return &code->functions[i];
-        }
+        if (code->functions[i].findex == findex) return &code->functions[i];
     }
     return NULL;
 }
 
+static void get_argument_names(hl_function *func, hl_code *code, const uchar **names_out, int max_names) {
+    if (!func->assigns) return;
+    int arg_idx = 0;
+    // The assigns with op_index 0 are the argument names, in order, *excluding this*.
+    for (int i = 0; i < func->nassigns && arg_idx < max_names; i++) {
+        if (func->assigns[i].op_index == 0) {
+            names_out[arg_idx++] = hl_get_ustring(code, func->assigns[i].str_index);
+        }
+    }
+}
 
-
-/**
- * @brief Recursively creates directories for a given path.
- * @param path The full directory path to create.
- */
-static void mkdir_p(const char *path) {
-    char tmp[1024];
-    char *p = NULL;
-    size_t len;
-
-    snprintf(tmp, sizeof(tmp), "%s", path);
-    len = strlen(tmp);
-
-    // Remove trailing slash if it exists
-    if (len > 0 && (tmp[len - 1] == '/' || tmp[len - 1] == '\\')) {
-        tmp[len - 1] = 0;
+static void print_method_stub_from_func(FILE *f, const char* name, hl_function *func, int findex, hl_code *code) {
+    if (!func || !func->type || (func->type->kind != HFUN && func->type->kind != HMETHOD)) {
+        fprintf(f, "    def %s(self, *args, **kwargs) -> Any: ... # findex: %d\n", name, findex);
+        return;
     }
 
-    // Iterate through the path and create each directory component
-    for (p = tmp + 1; *p; p++) {
+    int nargs = func->type->fun->nargs;
+    int real_nargs = nargs > 0 ? nargs - 1 : 0;
+    const uchar* arg_names[real_nargs];
+    for(int i = 0; i < real_nargs; i++) arg_names[i] = NULL;
+    get_argument_names(func, code, arg_names, real_nargs);
+
+    fprintf(f, "    def %s(self", name);
+    for (int k = 1; k < nargs; k++) { // Start at 1 to skip 'this'
+        const char* arg_name_utf8;
+        char fallback_name[16];
+        
+        // ** FIX HERE **: Use k-1 to index the names array, as it does not include 'this'.
+        if (arg_names[k-1]) {
+            arg_name_utf8 = (char*)hl_to_utf8(arg_names[k-1]);
+        } else {
+            snprintf(fallback_name, sizeof(fallback_name), "arg%d", k - 1);
+            arg_name_utf8 = fallback_name;
+        }
+        fprintf(f, ", %s: %s", arg_name_utf8, (char*)hl_to_utf8(python_type_str(func->type->fun->args[k])));
+    }
+    fprintf(f, ") -> %s: ... # findex: %d\n", (char*)hl_to_utf8(python_type_str(func->type->fun->ret)), findex);
+}
+
+static void print_method_stub_from_type(FILE *f, const char* name, hl_type_fun* fun_type) {
+    fprintf(f, "    def %s(self", name);
+    for (int k = 1; k < fun_type->nargs; k++) { // Start at 1 to skip 'this'
+        fprintf(f, ", arg%d: %s", k - 1, (char*)hl_to_utf8(python_type_str(fun_type->args[k])));
+    }
+    fprintf(f, ") -> %s: ...\n", (char*)hl_to_utf8(python_type_str(fun_type->ret)));
+}
+
+static void mkdir_p(const char *path) {
+    char tmp[1024];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    size_t len = strlen(tmp);
+    if (len > 0 && (tmp[len - 1] == '/' || tmp[len - 1] == '\\')) tmp[len - 1] = 0;
+    for (char *p = tmp + 1; *p; p++) {
         if (*p == '/' || *p == '\\') {
             *p = 0;
-            // Create the directory, ignore error if it already exists
             if (MKDIR(tmp) != 0 && errno != EEXIST) {
                  fprintf(stderr, "[hlmod] Error creating directory %s: %s\n", tmp, strerror(errno));
                  return;
             }
-            *p = '/'; // Use a consistent separator
+            *p = '/';
         }
     }
-    // Create the final directory in the path
     if (MKDIR(tmp) != 0 && errno != EEXIST) {
         fprintf(stderr, "[hlmod] Error creating directory %s: %s\n", tmp, strerror(errno));
     }
 }
 
-
-/**
- * @brief Converts a Haxe uchar* name to a Python-safe UTF-8 string, writing it into a buffer.
- *        Specifically, it replaces a leading '$' with 'S_'.
- * @param u_name The Haxe uchar string.
- * @param buffer The output character buffer.
- * @param buffer_size The size of the output buffer.
- */
 static void to_python_safe_name(const uchar* u_name, char* buffer, size_t buffer_size) {
     if (!u_name || buffer_size == 0) {
-        if(buffer_size > 0) buffer[0] = '\0';
+        if (buffer_size > 0) buffer[0] = '\0';
         return;
     }
-
     char* utf8_name = (char*)hl_to_utf8(u_name);
-    if (utf8_name[0] == '$') {
-        snprintf(buffer, buffer_size, "S_%s", utf8_name + 1);
-    } else {
-        strncpy(buffer, utf8_name, buffer_size - 1);
-        buffer[buffer_size - 1] = '\0';
+    size_t out_pos = 0;
+    for (size_t i = 0; utf8_name[i] != '\0' && out_pos < buffer_size - 1; ++i) {
+        if (utf8_name[i] == '$') {
+            if (out_pos < buffer_size - 2) {
+                buffer[out_pos++] = 'S';
+                buffer[out_pos++] = '_';
+            }
+        } else {
+            buffer[out_pos++] = utf8_name[i];
+        }
+    }
+    buffer[out_pos] = '\0';
+}
+
+static void type_set_init(hl_type_set* set) {
+    set->items = NULL;
+    set->count = 0;
+    set->capacity = 0;
+}
+
+static void type_set_free(hl_type_set* set) {
+    if (set->items) free(set->items);
+    set->items = NULL;
+    set->count = 0;
+    set->capacity = 0;
+}
+
+static void type_set_add(hl_type_set* set, hl_type* t) {
+    if (!t || (t->kind != HOBJ && t->kind != HSTRUCT && t->kind != HENUM)) return;
+    for (int i = 0; i < set->count; i++) {
+        if (set->items[i] == t) return;
+    }
+    if (set->count >= set->capacity) {
+        set->capacity = set->capacity == 0 ? 16 : set->capacity * 2;
+        set->items = realloc(set->items, set->capacity * sizeof(hl_type*));
+        if (!set->items) { fprintf(stderr, "[hlmod] FATAL: realloc failed.\n"); exit(1); }
+    }
+    set->items[set->count++] = t;
+}
+
+static void collect_type_dependencies(hl_type* t, hl_type_set* deps) {
+    if (!t) return;
+    switch (t->kind) {
+        case HOBJ: case HSTRUCT: case HENUM: type_set_add(deps, t); break;
+        case HARRAY: case HNULL: case HREF: collect_type_dependencies(t->tparam, deps); break;
+        case HFUN: case HMETHOD:
+            if(t->fun) {
+                for (int i = 0; i < t->fun->nargs; i++) collect_type_dependencies(t->fun->args[i], deps);
+                collect_type_dependencies(t->fun->ret, deps);
+            }
+            break;
+        default: break;
     }
 }
 
-/**
- * @brief Generates a Python method stub line from a full hl_function definition.
- */
-static void print_method_stub_from_func(FILE *f, const char* name, hl_function *func, int findex) {
-    if (!func || !func->type || (func->type->kind != HFUN && func->type->kind != HMETHOD)) {
-        fprintf(f, "    def %s(self, *args, **kwargs): ... # findex: %d\n", name, findex);
+static void get_python_path_for_type(hl_type* t, const char* base_dir, char* dir_path_out, char* class_name_out, size_t out_size) {
+    char class_path_full_safe[1024];
+    to_python_safe_name(t->obj->name, class_path_full_safe, sizeof(class_path_full_safe));
+    char* last_dot = strrchr(class_path_full_safe, '.');
+    if (last_dot) {
+        strncpy(class_name_out, last_dot + 1, out_size - 1);
+        class_name_out[out_size - 1] = '\0';
+        char package_path[1024];
+        size_t package_len = last_dot - class_path_full_safe;
+        strncpy(package_path, class_path_full_safe, package_len);
+        package_path[package_len] = '\0';
+        for (char* p = package_path; *p; ++p) if (*p == '.') *p = '/';
+        snprintf(dir_path_out, out_size, "%s/%s", base_dir, package_path);
+    } else {
+        strncpy(class_name_out, class_path_full_safe, out_size - 1);
+        class_name_out[out_size - 1] = '\0';
+        snprintf(dir_path_out, out_size, "%s", base_dir);
+    }
+}
+
+static void print_absolute_import_for_type(FILE* f, hl_type* importer_type, hl_type* dependency_type, const char* base_dir, bool is_indented) {
+    if (importer_type == dependency_type) {
         return;
     }
 
-    fprintf(f, "    def %s(self", name);
-    for (int k = 0; k < func->type->fun->nargs; k++) {
-        fprintf(f, ", arg%d: %s", k, (char*)hl_to_utf8(python_type_str(func->type->fun->args[k])));
+    char dep_module_dir[1024], dep_class_name[512];
+    get_python_path_for_type(dependency_type, base_dir, dep_module_dir, dep_class_name, sizeof(dep_module_dir));
+
+    const char *top_level_pkg = strrchr(base_dir, '/');
+    if (top_level_pkg) {
+        top_level_pkg++;
+    } else {
+        const char *alt_top_level_pkg = strrchr(base_dir, '\\');
+        top_level_pkg = alt_top_level_pkg ? alt_top_level_pkg + 1 : base_dir;
     }
-    fprintf(f, ") -> %s: ... # findex: %d\n", (char*)hl_to_utf8(python_type_str(func->type->fun->ret)), findex);
+
+    const char* module_path_rel = dep_module_dir + strlen(base_dir);
+    if (*module_path_rel == '/' || *module_path_rel == '\\') {
+        module_path_rel++;
+    }
+
+    char full_module_path[2048] = {0};
+    strcpy(full_module_path, top_level_pkg);
+
+    if (strlen(module_path_rel) > 0) {
+        strcat(full_module_path, ".");
+        strcat(full_module_path, module_path_rel);
+    }
+    
+    strcat(full_module_path, ".");
+    strcat(full_module_path, dep_class_name);
+    
+    for (char* p = full_module_path; *p; ++p) {
+        if (*p == '/' || *p == '\\') {
+            *p = '.';
+        }
+    }
+    
+    const char* indent = is_indented ? "    " : "";
+    fprintf(f, "%sfrom %s import %s\n", indent, full_module_path, dep_class_name);
 }
 
-/**
- * @brief Generates a Python method stub line from just a function type.
- */
-static void print_method_stub_from_type(FILE *f, const char* name, hl_type_fun* fun_type) {
-    fprintf(f, "    def %s(self", name);
-    for (int k = 0; k < fun_type->nargs; k++) {
-        fprintf(f, ", arg%d: %s", k, (char*)hl_to_utf8(python_type_str(fun_type->args[k])));
-    }
-    fprintf(f, ") -> %s: ...\n", (char*)hl_to_utf8(python_type_str(fun_type->ret)));
-}
-
-
-/**
- * @brief Generates Python class stubs for all Objs in the bytecode.
- * @param code A pointer to the loaded HashLink code.
- */
- void hlmod_generate_stubs(hl_code *code) {
-    const char* base_dir = "./mods/hl";
+void hlmod_generate_stubs(hl_code *code) {
+    const char* base_dir = "./mods/stubs";
     clock_t start_time = clock();
     printf("[hlmod] Generating class stubs...\n");
     mkdir_p(base_dir);
 
-    char init_path[1024];
-    snprintf(init_path, sizeof(init_path), "%s/__init__.py", base_dir);
-    FILE *init_f = fopen(init_path, "w");
-    if (init_f) {
-        fprintf(init_f, "# HLMOD Root Package\n");
-        fclose(init_f);
+    for (int i = 0; i < code->ntypes; i++) {
+        hl_type *t = &code->types[i];
+        if (t->kind != HOBJ && t->kind != HSTRUCT) continue;
+        char dir_path[1024];
+        get_python_path_for_type(t, base_dir, dir_path, (char[1]){0}, sizeof(dir_path));
+        char pkg_init_path[1024];
+        snprintf(pkg_init_path, sizeof(pkg_init_path), "%s/__init__.py", dir_path);
+        remove(pkg_init_path);
     }
+    char root_init_path[1024];
+    snprintf(root_init_path, sizeof(root_init_path), "%s/__init__.py", base_dir);
+    remove(root_init_path);
 
     for (int i = 0; i < code->ntypes; i++) {
         hl_type *t = &code->types[i];
-        if (t->kind == HOBJ || t->kind == HSTRUCT) {
-            char class_path_full_safe[1024];
-            to_python_safe_name(t->obj->name, class_path_full_safe, sizeof(class_path_full_safe));
+        if (t->kind != HOBJ && t->kind != HSTRUCT) continue;
 
-            char class_path_copy[1024];
-            strncpy(class_path_copy, class_path_full_safe, sizeof(class_path_copy));
-            class_path_copy[sizeof(class_path_copy) - 1] = '\0';
+        char dir_path[1024], class_name_only[512];
+        get_python_path_for_type(t, base_dir, dir_path, class_name_only, sizeof(class_name_only));
+        
+        char file_path[1024];
+        snprintf(file_path, sizeof(file_path), "%s/%s.py", dir_path, class_name_only);
 
+        mkdir_p(dir_path);
+        char pkg_init_path[1024];
+        snprintf(pkg_init_path, sizeof(pkg_init_path), "%s/__init__.py", dir_path);
+        FILE *pkg_init_f = fopen(pkg_init_path, "a");
+        if (pkg_init_f) {
+            fprintf(pkg_init_f, "from .%s import %s\n", class_name_only, class_name_only);
+            fclose(pkg_init_f);
+        }
 
-            char file_path[1024];
-            char dir_path[1024];
-            char class_name_only[512] = {0};
+        FILE *f = fopen(file_path, "w");
+        if (!f) {
+            fprintf(stderr, "[hlmod] Error: Could not open for writing: %s\n", file_path);
+            continue;
+        }
 
-            char* last_dot = strrchr(class_path_copy, '.');
-            if (last_dot) {
-                *last_dot = '\0';
-                char* package_path = class_path_copy;
-                strncpy(class_name_only, last_dot + 1, sizeof(class_name_only) - 1);
-                for (char* p = package_path; *p; ++p) {
-                    if (*p == '.') *p = '/';
-                }
-                snprintf(dir_path, sizeof(dir_path), "%s/%s", base_dir, package_path);
-            } else {
-                strncpy(class_name_only, class_path_copy, sizeof(class_name_only) - 1);
-                snprintf(dir_path, sizeof(dir_path), "%s", base_dir);
+        fprintf(f, "# This file is automatically generated by hlmod. Do not edit.\n");
+        fprintf(f, "from __future__ import annotations\n");
+        fprintf(f, "from typing import Any, Callable, Optional, List, TYPE_CHECKING\n");
+        fprintf(f, "from hlobj import HlObject\n\n");
+
+        if (t->obj->super) {
+            print_absolute_import_for_type(f, t, t->obj->super, base_dir, false);
+        }
+
+        hl_type_set deps;
+        type_set_init(&deps);
+        for (int j = 0; j < t->obj->nfields; j++) collect_type_dependencies(t->obj->fields[j].t, &deps);
+        for (int j = 0; j < t->obj->nproto; j++) {
+            hl_function* func = find_function_by_findex(code, t->obj->proto[j].findex);
+            if (func) collect_type_dependencies(func->type, &deps);
+        }
+
+        bool has_type_deps = false;
+        for (int j = 0; j < deps.count; j++) {
+            if (deps.items[j] != t->obj->super && deps.items[j] != t) {
+                has_type_deps = true;
+                break;
             }
-
-            mkdir_p(dir_path);
-            snprintf(file_path, sizeof(file_path), "%s/%s.py", dir_path, class_name_only);
-
-            char pkg_init_path[1024];
-            snprintf(pkg_init_path, sizeof(pkg_init_path), "%s/__init__.py", dir_path);
-            // Use "a" to create if not exists, without truncating if it does.
-            FILE *pkg_init_f = fopen(pkg_init_path, "a");
-            if(pkg_init_f) fclose(pkg_init_f);
-
-            FILE *f = fopen(file_path, "w");
-            if (f == NULL) {
-                fprintf(stderr, "Error opening file: %s\n", file_path);
-                continue;
-            }
-
-            fprintf(f, "# This file is automatically generated by hlmod. Do not edit.\n");
-            fprintf(f, "from typing import Any, Callable, Optional, List\n\n");
-
-            char parent_class_arg[512] = {0};
-            if (t->obj->super) {
-                char parent_full_name_safe[1024];
-                to_python_safe_name(t->obj->super->obj->name, parent_full_name_safe, sizeof(parent_full_name_safe));
-
-                char parent_full_name_copy[1024];
-                strncpy(parent_full_name_copy, parent_full_name_safe, sizeof(parent_full_name_copy));
-
-                char* parent_last_dot = strrchr(parent_full_name_copy, '.');
-                if (parent_last_dot) {
-                    *parent_last_dot = '\0';
-                    fprintf(f, "from hl.%s import %s\n\n", parent_full_name_copy, parent_last_dot + 1);
-                    strncpy(parent_class_arg, parent_last_dot + 1, sizeof(parent_class_arg) - 1);
-                } else {
-                    fprintf(f, "from hl import %s\n\n", parent_full_name_copy);
-                    strncpy(parent_class_arg, parent_full_name_copy, sizeof(parent_class_arg) - 1);
+        }
+        
+        if (has_type_deps) {
+            fprintf(f, "if TYPE_CHECKING:\n");
+            for (int j = 0; j < deps.count; j++) {
+                if (deps.items[j] != t->obj->super) {
+                    print_absolute_import_for_type(f, t, deps.items[j], base_dir, true);
                 }
             }
+        }
+        type_set_free(&deps);
+        fprintf(f, "\n");
 
-            fprintf(f, "class %s(%s):\n", class_name_only, parent_class_arg[0] ? parent_class_arg : "object");
+        char parent_class_arg[512] = "HlObject";
+        if (t->obj->super) {
+            get_python_path_for_type(t->obj->super, base_dir, (char[1]){0}, parent_class_arg, sizeof(parent_class_arg));
+        }
+        fprintf(f, "class %s(%s):\n", class_name_only, parent_class_arg);
 
-            int* binding_map = malloc(sizeof(int) * t->obj->nfields);
+        int* binding_map = NULL;
+        if (t->obj->nfields > 0) {
+            binding_map = calloc(t->obj->nfields, sizeof(int));
             for(int j = 0; j < t->obj->nfields; j++) binding_map[j] = -1;
             for (int j = 0; j < t->obj->nbindings; j++) {
-                int findex = t->obj->bindings[j * 2];
                 int ffield = t->obj->bindings[j * 2 + 1];
-                if (ffield < t->obj->nfields) binding_map[ffield] = findex;
+                int findex = t->obj->bindings[j * 2];
+                if (ffield >= 0 && ffield < t->obj->nfields) binding_map[ffield] = findex;
             }
+        }
 
-            bool has_content = false;
-            if (t->obj->nfields > 0) fprintf(f, "\n    # --- Fields defined in this class ---\n");
+        bool has_content = false;
+        if (t->obj->nfields > 0) {
+            fprintf(f, "\n    # --- Fields ---\n");
             for (int j = 0; j < t->obj->nfields; j++) {
                 hl_obj_field *field = &t->obj->fields[j];
                 char safe_field_name[512];
                 to_python_safe_name(field->name, safe_field_name, sizeof(safe_field_name));
-
-                int bound_findex = binding_map[j];
-                if (bound_findex != -1) {
-                    hl_function* func = find_function_by_findex(code, bound_findex);
-                    if(func) print_method_stub_from_func(f, safe_field_name, func, bound_findex);
+                if (binding_map && binding_map[j] != -1) {
+                    hl_function* func = find_function_by_findex(code, binding_map[j]);
+                    if (func) print_method_stub_from_func(f, safe_field_name, func, binding_map[j], code);
                 } else if (field->t->kind == HFUN || field->t->kind == HMETHOD) {
                     print_method_stub_from_type(f, safe_field_name, field->t->fun);
                 } else {
@@ -310,27 +426,26 @@ static void print_method_stub_from_type(FILE *f, const char* name, hl_type_fun* 
                 }
                 has_content = true;
             }
-            free(binding_map);
-
-            if (t->obj->nproto > 0) {
-                fprintf(f, "\n    # --- Methods defined in this class ---\n");
-                for (int j = 0; j < t->obj->nproto; j++) {
-                    hl_obj_proto *proto = &t->obj->proto[j];
-                    char safe_proto_name[512];
-                    to_python_safe_name(proto->name, safe_proto_name, sizeof(safe_proto_name));
-
-                    hl_function* func = find_function_by_findex(code, proto->findex);
-                    if(func) print_method_stub_from_func(f, safe_proto_name, func, proto->findex);
-                    has_content = true;
-                }
-            }
-
-            if (!has_content) fprintf(f, "    pass\n");
-
-            fclose(f);
         }
+        if (binding_map) free(binding_map);
+
+        if (t->obj->nproto > 0) {
+            fprintf(f, "\n    # --- Methods ---\n");
+            for (int j = 0; j < t->obj->nproto; j++) {
+                hl_obj_proto *proto = &t->obj->proto[j];
+                char safe_proto_name[512];
+                to_python_safe_name(proto->name, safe_proto_name, sizeof(safe_proto_name));
+                hl_function* func = find_function_by_findex(code, proto->findex);
+                if (func) print_method_stub_from_func(f, safe_proto_name, func, proto->findex, code);
+                has_content = true;
+            }
+        }
+
+        if (!has_content) fprintf(f, "    pass\n");
+        fclose(f);
     }
+
     clock_t end_time = clock();
     double elapsed_ms = ((double)(end_time - start_time) / CLOCKS_PER_SEC) * 1000.0;
-    printf("[hlmod] Finished generating class stubs in %fms.\n", elapsed_ms);
+    printf("[hlmod] Finished generating class stubs in %.2fms.\n", elapsed_ms);
 }
