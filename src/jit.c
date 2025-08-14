@@ -37,7 +37,7 @@
 #include <Python.h>
 #include <hlmod.h>
 
-hl_module *g_runtime_module = NULL;
+hl_module *g_module = NULL;
 
 typedef enum {
 	Eax = 0,

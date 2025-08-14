@@ -27,6 +27,8 @@
 #include <hlmod.h>
 #include <hlmod_codegen.h>
 
+hl_code *g_code = NULL;
+
 #ifdef HL_WIN
 #	include <locale.h>
 #	include <direct.h>
@@ -148,6 +150,9 @@ static PyObject* hlmod_py_register_hook(PyObject *self, PyObject *args) {
 
 static PyMethodDef HlmodMethods[] = {
     {"register_hook", hlmod_py_register_hook, METH_VARARGS, "Hooks a function by its findex."},
+    {"register_hlobj", hlmod_py_register_hlobj, METH_VARARGS, "Registers a Python class for a given Haxe type index."},
+    {"get_obj_field", hlmod_py_get_obj_field, METH_VARARGS, "Gets a field value from a Haxe object."},
+    {"set_obj_field", hlmod_py_set_obj_field, METH_VARARGS, "Sets a field value on a Haxe object."},
     {NULL, NULL, 0, NULL}
 };
 static struct PyModuleDef hlmod_module_def = {
@@ -508,9 +513,8 @@ int main(int argc, pchar *argv[]) {
 	if( !hl_module_init(ctx.m,hot_reload,vtune_later) )
 		return 3;
 
-    g_runtime_module = ctx.m; // Make the module available to hooks
-
-	hl_code_free(ctx.code);
+    g_module = ctx.m;
+    g_code = ctx.code;
 
 	printf("[hlmod] Fnding mods...\n");
     const char* mods_directory = "./mods";
@@ -539,6 +543,7 @@ int main(int argc, pchar *argv[]) {
         Py_DECREF(load_order_list);
     } else {
         fprintf(stderr, "[hlmod] Could not resolve mod load order. Halting.\n");
+        hl_code_free(ctx.code);
         Py_FinalizeEx();
         hl_debug_break();
         hl_global_free();
@@ -553,8 +558,10 @@ int main(int argc, pchar *argv[]) {
 	hl_profile_setup(profile_count);
 	ctx.ret = hl_dyn_call_safe(&cl,NULL,0,&isExc);
 
+    hl_code_free(ctx.code);
 	hl_profile_end();
 	if( isExc ) {
+        hl_code_free(ctx.code);
 		hl_print_uncaught_exception(ctx.ret);
 		hl_debug_break();
 		hl_global_free();

@@ -8,6 +8,9 @@ THREAD_LOCAL int64 g_return_value_int = 0;
 THREAD_LOCAL double g_return_value_double = 0.0;
 THREAD_LOCAL bool g_is_passthrough_call = false;
 
+static PyObject **g_hlobjs = NULL;
+static int g_hlobjs_l = 0;
+
 #pragma region HlPtr
 static PyObject* HlPtr_New(void* ptr, int kind);
 static PyObject* HlPtr_get_ptr(HlPtr* self, void* closure);
@@ -48,7 +51,7 @@ static PyObject* HlPtr_get_kind(HlPtr* self, void* closure) {
 
 #pragma region HlHook
 static PyObject* HlHook_call_original(HlHook* self, PyObject* py_args) {
-    hl_function* f = g_runtime_module->code->functions + g_runtime_module->functions_indexes[self->findex];
+    hl_function* f = g_module->code->functions + g_module->functions_indexes[self->findex];
     hl_type_fun* fun_type = f->type->fun;
     int nargs = fun_type->nargs;
 
@@ -77,7 +80,7 @@ static PyObject* HlHook_call_original(HlHook* self, PyObject* py_args) {
     
     vclosure cl;
     cl.t = f->type;
-    cl.fun = g_runtime_module->functions_ptrs[self->findex];
+    cl.fun = g_module->functions_ptrs[self->findex];
     cl.hasValue = 0;
 
     g_is_passthrough_call = true;
@@ -116,6 +119,39 @@ PyTypeObject HlHookType = {
 };
 
 
+PyObject* hlmod_py_register_hlobj(PyObject *self, PyObject *args) {
+    int type_idx;
+    PyObject* py_class;
+
+    if (!PyArg_ParseTuple(args, "iO", &type_idx, &py_class)) {
+        return NULL;
+    }
+
+    // printf("[hlmod] Registering HlObject for t@%i\n", type_idx);
+
+
+    if (!PyType_Check(py_class)) {
+        PyErr_SetString(PyExc_TypeError, "Second argument must be a class.");
+        return NULL;
+    }
+
+    if (type_idx >= g_hlobjs_l) {
+        int new_len = type_idx + 1;
+        g_hlobjs = realloc(g_hlobjs, sizeof(PyObject*) * new_len);
+        memset(g_hlobjs + g_hlobjs_l, 0, sizeof(PyObject*) * (new_len - g_hlobjs_l));
+        g_hlobjs_l = new_len;
+    }
+
+    if (g_hlobjs[type_idx] != NULL) {
+        Py_DECREF(g_hlobjs[type_idx]);
+    }
+
+    Py_INCREF(py_class);
+    g_hlobjs[type_idx] = py_class;
+
+    Py_RETURN_NONE;
+}
+
 #pragma region Casting
 
 /**
@@ -148,6 +184,28 @@ PyObject* hlmod_cast_to_py(hl_type* type, void* ptr) {
             return PyLong_FromLong( *(unsigned short*)ptr );
         case HUI8:
             return PyLong_FromLong( *(unsigned char*)ptr );
+        case HOBJ: {
+            if (g_code == NULL) break;
+
+            int type_idx = type - g_code->types;
+            
+            if (type_idx >= 0 && type_idx < g_hlobjs_l) {
+                PyObject* py_class = g_hlobjs[type_idx];
+                if (py_class != NULL) {
+                    PyObject* py_arg_ptr = HlPtr_New(obj_ptr, HOBJ);
+                    if (py_arg_ptr == NULL) return NULL;
+
+                    PyObject* py_args = PyTuple_Pack(1, py_arg_ptr);
+                    Py_DECREF(py_arg_ptr);
+                    if (py_args == NULL) return NULL;
+                    
+                    PyObject* py_instance = PyObject_CallObject(py_class, py_args);
+                    Py_DECREF(py_args);
+                    
+                    return py_instance;
+                }
+            }
+        }
 
         default:
             return HlPtr_New(obj_ptr, type->kind);
@@ -220,14 +278,29 @@ void* hlmod_cast_to_hl(PyObject* obj, hl_type* type) {
             break;
         }
         default: {
-            void* inner_ptr;
-            if (Py_IS_TYPE(obj, &HlPtrType)) {
+            void* inner_ptr = NULL;
+
+            if (PyObject_HasAttrString(obj, "_hlmod_ptr")) {
+                PyObject* py_hlptr = PyObject_GetAttrString(obj, "_hlmod_ptr");
+                if (py_hlptr == NULL) return NULL;
+
+                if (Py_IS_TYPE(py_hlptr, &HlPtrType)) {
+                    inner_ptr = ((HlPtr*)py_hlptr)->ptr;
+                } else {
+                    PyErr_SetString(PyExc_TypeError, "Attribute '_hlmod_ptr' was not of type hlmod.HlPtr.");
+                }
+                Py_DECREF(py_hlptr);
+
+            } else if (Py_IS_TYPE(obj, &HlPtrType)) {
                 inner_ptr = ((HlPtr*)obj)->ptr;
             } else if (PyLong_Check(obj)) {
                 inner_ptr = PyLong_AsVoidPtr(obj);
-                if (PyErr_Occurred()) return NULL;
-            } else {
-                PyErr_Format(PyExc_TypeError, "Expected an hlmod.HlPtr or an int pointer, but got %s", Py_TYPE(obj)->tp_name);
+            }
+
+            if (PyErr_Occurred()) return NULL;
+
+            if (inner_ptr == NULL) {
+                 PyErr_Format(PyExc_TypeError, "Expected a subclass of HlObject, an hlmod.HlPtr, or an int pointer, but got %s", Py_TYPE(obj)->tp_name);
                 return NULL;
             }
 
@@ -241,6 +314,94 @@ void* hlmod_cast_to_hl(PyObject* obj, hl_type* type) {
     return ptr;
 }
 
+#pragma region Field Access
+PyObject* hlmod_py_get_obj_field(PyObject *self, PyObject *args) {
+    PyObject* hlobj_ptr;
+    const char* field_name;
+
+    if (!PyArg_ParseTuple(args, "O!s", &HlPtrType, &hlobj_ptr, &field_name)) {
+        return NULL;
+    }
+
+    vobj* obj = (vobj*)((HlPtr*)hlobj_ptr)->ptr;
+    if (obj == NULL) {
+        PyErr_SetString(PyExc_ValueError, "Cannot get field from a null HlPtr.");
+        return NULL;
+    }
+
+    int field_hash = hl_hash_utf8(field_name);
+    
+    vdynamic d;
+    d.t = obj->t;
+    d.v.ptr = obj;
+
+    vdynamic* field_value = hl_dyn_getp(&d, field_hash, NULL);
+
+    if (field_value == NULL) {
+        Py_RETURN_NONE;
+    }
+
+    return hlmod_cast_to_py(field_value->t, &field_value->v);
+}
+
+PyObject* hlmod_py_set_obj_field(PyObject *self, PyObject *args) {
+    PyObject* hlobj_ptr;
+    const char* field_name;
+    PyObject* py_value;
+
+    if (!PyArg_ParseTuple(args, "O!sO", &HlPtrType, &hlobj_ptr, &field_name, &py_value)) {
+        return NULL;
+    }
+
+    vobj* obj = (vobj*)((HlPtr*)hlobj_ptr)->ptr;
+    if (obj == NULL) {
+        PyErr_SetString(PyExc_ValueError, "Cannot set field on a null HlPtr.");
+        return NULL;
+    }
+
+    int field_hash = hl_hash_utf8(field_name);
+    
+    hl_runtime_obj* rt = hl_get_obj_rt(obj->t);
+    hl_field_lookup *lookup = hl_lookup_find(rt->lookup, rt->nlookup, field_hash);
+
+    if (!lookup) {
+        PyErr_Format(PyExc_AttributeError, "Haxe object of type '%s' has no field '%s'", (char*)hl_to_utf8(obj->t->obj->name), field_name);
+        return NULL;
+    }
+
+    hl_type* field_type = obj->t->obj->fields[lookup->field_index].t;
+
+    void* hl_value_ptr = hlmod_cast_to_hl(py_value, field_type);
+    if (hl_value_ptr == NULL && PyErr_Occurred()) {
+        return NULL;
+    }
+
+    // *** FIX: Create a temporary vdynamic wrapper for the object ***
+    vdynamic d;
+    d.t = obj->t;
+    d.v.ptr = obj;
+
+    switch (field_type->kind) {
+        case HI32:
+        case HUI16:
+        case HUI8:
+        case HBOOL:
+            hl_dyn_seti(&d, field_hash, field_type, hl_value_ptr ? *(int*)hl_value_ptr : 0);
+            break;
+        case HF64:
+            hl_dyn_setd(&d, field_hash, hl_value_ptr ? *(double*)hl_value_ptr : 0.0);
+            break;
+        case HF32:
+            hl_dyn_setf(&d, field_hash, hl_value_ptr ? *(float*)hl_value_ptr : 0.0f);
+            break;
+        default:
+            hl_dyn_setp(&d, field_hash, field_type, hl_value_ptr ? *(void**)hl_value_ptr : NULL);
+            break;
+    }
+
+    Py_RETURN_NONE;
+}
+#pragma endregion
 #pragma region JIT hook
 /**
  * @brief The C hook that will be called from the JIT-compiled code.
@@ -275,7 +436,7 @@ int jit_dispatch_hook(int findex, int nargs, void** args) {
     PyGILState_STATE gstate;
     gstate = PyGILState_Ensure();
 
-    hl_function* f = g_runtime_module->code->functions + g_runtime_module->functions_indexes[findex];
+    hl_function* f = g_module->code->functions + g_module->functions_indexes[findex];
     hl_type_fun* fun_type = f->type->fun;
 
     //printf("[hlmod] Intercepted call to function f@%d with %d args\n",

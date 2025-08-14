@@ -23,6 +23,10 @@ typedef struct {
 
 extern PyTypeObject HlHookType;
 
+PyObject* hlmod_py_register_hlobj(PyObject *self, PyObject *args);
+PyObject* hlmod_py_get_obj_field(PyObject *self, PyObject *args);
+PyObject* hlmod_py_set_obj_field(PyObject *self, PyObject *args);
+
 extern THREAD_LOCAL int64 g_return_value_int;
 extern THREAD_LOCAL double g_return_value_double;
 extern THREAD_LOCAL bool g_is_passthrough_call;
@@ -38,7 +42,8 @@ typedef struct HookRegistryEntry {
 } HookRegistryEntry;
 
 extern HookRegistryEntry* g_hook_registry;
-extern hl_module *g_runtime_module;
+extern hl_module *g_module;
+extern hl_code *g_code;
 
 void hlmod_register_hook(int findex, PyObject* callback);
 
