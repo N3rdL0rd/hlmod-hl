@@ -180,6 +180,7 @@ if (WITH_VM)
         src/debugger.c
         src/profile.c
         src/hlmod.c
+        src/hlmod_codegen.c
     )
 
     if (UNIX AND NOT APPLE)

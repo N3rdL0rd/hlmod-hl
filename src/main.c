@@ -25,6 +25,7 @@
 
 #include <Python.h>
 #include <hlmod.h>
+#include <hlmod_codegen.h>
 
 #ifdef HL_WIN
 #	include <locale.h>
@@ -423,225 +424,6 @@ static void setup_handler() {
 }
 #endif
 
-// --- Forward declaration for recursive type conversion ---
-const uchar* python_type_str(hl_type *t);
-
-/**
- * @brief Appends a uchar string to a buffer, managing position and bounds.
- */
-static void _str_append(uchar* buf, int* pos, int buf_size, const uchar* str) {
-    if (!str) return;
-    int len = ustrlen(str);
-    if (*pos + len < buf_size) {
-        memcpy(buf + *pos, str, len * sizeof(uchar));
-        *pos += len;
-    }
-}
-
-/**
- * @brief Recursively builds a Python type string from an hl_type.
- */
-static void _python_type_str_rec(hl_type *t, uchar* buf, int* pos, int buf_size) {
-    if (t == NULL) {
-        _str_append(buf, pos, buf_size, USTR("Any"));
-        return;
-    }
-
-    switch(t->kind) {
-        case HVOID: _str_append(buf, pos, buf_size, USTR("None")); break;
-        case HUI8: case HUI16: case HI32: case HI64: _str_append(buf, pos, buf_size, USTR("int")); break;
-        case HF32: case HF64: _str_append(buf, pos, buf_size, USTR("float")); break;
-        case HBOOL: _str_append(buf, pos, buf_size, USTR("bool")); break;
-        case HBYTES: _str_append(buf, pos, buf_size, USTR("bytes")); break;
-        case HDYN: _str_append(buf, pos, buf_size, USTR("Any")); break;
-        case HTYPE: _str_append(buf, pos, buf_size, USTR("type")); break;
-        case HREF: _python_type_str_rec(t->tparam, buf, pos, buf_size); break;
-        case HDYNOBJ: _str_append(buf, pos, buf_size, USTR("dict[str, Any]")); break;
-
-        case HARRAY:
-            _str_append(buf, pos, buf_size, USTR("list["));
-            _python_type_str_rec(t->tparam, buf, pos, buf_size);
-            _str_append(buf, pos, buf_size, USTR("]"));
-            break;
-        case HNULL:
-            _str_append(buf, pos, buf_size, USTR("Optional["));
-            _python_type_str_rec(t->tparam, buf, pos, buf_size);
-            _str_append(buf, pos, buf_size, USTR("]"));
-            break;
-        case HABSTRACT:
-            if (ucmp(t->abs_name, USTR("String")) == 0) {
-                 _str_append(buf, pos, buf_size, USTR("str"));
-            } else {
-                 _str_append(buf, pos, buf_size, t->abs_name);
-            }
-            break;
-        case HOBJ: case HSTRUCT: case HENUM:
-            _str_append(buf, pos, buf_size, USTR("\""));
-            _str_append(buf, pos, buf_size, t->obj->name);
-            _str_append(buf, pos, buf_size, USTR("\""));
-            break;
-        case HFUN: case HMETHOD:
-            _str_append(buf, pos, buf_size, USTR("Callable[["));
-            for(int i = 0; i < t->fun->nargs; i++) {
-                if(i > 0) _str_append(buf, pos, buf_size, USTR(", "));
-                _python_type_str_rec(t->fun->args[i], buf, pos, buf_size);
-            }
-            _str_append(buf, pos, buf_size, USTR("], "));
-            _python_type_str_rec(t->fun->ret, buf, pos, buf_size);
-            _str_append(buf, pos, buf_size, USTR("]"));
-            break;
-        default:
-            _str_append(buf, pos, buf_size, USTR("Any")); // Fallback
-            break;
-    }
-}
-
-/**
- * @brief Converts an hl_type to its Python equivalent as a string.
- *        The returned pointer is to a static buffer and should be used immediately.
- */
-const uchar* python_type_str(hl_type *t) {
-    static uchar buffer[2048];
-    int pos = 0;
-    _python_type_str_rec(t, buffer, &pos, 2048);
-    buffer[pos] = 0;
-    return buffer;
-}
-
-
-/**
- * @brief Finds a function definition in the bytecode by its unique function index (findex).
- */
-static hl_function* find_function_by_findex(hl_code* code, int findex) {
-    for (int i = 0; i < code->nfunctions; i++) {
-        if (code->functions[i].findex == findex) {
-            return &code->functions[i];
-        }
-    }
-    return NULL;
-}
-
-
-
-/**
- * @brief Recursively creates directories for a given path.
- * @param path The full directory path to create.
- */
-static void mkdir_p(const char *path) {
-    char tmp[1024];
-    char *p = NULL;
-    size_t len;
-
-    snprintf(tmp, sizeof(tmp), "%s", path);
-    len = strlen(tmp);
-
-    // Remove trailing slash if it exists
-    if (len > 0 && (tmp[len - 1] == '/' || tmp[len - 1] == '\\')) {
-        tmp[len - 1] = 0;
-    }
-
-    // Iterate through the path and create each directory component
-    for (p = tmp + 1; *p; p++) {
-        if (*p == '/' || *p == '\\') {
-            *p = 0;
-            // Create the directory, ignore error if it already exists
-            if (MKDIR(tmp) != 0 && errno != EEXIST) {
-                 fprintf(stderr, "[hlmod] Error creating directory %s: %s\n", tmp, strerror(errno));
-                 return;
-            }
-            *p = '/'; // Use a consistent separator
-        }
-    }
-    // Create the final directory in the path
-    if (MKDIR(tmp) != 0 && errno != EEXIST) {
-        fprintf(stderr, "[hlmod] Error creating directory %s: %s\n", tmp, strerror(errno));
-    }
-}
-
-/**
- * @brief Generates Python class stubs for all Objs in the bytecode.
- * @param code A pointer to the loaded HashLink code.
- */
-static void generate_class_stubs(hl_code *code) {
-    const char* base_dir = "./mods/hl";
-    printf("[hlmod] Generating class stubs...\n");
-    mkdir_p(base_dir);
-
-    for (int i = 0; i < code->ntypes; i++) {
-        hl_type *t = &code->types[i];
-        if (t->kind == HOBJ || t->kind == HSTRUCT) {
-            char* class_path_full_utf8 = (char*)hl_to_utf8(t->obj->name);
-            char* class_path_copy = strdup(class_path_full_utf8); // Create a mutable copy
-
-            char file_path[1024];
-            char dir_path[1024];
-
-            char* last_dot = strrchr(class_path_copy, '.');
-            if (last_dot) {
-                // Class is in a package
-                *last_dot = '\0'; // Split into package path and class name
-                char* package_path = class_path_copy;
-                char* class_name_only = last_dot + 1;
-
-                // Replace dots in package path with directory separators
-                for (char* p = package_path; *p; ++p) {
-                    if (*p == '.') *p = '/';
-                }
-
-                snprintf(dir_path, sizeof(dir_path), "%s/%s", base_dir, package_path);
-                snprintf(file_path, sizeof(file_path), "%s/%s.py", dir_path, class_name_only);
-            } else {
-                // Class is in the root package
-                snprintf(dir_path, sizeof(dir_path), "%s", base_dir);
-                snprintf(file_path, sizeof(file_path), "%s/%s.py", dir_path, class_path_copy);
-            }
-
-            mkdir_p(dir_path);
-
-            FILE *f = fopen(file_path, "w");
-            if (f == NULL) {
-                fprintf(stderr, "Error opening file: %s\n", file_path);
-                free(class_path_copy);
-                continue;
-            }
-
-            fprintf(f, "class %s:\n", class_path_full_utf8);
-
-            // Fields
-            if (t->obj->nfields > 0) {
-                fprintf(f, "\n    # --- Attributes ---\n");
-                for (int j = 0; j < t->obj->nfields; j++) {
-                    hl_obj_field *field = &t->obj->fields[j];
-                    fprintf(f, "    %s: %s\n", (char*)hl_to_utf8(field->name), (char*)hl_to_utf8(python_type_str(field->t)));
-                }
-            }
-
-            // Prototypes
-            if (t->obj->nproto > 0) {
-                fprintf(f, "\n    # --- Prototypes ---\n");
-                for (int j = 0; j < t->obj->nproto; j++) {
-                    hl_obj_proto *proto = &t->obj->proto[j];
-                    fprintf(f, "    def %s(*args): ... # findex: %d, pindex: %d\n", (char*)hl_to_utf8(proto->name), proto->findex, proto->pindex);
-                }
-            }
-
-            // Bindings
-            if (t->obj->nbindings > 0) {
-                fprintf(f, "\n    # --- Bindings ---\n");
-                for (int j = 0; j < t->obj->nbindings; j++) {
-                    int findex = t->obj->bindings[j * 2];
-                    int ffield = t->obj->bindings[j * 2 + 1];
-                    fprintf(f, "    # bind function %d to field %d\n", findex, ffield);
-                }
-            }
-
-            fclose(f);
-            free(class_path_copy);
-        }
-    }
-    printf("[hlmod] Finished generating class stubs in %s/\n", base_dir);
-}
-
 
 #ifdef HL_WIN
 int wmain(int argc, pchar *argv[]) {
@@ -705,6 +487,7 @@ int main(int argc, pchar *argv[]) {
 			argc = first_boot_arg;
 		}
 	}
+    printf("[hlmod] HL init...\n");
 	hl_global_init();
 	hl_sys_init((void**)argv,argc,file);
 	hl_register_thread(&ctx);
@@ -714,6 +497,11 @@ int main(int argc, pchar *argv[]) {
 		if( error_msg ) printf("%s\n", error_msg);
 		return 1;
 	}
+
+    hlmod_generate_stubs(ctx.code);
+
+    printf("[hlmod] Initializing HL module...\n");
+
 	ctx.m = hl_module_alloc(ctx.code);
 	if( ctx.m == NULL )
 		return 2;
@@ -722,11 +510,9 @@ int main(int argc, pchar *argv[]) {
 
     g_runtime_module = ctx.m; // Make the module available to hooks
 
-    generate_class_stubs(ctx.code);
-
 	hl_code_free(ctx.code);
 
-	printf("[hlmod] Initializing mods...\n");
+	printf("[hlmod] Fnding mods...\n");
     const char* mods_directory = "./mods";
 
     PyObject* sys_path = PySys_GetObject("path");
@@ -737,7 +523,7 @@ int main(int argc, pchar *argv[]) {
     PyObject* load_order_list = NULL;
     if (get_mod_load_order(mods_directory, &load_order_list)) {
         Py_ssize_t mod_count = PyList_Size(load_order_list);
-        printf("[hlmod] Done. Found %i mods.\n", mod_count);
+        printf("[hlmod] Found %i mods.\n", mod_count);
 
         printf("[hlmod] Loading mods:\n");
         for (Py_ssize_t i = 0; i < mod_count; i++) {
@@ -754,6 +540,8 @@ int main(int argc, pchar *argv[]) {
     } else {
         fprintf(stderr, "[hlmod] Could not resolve mod load order. Halting.\n");
         Py_FinalizeEx();
+        hl_debug_break();
+        hl_global_free();
         return 1;
     }
     printf("[hlmod] All mods initialized.\n\n");
@@ -777,6 +565,7 @@ int main(int argc, pchar *argv[]) {
 	// do not call hl_unregister_thread() or hl_global_free will display error
 	// on global_lock if there are threads that are still running (such as debugger)
 	hl_global_free();
+    printf("[hlmod] Bye!\n");
 	return 0;
 }
 
