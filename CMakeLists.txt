@@ -181,6 +181,7 @@ if (WITH_VM)
         src/profile.c
         src/hlmod.c
         src/hlmod_codegen.c
+        src/hlmod_crash.c
     )
 
     if (UNIX AND NOT APPLE)
@@ -205,6 +206,24 @@ else()
     else()
         target_link_libraries(libhl pthread)
     endif()
+endif()
+
+if(MSVC)
+    set(CMAKE_DEBUG_COMPILE_FLAGS "/Zi")
+    set(CMAKE_DEBUG_LINK_FLAGS "/DEBUG")
+else()
+    set(CMAKE_DEBUG_COMPILE_FLAGS "-g")
+    set(CMAKE_DEBUG_LINK_FLAGS "-g")
+endif()
+
+target_compile_options(libhl PRIVATE "$<$<CONFIG:Debug,RelWithDebInfo>:${CMAKE_DEBUG_COMPILE_FLAGS}>")
+target_link_options(libhl PRIVATE "$<$<CONFIG:Debug,RelWithDebInfo>:${CMAKE_DEBUG_LINK_FLAGS}>")
+
+target_compile_options(hl PRIVATE "$<$<CONFIG:Debug,RelWithDebInfo>:${CMAKE_DEBUG_COMPILE_FLAGS}>")
+if(NOT MSVC)
+    target_link_options(hl PRIVATE "$<$<CONFIG:Debug,RelWithDebInfo>:-g;-rdynamic>")
+else()
+    target_link_options(hl PRIVATE "$<$<CONFIG:Debug,RelWithDebInfo>:${CMAKE_DEBUG_LINK_FLAGS}>")
 endif()
 
 if(BUILD_TESTING)

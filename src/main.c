@@ -19,6 +19,8 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
  * DEALINGS IN THE SOFTWARE.
  */
+#define USE_HLMOD_CRASH // TODO: some arg for this
+
 #include <hl.h>
 #include <hlmodule.h>
 #include "hlsystem.h"
@@ -26,6 +28,10 @@
 #include <Python.h>
 #include <hlmod.h>
 #include <hlmod_codegen.h>
+
+#ifdef USE_HLMOD_CRASH
+#include <hlmod_crash.h>
+#endif
 
 hl_code *g_code = NULL;
 
@@ -403,32 +409,6 @@ __declspec(dllexport) DWORD NvOptimusEnablement = 1;
 __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #endif
 
-#if defined(HL_LINUX) || defined(HL_MAC)
-#include <signal.h>
-static void handle_signal( int signum ) {
-	signal(signum, SIG_DFL);
-	printf("SIGNAL %d\n",signum);
-	if( hl_get_thread() != NULL ) {
-		hl_dump_stack();
-	}
-	fflush(stdout);
-	raise(signum);
-}
-static void setup_handler() {
-	struct sigaction act;
-	act.sa_sigaction = NULL;
-	act.sa_handler = handle_signal;
-	act.sa_flags = 0;
-	sigemptyset(&act.sa_mask);
-	signal(SIGPIPE, SIG_IGN);
-	sigaction(SIGSEGV,&act,NULL);
-	sigaction(SIGTERM,&act,NULL);
-}
-#else
-static void setup_handler() {
-}
-#endif
-
 
 #ifdef HL_WIN
 int wmain(int argc, pchar *argv[]) {
@@ -554,7 +534,9 @@ int main(int argc, pchar *argv[]) {
 	cl.t = ctx.code->functions[ctx.m->functions_indexes[ctx.m->code->entrypoint]].type;
 	cl.fun = ctx.m->functions_ptrs[ctx.m->code->entrypoint];
 	cl.hasValue = 0;
-	setup_handler();
+#ifdef USE_HLMOD_CRASH
+	hlmod_setup_handler();
+#endif
 	hl_profile_setup(profile_count);
 	ctx.ret = hl_dyn_call_safe(&cl,NULL,0,&isExc);
 
