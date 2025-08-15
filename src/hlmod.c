@@ -4,6 +4,17 @@
 #include <Python.h>
 #include <structmember.h>
 
+bool uchar_eq(const uchar* s1, const uchar* s2) {
+    while (*s1 != u'\0' && *s2 != u'\0') {
+        if (*s1 != *s2) {
+            return false;
+        }
+        s1++;
+        s2++;
+    }
+    return *s1 == *s2;
+}
+
 THREAD_LOCAL int64 g_return_value_int = 0;
 THREAD_LOCAL double g_return_value_double = 0.0;
 THREAD_LOCAL bool g_is_passthrough_call = false;
@@ -185,6 +196,15 @@ PyObject* hlmod_cast_to_py(hl_type* type, void* ptr) {
         case HUI8:
             return PyLong_FromLong( *(unsigned char*)ptr );
         case HOBJ: {
+            if (type->obj != NULL && type->obj->name != NULL && uchar_eq(type->obj->name, u"String")) {
+                vstring* s = (vstring*)obj_ptr;
+                return PyUnicode_DecodeUTF16(
+                    (const char*)s->bytes,
+                    s->length * sizeof(uchar),
+                    "strict",
+                    NULL
+                );
+            }
             if (g_code == NULL) break;
 
             int type_idx = type - g_code->types;
@@ -224,6 +244,36 @@ void* hlmod_cast_to_hl(PyObject* obj, hl_type* type) {
     if (type == NULL) {
         fprintf(stderr, "[hlmod] [ERROR] [py->hl] Received NULL type in cast function.\n");
         return NULL;
+    }
+
+
+    if (type->kind == HOBJ && type->obj != NULL && type->obj->name != NULL && uchar_eq(type->obj->name, u"String")) {
+        if (!PyUnicode_Check(obj)) {
+            PyErr_Format(PyExc_TypeError, "Expected a string for Haxe type String, but got %s", Py_TYPE(obj)->tp_name);
+            return NULL;
+        }
+
+        PyObject* utf16_bytes = PyUnicode_AsUTF16String(obj);
+        if (utf16_bytes == NULL) return NULL;
+
+        const char* buffer = PyBytes_AsString(utf16_bytes);
+        Py_ssize_t size_in_bytes = PyBytes_Size(utf16_bytes);
+        
+        const unsigned char* char_buffer = (const unsigned char*)(buffer + 2);
+        int data_size_in_bytes = size_in_bytes - 2;
+
+        vstring* s_data = (vstring*)hl_gc_alloc_raw(sizeof(vstring));
+        uchar* s_val = (uchar*)hl_gc_alloc_raw(data_size_in_bytes);
+        memcpy(s_val, buffer, data_size_in_bytes);
+        s_data->t = type;
+        s_data->bytes = s_val;
+        s_data->length = data_size_in_bytes / 2;
+
+        Py_DECREF(utf16_bytes);
+
+        void** ret_ptr = (void**)hl_gc_alloc_raw(sizeof(void*));
+        *ret_ptr = s_data;
+        return ret_ptr;
     }
 
     void* ptr = NULL;
@@ -315,11 +365,12 @@ void* hlmod_cast_to_hl(PyObject* obj, hl_type* type) {
 }
 
 #pragma region Field Access
+
 PyObject* hlmod_py_get_obj_field(PyObject *self, PyObject *args) {
     PyObject* hlobj_ptr;
-    const char* field_name;
+    int field_index;
 
-    if (!PyArg_ParseTuple(args, "O!s", &HlPtrType, &hlobj_ptr, &field_name)) {
+    if (!PyArg_ParseTuple(args, "O!i", &HlPtrType, &hlobj_ptr, &field_index)) {
         return NULL;
     }
 
@@ -329,27 +380,28 @@ PyObject* hlmod_py_get_obj_field(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    int field_hash = hl_hash_utf8(field_name);
-    
-    vdynamic d;
-    d.t = obj->t;
-    d.v.ptr = obj;
+    hl_runtime_obj *rt = hl_get_obj_rt(obj->t);
 
-    vdynamic* field_value = hl_dyn_getp(&d, field_hash, NULL);
-
-    if (field_value == NULL) {
-        Py_RETURN_NONE;
+    if (field_index < 0 || field_index >= rt->nfields) {
+        PyErr_Format(PyExc_IndexError, "Field index %d is out of bounds for type '%s' (0-%d).", 
+            field_index, (char*)hl_to_utf8(obj->t->obj->name), rt->nfields - 1);
+        return NULL;
     }
 
-    return hlmod_cast_to_py(field_value->t, &field_value->v);
+    hl_type *field_type = obj->t->obj->fields[field_index].t;
+    int field_offset = rt->fields_indexes[field_index];
+
+    void* field_ptr = (char*)obj + field_offset;
+
+    return hlmod_cast_to_py(field_type, field_ptr);
 }
 
 PyObject* hlmod_py_set_obj_field(PyObject *self, PyObject *args) {
     PyObject* hlobj_ptr;
-    const char* field_name;
+    int field_index;
     PyObject* py_value;
 
-    if (!PyArg_ParseTuple(args, "O!sO", &HlPtrType, &hlobj_ptr, &field_name, &py_value)) {
+    if (!PyArg_ParseTuple(args, "O!iO", &HlPtrType, &hlobj_ptr, &field_index, &py_value)) {
         return NULL;
     }
 
@@ -359,43 +411,38 @@ PyObject* hlmod_py_set_obj_field(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    int field_hash = hl_hash_utf8(field_name);
-    
-    hl_runtime_obj* rt = hl_get_obj_rt(obj->t);
-    hl_field_lookup *lookup = hl_lookup_find(rt->lookup, rt->nlookup, field_hash);
+    hl_runtime_obj *rt = hl_get_obj_rt(obj->t);
 
-    if (!lookup) {
-        PyErr_Format(PyExc_AttributeError, "Haxe object of type '%s' has no field '%s'", (char*)hl_to_utf8(obj->t->obj->name), field_name);
+    if (field_index < 0 || field_index >= rt->nfields) {
+        PyErr_Format(PyExc_IndexError, "Field index %d is out of bounds for type '%s' (0-%d).",
+            field_index, (char*)hl_to_utf8(obj->t->obj->name), rt->nfields - 1);
         return NULL;
     }
 
-    hl_type* field_type = obj->t->obj->fields[lookup->field_index].t;
+    hl_type* field_type = obj->t->obj->fields[field_index].t;
+    int field_offset = rt->fields_indexes[field_index];
 
+    void* field_ptr = (char*)obj + field_offset;
     void* hl_value_ptr = hlmod_cast_to_hl(py_value, field_type);
     if (hl_value_ptr == NULL && PyErr_Occurred()) {
         return NULL;
     }
-
-    // *** FIX: Create a temporary vdynamic wrapper for the object ***
-    vdynamic d;
-    d.t = obj->t;
-    d.v.ptr = obj;
 
     switch (field_type->kind) {
         case HI32:
         case HUI16:
         case HUI8:
         case HBOOL:
-            hl_dyn_seti(&d, field_hash, field_type, hl_value_ptr ? *(int*)hl_value_ptr : 0);
+            *(int*)field_ptr = hl_value_ptr ? *(int*)hl_value_ptr : 0;
             break;
         case HF64:
-            hl_dyn_setd(&d, field_hash, hl_value_ptr ? *(double*)hl_value_ptr : 0.0);
+            *(double*)field_ptr = hl_value_ptr ? *(double*)hl_value_ptr : 0.0;
             break;
         case HF32:
-            hl_dyn_setf(&d, field_hash, hl_value_ptr ? *(float*)hl_value_ptr : 0.0f);
+            *(float*)field_ptr = hl_value_ptr ? *(float*)hl_value_ptr : 0.0f;
             break;
         default:
-            hl_dyn_setp(&d, field_hash, field_type, hl_value_ptr ? *(void**)hl_value_ptr : NULL);
+            *(void**)field_ptr = hl_value_ptr ? *(void**)hl_value_ptr : NULL;
             break;
     }
 
