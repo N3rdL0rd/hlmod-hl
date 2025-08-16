@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <time.h>
 #include <hl.h>
+#include <hlmod.h>
 
 /*=================================================================================================
  *
@@ -140,7 +141,7 @@ static void print_method_stub_from_func(FILE *f, const char* name, hl_function *
 
     int nargs = func->type->fun->nargs;
     int real_nargs = nargs > 0 ? nargs - 1 : 0;
-    const uchar* arg_names[real_nargs];
+    const uchar* arg_names[HL_MAX_ARGS];
     for(int i = 0; i < real_nargs; i++) arg_names[i] = NULL;
     get_argument_names(func, code, arg_names, real_nargs);
 
@@ -250,23 +251,34 @@ static void collect_type_dependencies(hl_type* t, hl_type_set* deps) {
     }
 }
 
-static void get_python_path_for_type(hl_type* t, const char* base_dir, char* dir_path_out, char* class_name_out, size_t out_size) {
+static void get_python_path_for_type(hl_type* t, const char* base_dir,
+                                     char* dir_path_out, size_t dir_path_size,
+                                     char* class_name_out, size_t class_name_size) {
     char class_path_full_safe[1024];
     to_python_safe_name(t->obj->name, class_path_full_safe, sizeof(class_path_full_safe));
     char* last_dot = strrchr(class_path_full_safe, '.');
     if (last_dot) {
-        strncpy(class_name_out, last_dot + 1, out_size - 1);
-        class_name_out[out_size - 1] = '\0';
-        char package_path[1024];
-        size_t package_len = last_dot - class_path_full_safe;
-        strncpy(package_path, class_path_full_safe, package_len);
-        package_path[package_len] = '\0';
-        for (char* p = package_path; *p; ++p) if (*p == '.') *p = '/';
-        snprintf(dir_path_out, out_size, "%s/%s", base_dir, package_path);
+        if (class_name_out && class_name_size > 0) {
+            strncpy(class_name_out, last_dot + 1, class_name_size - 1);
+            class_name_out[class_name_size - 1] = '\0';
+        }
+
+        if (dir_path_out && dir_path_size > 0) {
+            char package_path[1024];
+            size_t package_len = last_dot - class_path_full_safe;
+            strncpy(package_path, class_path_full_safe, package_len);
+            package_path[package_len] = '\0';
+            for (char* p = package_path; *p; ++p) if (*p == '.') *p = '/';
+            snprintf(dir_path_out, dir_path_size, "%s/%s", base_dir, package_path);
+        }
     } else {
-        strncpy(class_name_out, class_path_full_safe, out_size - 1);
-        class_name_out[out_size - 1] = '\0';
-        snprintf(dir_path_out, out_size, "%s", base_dir);
+        if (class_name_out && class_name_size > 0) {
+            strncpy(class_name_out, class_path_full_safe, class_name_size - 1);
+            class_name_out[class_name_size - 1] = '\0';
+        }
+        if (dir_path_out && dir_path_size > 0) {
+            snprintf(dir_path_out, dir_path_size, "%s", base_dir);
+        }
     }
 }
 
@@ -276,7 +288,7 @@ static void print_absolute_import_for_type(FILE* f, hl_type* importer_type, hl_t
     }
 
     char dep_module_dir[1024], dep_class_name[512];
-    get_python_path_for_type(dependency_type, base_dir, dep_module_dir, dep_class_name, sizeof(dep_module_dir));
+    get_python_path_for_type(dependency_type, base_dir, dep_module_dir, sizeof(dep_module_dir), dep_class_name, sizeof(dep_class_name));
 
     const char *top_level_pkg = strrchr(base_dir, '/');
     if (top_level_pkg) {
@@ -291,17 +303,34 @@ static void print_absolute_import_for_type(FILE* f, hl_type* importer_type, hl_t
         module_path_rel++;
     }
 
-    char full_module_path[2048] = {0};
-    strcpy(full_module_path, top_level_pkg);
+    char full_module_path[2048];
+    int pos = 0;
+    int remaining_size = sizeof(full_module_path);
+    int written_chars = 0;
+
+    written_chars = snprintf(full_module_path + pos, remaining_size, "%s", top_level_pkg);
+    if (written_chars < 0 || written_chars >= remaining_size) {
+        fprintf(stderr, "[hlmod] Error: Module path construction failed (1).\n");
+        return;
+    }
+    pos += written_chars;
+    remaining_size -= written_chars;
 
     if (strlen(module_path_rel) > 0) {
-        strcat(full_module_path, ".");
-        strcat(full_module_path, module_path_rel);
+        written_chars = snprintf(full_module_path + pos, remaining_size, ".%s", module_path_rel);
+        if (written_chars < 0 || written_chars >= remaining_size) {
+            fprintf(stderr, "[hlmod] Error: Module path construction failed (2).\n");
+            return;
+        }
+        pos += written_chars;
+        remaining_size -= written_chars;
     }
-    
-    strcat(full_module_path, ".");
-    strcat(full_module_path, dep_class_name);
-    
+
+    written_chars = snprintf(full_module_path + pos, remaining_size, ".%s", dep_class_name);
+    if (written_chars < 0 || written_chars >= remaining_size) {
+        fprintf(stderr, "[hlmod] Error: Module path construction failed (3).\n");
+        return;
+    }
     for (char* p = full_module_path; *p; ++p) {
         if (*p == '/' || *p == '\\') {
             *p = '.';
@@ -322,7 +351,7 @@ void hlmod_generate_stubs(hl_code *code) {
         hl_type *t = &code->types[i];
         if (t->kind != HOBJ && t->kind != HSTRUCT) continue;
         char dir_path[1024];
-        get_python_path_for_type(t, base_dir, dir_path, (char[1]){0}, sizeof(dir_path));
+        get_python_path_for_type(t, base_dir, dir_path, sizeof(dir_path), NULL, 0);
         char pkg_init_path[1024];
         snprintf(pkg_init_path, sizeof(pkg_init_path), "%s/__init__.py", dir_path);
         remove(pkg_init_path);
@@ -336,7 +365,7 @@ void hlmod_generate_stubs(hl_code *code) {
         if (t->kind != HOBJ && t->kind != HSTRUCT) continue;
 
         char dir_path[1024], class_name_only[512];
-        get_python_path_for_type(t, base_dir, dir_path, class_name_only, sizeof(class_name_only));
+        get_python_path_for_type(t, base_dir, dir_path, sizeof(dir_path), class_name_only, sizeof(class_name_only));
         
         char file_path[1024];
         snprintf(file_path, sizeof(file_path), "%s/%s.py", dir_path, class_name_only);
@@ -394,7 +423,7 @@ void hlmod_generate_stubs(hl_code *code) {
 
         char parent_class_arg[512] = "HlObject";
         if (t->obj->super) {
-            get_python_path_for_type(t->obj->super, base_dir, (char[1]){0}, parent_class_arg, sizeof(parent_class_arg));
+            get_python_path_for_type(t->obj->super, base_dir, NULL, 0, parent_class_arg, sizeof(parent_class_arg));
         }
         fprintf(f, "@hltype(%i)\nclass %s(%s):\n", i, class_name_only, parent_class_arg);
 

@@ -483,6 +483,10 @@ int main(int argc, pchar *argv[]) {
 		return 1;
 	}
 
+#ifdef USE_HLMOD_CRASH
+	hlmod_setup_handler();
+#endif
+
     hlmod_generate_stubs(ctx.code);
 
     printf("[hlmod] Initializing HL module...\n");
@@ -534,9 +538,6 @@ int main(int argc, pchar *argv[]) {
 	cl.t = ctx.code->functions[ctx.m->functions_indexes[ctx.m->code->entrypoint]].type;
 	cl.fun = ctx.m->functions_ptrs[ctx.m->code->entrypoint];
 	cl.hasValue = 0;
-#ifdef USE_HLMOD_CRASH
-	hlmod_setup_handler();
-#endif
 	hl_profile_setup(profile_count);
 	ctx.ret = hl_dyn_call_safe(&cl,NULL,0,&isExc);
 
