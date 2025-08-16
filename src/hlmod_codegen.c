@@ -231,7 +231,7 @@ static void type_set_add(hl_type_set* set, hl_type* t) {
     if (set->count >= set->capacity) {
         set->capacity = set->capacity == 0 ? 16 : set->capacity * 2;
         set->items = realloc(set->items, set->capacity * sizeof(hl_type*));
-        if (!set->items) { fprintf(stderr, "[hlmod] FATAL: realloc failed.\n"); exit(1); }
+        if (!set->items) { fprintf(stderr, "[hlmod] FATAL: realloc failed.\n"); fflush(stderr); exit(1); }
     }
     set->items[set->count++] = t;
 }

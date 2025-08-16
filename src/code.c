@@ -434,6 +434,25 @@ hl_code *hl_code_read( const unsigned char *data, int size, char **error_msg ) {
 	c = hl_zalloc(&alloc,sizeof(hl_code));
 	c->alloc = alloc;
 	hl_alloc_init(&c->falloc);
+
+	{
+		int start_pos = -1;
+		for (i = 0; i <= size - 3; i++) {
+			if (data[i] == 'H' && data[i + 1] == 'L' && data[i + 2] == 'B') {
+				start_pos = i;
+				break;
+			}
+			if (i == 1) {
+				printf("[hlmod] Searching for bytecode...\n");
+			}
+		}
+
+		if (start_pos == -1) {
+			EXIT("Invalid HL bytecode header: magic not found");
+		}
+		r->pos = start_pos;
+	}
+
 	if( READ() != 'H' || READ() != 'L' || READ() != 'B' )
 		EXIT("Invalid HL bytecode header");
 	r->code = c;
