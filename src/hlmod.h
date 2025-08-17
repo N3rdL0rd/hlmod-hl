@@ -6,7 +6,7 @@
 #include <hl.h>
 #include <hlmodule.h>
 
-#define HL_MAX_ARGS 9
+#define HL_MAX_ARGS 64
 
 typedef struct {
     PyObject_HEAD
@@ -26,6 +26,9 @@ extern PyTypeObject HlHookType;
 PyObject* hlmod_py_register_hlobj(PyObject *self, PyObject *args);
 PyObject* hlmod_py_get_obj_field(PyObject *self, PyObject *args);
 PyObject* hlmod_py_set_obj_field(PyObject *self, PyObject *args);
+
+PyObject* hlmod_py_set_fixed_prng(PyObject *self, PyObject *args);
+PyObject* hlmod_py_get_fixed_prng(PyObject *self, PyObject *args);
 
 extern THREAD_LOCAL int64 g_return_value_int;
 extern THREAD_LOCAL double g_return_value_double;

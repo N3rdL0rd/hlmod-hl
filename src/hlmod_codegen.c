@@ -141,6 +141,10 @@ static void print_method_stub_from_func(FILE *f, const char* name, hl_function *
 
     int nargs = func->type->fun->nargs;
     int real_nargs = nargs > 0 ? nargs - 1 : 0;
+    if (real_nargs > HL_MAX_ARGS) {
+        fprintf(stderr, "[hlmod] FATAL: Function %s has %d args, exceeding max of %d. Increase HL_MAX_ARGS to prevent this issue!\n", name, real_nargs, HL_MAX_ARGS);
+        exit(65);
+    }
     const uchar* arg_names[HL_MAX_ARGS];
     for(int i = 0; i < real_nargs; i++) arg_names[i] = NULL;
     get_argument_names(func, code, arg_names, real_nargs);
@@ -150,7 +154,6 @@ static void print_method_stub_from_func(FILE *f, const char* name, hl_function *
         const char* arg_name_utf8;
         char fallback_name[16];
         
-        // ** FIX HERE **: Use k-1 to index the names array, as it does not include 'this'.
         if (arg_names[k-1]) {
             arg_name_utf8 = (char*)hl_to_utf8(arg_names[k-1]);
         } else {
@@ -344,7 +347,7 @@ static void print_absolute_import_for_type(FILE* f, hl_type* importer_type, hl_t
 void hlmod_generate_stubs(hl_code *code) {
     const char* base_dir = "./mods/stubs";
     clock_t start_time = clock();
-    printf("[hlmod] Generating class stubs...\n");
+    printf("[hlmod] Generating class stubs... (this may take up to 10 seconds)\n");
     mkdir_p(base_dir);
 
     for (int i = 0; i < code->ntypes; i++) {
