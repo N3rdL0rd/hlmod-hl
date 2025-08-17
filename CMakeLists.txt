@@ -224,6 +224,12 @@ if(NOT MSVC)
     target_link_options(hl PRIVATE "$<$<CONFIG:Debug,RelWithDebInfo>:-g;-rdynamic>")
 else()
     target_link_options(hl PRIVATE "$<$<CONFIG:Debug,RelWithDebInfo>:${CMAKE_DEBUG_LINK_FLAGS}>")
+    # set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /Zi")
+    # set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /Zi")
+
+    # set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} /DEBUG /GenerateDebugInfo /OPT:REF /OPT:ICF")
+
+    # set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} /DEBUG /GenerateDebugInfo /OPT:REF /OPT:ICF")
 endif()
 
 if(BUILD_TESTING)

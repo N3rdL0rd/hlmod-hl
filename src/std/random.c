@@ -34,6 +34,10 @@
 #	include <unistd.h>
 #endif
 
+#include <std_globals.h>
+
+bool g_fixed_prng = false;
+
 #define NSEEDS	25
 #define MAX		7
 
@@ -72,18 +76,18 @@ HL_PRIM rnd *hl_rnd_init_system() {
 	rnd *r = hl_rnd_alloc();
 	int pid = getpid();
 	unsigned int time;
+	if (g_fixed_prng) {
+		time = 4644546;
+		pid = 0;
+	} else {
 #ifdef HL_WIN
-	time = GetTickCount();
+		time = GetTickCount();
 #else
-	struct timeval t;
-	gettimeofday(&t,NULL);
-	time = t.tv_sec * 1000000 + t.tv_usec;
+		struct timeval t;
+		gettimeofday(&t,NULL);
+		time = t.tv_sec * 1000000 + t.tv_usec;
 #endif
-#ifdef HL_DEBUG_REPRO
-	// fixed random seed
-	time = 4644546;
-	pid = 0;
-#endif
+	}
 	hl_rnd_set_seed(r,time ^ (pid | (pid << 16)));
 	return r;
 }

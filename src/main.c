@@ -159,6 +159,8 @@ static PyMethodDef HlmodMethods[] = {
     {"register_hlobj", hlmod_py_register_hlobj, METH_VARARGS, "Registers a Python class for a given Haxe type index."},
     {"get_obj_field", hlmod_py_get_obj_field, METH_VARARGS, "Gets a field value from a Haxe object."},
     {"set_obj_field", hlmod_py_set_obj_field, METH_VARARGS, "Sets a field value on a Haxe object."},
+    {"set_fixed_prng", hlmod_py_set_fixed_prng, METH_VARARGS, "Sets the PRNG to a fixed or random state."},
+    {"get_fixed_prng", hlmod_py_get_fixed_prng, METH_NOARGS, "Gets whether the PRNG is in a fixed state."},
     {NULL, NULL, 0, NULL}
 };
 static struct PyModuleDef hlmod_module_def = {

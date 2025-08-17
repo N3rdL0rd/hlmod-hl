@@ -3,6 +3,7 @@
 #include <hlmod.h>
 #include <Python.h>
 #include <structmember.h>
+#include <std_globals.h>
 
 bool uchar_eq(const uchar* s1, const uchar* s2) {
     while (*s1 != u'\0' && *s2 != u'\0') {
@@ -258,16 +259,27 @@ void* hlmod_cast_to_hl(PyObject* obj, hl_type* type) {
 
         const char* buffer = PyBytes_AsString(utf16_bytes);
         Py_ssize_t size_in_bytes = PyBytes_Size(utf16_bytes);
-        
-        const unsigned char* char_buffer = (const unsigned char*)(buffer + 2);
-        int data_size_in_bytes = size_in_bytes - 2;
+
+        const char* string_start = buffer;
+        Py_ssize_t string_size = size_in_bytes;
+
+        if (size_in_bytes >= 2 && (unsigned char)buffer[0] == 0xFF && (unsigned char)buffer[1] == 0xFE) {
+            string_start += 2;
+            string_size -= 2;
+        }
+
+        if (string_size % 2 != 0) {
+            fprintf(stderr, "[hlmod] [WARN] UTF-16 string conversion resulted in an odd number of bytes.\n");
+            string_size--;
+        }
 
         vstring* s_data = (vstring*)hl_gc_alloc_raw(sizeof(vstring));
-        uchar* s_val = (uchar*)hl_gc_alloc_raw(data_size_in_bytes);
-        memcpy(s_val, buffer, data_size_in_bytes);
+        uchar* s_val = (uchar*)hl_gc_alloc_raw(string_size);
+        memcpy(s_val, string_start, string_size);
+
         s_data->t = type;
         s_data->bytes = s_val;
-        s_data->length = data_size_in_bytes / 2;
+        s_data->length = string_size / 2;
 
         Py_DECREF(utf16_bytes);
 
@@ -449,6 +461,39 @@ PyObject* hlmod_py_set_obj_field(PyObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 #pragma endregion
+
+#pragma region other python-side utils
+
+PyObject* hlmod_py_get_fixed_prng(PyObject *self, PyObject *args) {
+    if (g_fixed_prng) {
+        Py_RETURN_TRUE;
+    }
+    Py_RETURN_FALSE;
+}
+
+PyObject* hlmod_py_set_fixed_prng(PyObject *self, PyObject *args) {
+    PyObject *py_val;
+
+    if (!PyArg_ParseTuple(args, "O", &py_val)) {
+        return NULL;
+    }
+
+    if (!PyBool_Check(py_val)) {
+        PyErr_SetString(PyExc_TypeError, "Argument must be a boolean (True or False).");
+        return NULL;
+    }
+
+    if (py_val == Py_True) {
+        g_fixed_prng = true;
+    } else {
+        g_fixed_prng = false;
+    }
+
+    Py_RETURN_NONE;
+}
+
+#pragma endregion
+
 #pragma region JIT hook
 /**
  * @brief The C hook that will be called from the JIT-compiled code.
