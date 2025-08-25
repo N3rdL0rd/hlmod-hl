@@ -46,7 +46,7 @@ static void _str_append(uchar *buf, int *pos, int buf_size, const uchar *str)
 {
     if (!str)
         return;
-    int len = ustrlen(str);
+    size_t len = ustrlen(str);
     if (*pos + len < buf_size)
     {
         memcpy(buf + *pos, str, len * sizeof(uchar));
@@ -370,9 +370,7 @@ static void collect_type_dependencies(hl_type *t, hl_type_set *deps)
     }
 }
 
-static void get_python_path_for_type(hl_type *t, const char *base_dir,
-                                     char *dir_path_out, size_t dir_path_size,
-                                     char *class_name_out, size_t class_name_size)
+static void get_python_path_for_type(hl_type *t, const char *base_dir, char *dir_path_out, size_t dir_path_size, char *class_name_out, size_t class_name_size)
 {
     const uchar *type_name = NULL;
     if ((t->kind == HOBJ || t->kind == HSTRUCT) && t->obj)
