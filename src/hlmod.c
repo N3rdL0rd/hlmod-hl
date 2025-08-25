@@ -181,11 +181,9 @@ PyObject *hlmod_py_register_hlobj(PyObject *self, PyObject *args)
 
 #pragma region Casting
 
-/**/**
- * @brief 
+/**
+ * @brief Cast an HL type to Python.
  * 
- */
- *
  * @param type The type of the HL value
  * @param ptr A pointer to the HL value
  * @returns a PyObject* that is a casted version of the HL value

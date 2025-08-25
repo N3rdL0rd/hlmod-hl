@@ -1,4 +1,4 @@
-#include "hlmod_codegen.h"
+#include <hlmod_codegen.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -6,6 +6,7 @@
 #include <time.h>
 #include <hl.h>
 #include <hlmod.h>
+#include <cJSON.h>
 
 /*=================================================================================================
  *
@@ -28,19 +29,26 @@ typedef struct hl_type_set
     int capacity;
 } hl_type_set;
 
+static cJSON *g_docs_root = NULL;
+
 const uchar *python_type_str(hl_type *t);
 static void mkdir_p(const char *path);
 static hl_function *find_function_by_findex(hl_code *code, int findex);
 static void to_python_safe_name(const uchar *u_name, char *buffer, size_t buffer_size);
-static void print_method_stub_from_func(FILE *f, const char *name, hl_function *func, int findex, hl_code *code);
-static void print_method_stub_from_type(FILE *f, const char *name, hl_type_fun *fun_type);
+static void print_method_stub_from_func(FILE *f, const char *name, hl_function *func, int findex, hl_code *code, const char *docstring);
+static void print_method_stub_from_type(FILE *f, const char *name, hl_type_fun *fun_type, const char *docstring);
 static void type_set_init(hl_type_set *set);
 static void type_set_add(hl_type_set *set, hl_type *t);
 static void type_set_free(hl_type_set *set);
 static void collect_type_dependencies(hl_type *t, hl_type_set *deps);
-static void get_python_path_for_type(hl_type *t, const char *base_dir, char *dir_path_out, char *class_name_out, size_t out_size);
+static void get_python_path_for_type(hl_type *t, const char *base_dir, char *dir_path_out, size_t dir_path_size, char *class_name_out, size_t class_name_size);
 static void print_absolute_import_for_type(FILE *f, hl_type *importer_type, hl_type *dependency_type, const char *base_dir, bool is_indented);
 static void _python_type_str_rec(hl_type *t, uchar *buf, int *pos, int buf_size);
+static void load_documentation();
+static void free_documentation();
+static const char *get_doc_for_type(hl_type *t);
+static const char *get_doc_for_member(const char *type_name_full, const char *member_type, const char *member_name);
+static void print_docstring(FILE *f, const char *doc, const char *indent);
 
 static void _str_append(uchar *buf, int *pos, int buf_size, const uchar *str)
 {
@@ -50,7 +58,7 @@ static void _str_append(uchar *buf, int *pos, int buf_size, const uchar *str)
     if (*pos + len < buf_size)
     {
         memcpy(buf + *pos, str, len * sizeof(uchar));
-        *pos += len;
+        *pos += (int)len;
     }
 }
 
@@ -197,11 +205,13 @@ static void get_argument_names(hl_function *func, hl_code *code, const uchar **n
     }
 }
 
-static void print_method_stub_from_func(FILE *f, const char *name, hl_function *func, int findex, hl_code *code)
+static void print_method_stub_from_func(FILE *f, const char *name, hl_function *func, int findex, hl_code *code, const char *docstring)
 {
     if (!func || !func->type || (func->type->kind != HFUN && func->type->kind != HMETHOD))
     {
-        fprintf(f, "    def %s(self, *args, **kwargs) -> Any: ... # findex: %d\n", name, findex);
+        fprintf(f, "    def %s(self, *args, **kwargs) -> Any:\n", name);
+        print_docstring(f, docstring, "        ");
+        fprintf(f, "        ... # findex: %d\n", findex);
         return;
     }
 
@@ -234,18 +244,207 @@ static void print_method_stub_from_func(FILE *f, const char *name, hl_function *
         }
         fprintf(f, ", %s: %s", arg_name_utf8, (char *)hl_to_utf8(python_type_str(func->type->fun->args[k])));
     }
-    fprintf(f, ") -> %s: ... # findex: %d\n", (char *)hl_to_utf8(python_type_str(func->type->fun->ret)), findex);
+    fprintf(f, ") -> %s:\n", (char *)hl_to_utf8(python_type_str(func->type->fun->ret)));
+    print_docstring(f, docstring, "        ");
+    fprintf(f, "        ... # findex: %d\n", findex);
 }
 
-static void print_method_stub_from_type(FILE *f, const char *name, hl_type_fun *fun_type)
+static void print_method_stub_from_type(FILE *f, const char *name, hl_type_fun *fun_type, const char *docstring)
 {
     fprintf(f, "    def %s(self", name);
     for (int k = 1; k < fun_type->nargs; k++)
     { // Start at 1 to skip 'this'
         fprintf(f, ", arg%d: %s", k - 1, (char *)hl_to_utf8(python_type_str(fun_type->args[k])));
     }
-    fprintf(f, ") -> %s: ...\n", (char *)hl_to_utf8(python_type_str(fun_type->ret)));
+    fprintf(f, ") -> %s:\n", (char *)hl_to_utf8(python_type_str(fun_type->ret)));
+    print_docstring(f, docstring, "        ");
+    fprintf(f, "        ...\n");
 }
+
+static char *read_file_to_buffer(const char *filename)
+{
+    FILE *f = fopen(filename, "rb");
+    if (!f)
+        return NULL;
+
+    fseek(f, 0, SEEK_END);
+    long length = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    char *buffer = (char *)malloc(length + 1);
+    if (!buffer)
+    {
+        fclose(f);
+        return NULL;
+    }
+
+    fread(buffer, 1, length, f);
+    buffer[length] = '\0';
+    fclose(f);
+    return buffer;
+}
+
+static void load_documentation()
+{
+    if (g_docs_root)
+        return;
+
+    const char *paths_to_try[] = {
+        "haxe_docs.json",
+        "./mods/haxe_docs.json",
+        "./std_doc/haxe_docs.json",
+        NULL};
+
+    char *json_string = NULL;
+    for (int i = 0; paths_to_try[i] != NULL; i++)
+    {
+        json_string = read_file_to_buffer(paths_to_try[i]);
+        if (json_string)
+        {
+            printf("[hlmod] Found documentation at: %s\n", paths_to_try[i]);
+            break;
+        }
+    }
+
+    if (!json_string)
+    {
+        printf("[hlmod] Warning: 'haxe_docs.json' not found. Stubs will be generated without docstrings.\n");
+        return;
+    }
+
+    g_docs_root = cJSON_Parse(json_string);
+    free(json_string);
+
+    if (!g_docs_root)
+    {
+        printf("[hlmod] Error: Failed to parse JSON from documentation file.\n");
+    }
+}
+
+static void free_documentation()
+{
+    if (g_docs_root)
+    {
+        cJSON_Delete(g_docs_root);
+        g_docs_root = NULL;
+    }
+}
+
+static void print_docstring(FILE *f, const char *doc, const char *indent)
+{
+    if (!doc || doc[0] == '\0')
+    {
+        return;
+    }
+
+    const char *p = doc;
+    bool is_multiline = strchr(doc, '\n') != NULL;
+
+    fprintf(f, "%s\"\"\"", indent);
+
+    if (is_multiline)
+    {
+        fprintf(f, "\n%s", indent);
+    }
+
+    while (*p)
+    {
+        switch (*p)
+        {
+        case '\"':
+            fputc('\\', f);
+            fputc('"', f);
+            break;
+        case '\\':
+            fputc('\\', f);
+            fputc('\\', f);
+            break;
+        case '\n':
+            fputc('\n', f);
+            fputs(indent, f);
+            break;
+        default:
+            fputc(*p, f);
+            break;
+        }
+        p++;
+    }
+
+    if (is_multiline)
+    {
+        fprintf(f, "\n%s\"\"\"\n", indent);
+    }
+    else
+    {
+        fprintf(f, "\"\"\"\n");
+    }
+}
+
+static const char *get_full_type_name(hl_type *t, char *buffer, size_t buffer_size)
+{
+    const uchar *type_name_u = NULL;
+    if ((t->kind == HOBJ || t->kind == HSTRUCT) && t->obj)
+    {
+        type_name_u = t->obj->name;
+    }
+    else if (t->kind == HENUM && t->tenum)
+    {
+        type_name_u = t->tenum->name;
+    }
+
+    if (type_name_u)
+    {
+        to_python_safe_name(type_name_u, buffer, buffer_size);
+        return buffer;
+    }
+    return NULL;
+}
+
+static const char *get_doc_for_type(hl_type *t)
+{
+    if (!g_docs_root)
+        return NULL;
+
+    char type_name_full[1024];
+    if (!get_full_type_name(t, type_name_full, sizeof(type_name_full)))
+        return NULL;
+
+    cJSON *type_obj = cJSON_GetObjectItemCaseSensitive(g_docs_root, type_name_full);
+    if (!type_obj)
+        return NULL;
+
+    cJSON *doc_node = cJSON_GetObjectItemCaseSensitive(type_obj, "doc");
+    if (cJSON_IsString(doc_node) && (doc_node->valuestring != NULL))
+    {
+        return doc_node->valuestring;
+    }
+
+    return NULL;
+}
+
+static const char *get_doc_for_member(const char *type_name_full, const char *member_type, const char *member_name)
+{
+    if (!g_docs_root || !type_name_full)
+        return NULL;
+
+    cJSON *type_obj = cJSON_GetObjectItemCaseSensitive(g_docs_root, type_name_full);
+    if (!type_obj)
+        return NULL;
+
+    cJSON *members_obj = cJSON_GetObjectItemCaseSensitive(type_obj, member_type); // "functions" or "fields"
+    if (!members_obj)
+        return NULL;
+
+    cJSON *doc_node = cJSON_GetObjectItemCaseSensitive(members_obj, member_name);
+    if (cJSON_IsString(doc_node) && (doc_node->valuestring != NULL))
+    {
+        return doc_node->valuestring;
+    }
+
+    return NULL;
+}
+
+
 
 static void mkdir_p(const char *path)
 {
@@ -515,6 +714,9 @@ void hlmod_generate_stubs(hl_code *code)
     const char *base_dir = "./mods/stubs";
     clock_t start_time = clock();
     printf("[hlmod] Generating class stubs... (this may take up to 10 seconds)\n");
+
+    load_documentation();
+
     mkdir_p(base_dir);
 
     for (int i = 0; i < code->ntypes; i++)
@@ -544,6 +746,9 @@ void hlmod_generate_stubs(hl_code *code)
         get_python_path_for_type(t, base_dir, dir_path, sizeof(dir_path), class_name_only, sizeof(class_name_only));
         if (class_name_only[0] == '\0')
             continue;
+
+        char type_name_full[1024];
+        get_full_type_name(t, type_name_full, sizeof(type_name_full));
 
         char file_path[1024];
         snprintf(file_path, sizeof(file_path), "%s/%s.py", dir_path, class_name_only);
@@ -621,7 +826,7 @@ void hlmod_generate_stubs(hl_code *code)
 
         if (has_type_deps)
         {
-            fprintf(f, "if TYPE_CHECKING:\n");
+            fprintf(f, "\nif TYPE_CHECKING:\n");
             for (int j = 0; j < deps.count; j++)
             {
                 if (deps.items[j] == t)
@@ -633,11 +838,11 @@ void hlmod_generate_stubs(hl_code *code)
         }
 
         type_set_free(&deps);
-        fprintf(f, "\n");
 
         if (t->kind == HENUM)
         {
-            fprintf(f, "@hltype(%i)\nclass %s(HlEnum):\n", i, class_name_only);
+            fprintf(f, "\n@hltype(%i)\nclass %s(HlEnum):\n", i, class_name_only);
+            print_docstring(f, get_doc_for_type(t), "    ");
             bool has_param_constructs = false;
             bool has_no_param_constructs = false;
             for (int j = 0; j < t->tenum->nconstructs; j++)
@@ -686,7 +891,13 @@ void hlmod_generate_stubs(hl_code *code)
             {
                 get_python_path_for_type(t->obj->super, base_dir, NULL, 0, parent_class_arg, sizeof(parent_class_arg));
             }
-            fprintf(f, "@hltype(%i)\nclass %s(%s):\n", i, class_name_only, parent_class_arg);
+            fprintf(f, "\n@hltype(%i)\nclass %s(%s):\n", i, class_name_only, parent_class_arg);
+            const char *class_doc = get_doc_for_type(t);
+            print_docstring(f, class_doc, "    ");
+            if (class_doc && class_doc[0] != '\0')
+            {
+                fprintf(f, "\n");
+            }
 
             int *binding_map = NULL;
             if (t->obj->nfields > 0)
@@ -706,26 +917,30 @@ void hlmod_generate_stubs(hl_code *code)
             bool has_content = false;
             if (t->obj->nfields > 0)
             {
-                fprintf(f, "\n    # --- Fields ---\n");
+                fprintf(f, "    # --- Fields ---\n");
                 for (int j = 0; j < t->obj->nfields; j++)
                 {
                     hl_obj_field *field = &t->obj->fields[j];
                     char safe_field_name[512];
                     to_python_safe_name(field->name, safe_field_name, sizeof(safe_field_name));
+                    const char *field_doc = get_doc_for_member(type_name_full, "fields", safe_field_name);
+
                     if (binding_map && binding_map[j] != -1)
                     {
                         hl_function *func = find_function_by_findex(code, binding_map[j]);
                         if (func)
-                            print_method_stub_from_func(f, safe_field_name, func, binding_map[j], code);
+                            print_method_stub_from_func(f, safe_field_name, func, binding_map[j], code, field_doc);
                     }
                     else if (field->t->kind == HFUN || field->t->kind == HMETHOD)
                     {
-                        print_method_stub_from_type(f, safe_field_name, field->t->fun);
+                        print_method_stub_from_type(f, safe_field_name, field->t->fun, field_doc);
                     }
                     else
                     {
                         fprintf(f, "    %s: %s\n", safe_field_name, (char *)hl_to_utf8(python_type_str(field->t)));
+                        print_docstring(f, field_doc, "    ");
                     }
+                    fprintf(f, "\n");
                     has_content = true;
                 }
             }
@@ -734,15 +949,17 @@ void hlmod_generate_stubs(hl_code *code)
 
             if (t->obj->nproto > 0)
             {
-                fprintf(f, "\n    # --- Methods ---\n");
+                fprintf(f, "    # --- Methods ---\n");
                 for (int j = 0; j < t->obj->nproto; j++)
                 {
                     hl_obj_proto *proto = &t->obj->proto[j];
                     char safe_proto_name[512];
                     to_python_safe_name(proto->name, safe_proto_name, sizeof(safe_proto_name));
+                    const char *method_doc = get_doc_for_member(type_name_full, "functions", safe_proto_name);
                     hl_function *func = find_function_by_findex(code, proto->findex);
                     if (func)
-                        print_method_stub_from_func(f, safe_proto_name, func, proto->findex, code);
+                        print_method_stub_from_func(f, safe_proto_name, func, proto->findex, code, method_doc);
+                    fprintf(f, "\n");
                     has_content = true;
                 }
             }
@@ -752,6 +969,8 @@ void hlmod_generate_stubs(hl_code *code)
         }
         fclose(f);
     }
+
+    free_documentation();
 
     clock_t end_time = clock();
     double elapsed_ms = ((double)(end_time - start_time) / CLOCKS_PER_SEC) * 1000.0;

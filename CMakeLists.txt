@@ -182,6 +182,7 @@ if (WITH_VM)
         src/hlmod.c
         src/hlmod_codegen.c
         src/hlmod_crash.c
+        src/cJSON.c
     )
 
     if (UNIX AND NOT APPLE)
