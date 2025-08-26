@@ -290,7 +290,6 @@ int get_mod_load_order(const char *mods_dir, PyObject **load_order_list) {
     if (pValue == NULL) {
         fprintf(stderr, "Error: An exception occurred while defining Python mod resolver functions.\n");
         PyErr_Print();
-        Py_DECREF(pModule);
         return 0;
     }
     Py_DECREF(pValue);
@@ -300,7 +299,6 @@ int get_mod_load_order(const char *mods_dir, PyObject **load_order_list) {
     if (pFunc == NULL || !PyCallable_Check(pFunc)) {
         if (PyErr_Occurred()) PyErr_Print();
         fprintf(stderr, "[hlmod] Error: Cannot find callable function 'resolve_mod_order'.\n");
-        Py_DECREF(pModule);
         return 0;
     }
 
@@ -311,20 +309,15 @@ int get_mod_load_order(const char *mods_dir, PyObject **load_order_list) {
         PyErr_Print();
         Py_DECREF(pArgs);
         Py_DECREF(pFunc);
-        Py_DECREF(pModule);
         return 0;
     }
     PyTuple_SetItem(pArgs, 0, pValue); // PyTuple_SetItem steals a reference to pValue
 
-    // 5. Call the function and get the result.
     pResultObj = PyObject_CallObject(pFunc, pArgs);
-    Py_DECREF(pArgs); // We are done with the arguments tuple.
+    Py_DECREF(pArgs);
 
-    // Cleanup the function and module references now that the call is made.
     Py_DECREF(pFunc);
-    Py_DECREF(pModule);
 
-    // 6. Process the dictionary that was returned from the Python function.
     if (pResultObj != NULL) {
         pStatus = PyDict_GetItemString(pResultObj, "status");
         const char* status_str = PyUnicode_AsUTF8(pStatus);
