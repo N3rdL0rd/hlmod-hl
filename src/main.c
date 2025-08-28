@@ -29,6 +29,9 @@
 #include <hlmod.h>
 #include <hlmod_codegen.h>
 
+#include "sha256.h"
+char g_code_sha256[65] = {0};
+
 #ifdef USE_HLMOD_CRASH
 #include <hlmod_crash.h>
 #endif
@@ -99,6 +102,18 @@ static hl_code *load_code( const pchar *file, char **error_msg, bool print_error
 		pos += r;
 	}
 	fclose(f);
+    SHA256_CTX ctx;
+    BYTE hash[SHA256_BLOCK_SIZE];
+
+    sha256_init(&ctx);
+    sha256_update(&ctx, (BYTE*)fdata, size);
+    sha256_final(&ctx, hash);
+
+    for(int i = 0; i < SHA256_BLOCK_SIZE; i++)
+    	sprintf(&g_code_sha256[i * 2], "%02x", hash[i]);
+
+    printf("[hlmod] Bytecode SHA256: %s\n", g_code_sha256);
+
 	code = hl_code_read((unsigned char*)fdata, size, error_msg);
 	free(fdata);
 	return code;
@@ -161,6 +176,7 @@ static PyMethodDef HlmodMethods[] = {
     {"set_obj_field", hlmod_py_set_obj_field, METH_VARARGS, "Sets a field value on a Haxe object."},
     {"set_fixed_prng", hlmod_py_set_fixed_prng, METH_VARARGS, "Sets the PRNG to a fixed or random state."},
     {"get_fixed_prng", hlmod_py_get_fixed_prng, METH_NOARGS, "Gets whether the PRNG is in a fixed state."},
+    {"assert_code_sha", hlmod_py_assert_code_sha, METH_VARARGS, "Asserts the bytecode SHA256, exiting if it mismatches."},
     {NULL, NULL, 0, NULL}
 };
 static struct PyModuleDef hlmod_module_def = {

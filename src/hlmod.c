@@ -113,7 +113,9 @@ static PyObject *HlHook_call_original(HlHook *self, PyObject *py_args)
 
     if (is_exc)
     {
-        PyErr_SetString(PyExc_RuntimeError, "An exception occurred in the original Haxe function.");
+        uchar *u_exc_str = hl_to_string(hl_result);
+        char *exc_str_utf8 = hl_to_utf8(u_exc_str);
+        PyErr_Format(PyExc_RuntimeError, "An exception occurred in the original Haxe function: %s", exc_str_utf8);
         return NULL;
     }
 
@@ -334,7 +336,21 @@ void *hlmod_cast_to_hl(PyObject *obj, hl_type *type)
             *ret_ptr = NULL;
             return ret_ptr;
         }
-        return hlmod_cast_to_hl(obj, type->tparam);
+
+        hl_type* inner_type = type->tparam;
+        if (hl_is_ptr(inner_type)) {
+            return hlmod_cast_to_hl(obj, inner_type);
+        } else {
+            vdynamic* box = hl_alloc_dynamic(inner_type);
+            void* inner_val_ptr = hlmod_cast_to_hl(obj, inner_type);
+            if (!inner_val_ptr) return NULL;
+
+            memcpy(&box->v, inner_val_ptr, hl_type_size(inner_type));
+
+            void** ret_ptr = (void**)hl_gc_alloc_raw(sizeof(void*));
+            *ret_ptr = box;
+            return ret_ptr;
+        }
     }
 
     if (type->kind == HARRAY)
@@ -669,6 +685,28 @@ PyObject *hlmod_py_set_fixed_prng(PyObject *self, PyObject *args)
     else
     {
         g_fixed_prng = false;
+    }
+
+    Py_RETURN_NONE;
+}
+
+PyObject *hlmod_py_assert_code_sha(PyObject* self, PyObject* args)
+{
+    const char* expected_sha;
+
+    if (!PyArg_ParseTuple(args, "s", &expected_sha)) {
+        return NULL;
+    }
+
+    printf("[hlmod] Expecting SHA256: %s\n", expected_sha);
+
+    if (strcmp(g_code_sha256, expected_sha) != 0) {
+        fprintf(stderr, "\n[hlmod] FATAL ERROR: Bytecode SHA256 mismatch!\n");
+        fprintf(stderr, "  Expected: %s\n", expected_sha);
+        fprintf(stderr, "  Actual:   %s\n", g_code_sha256);
+        fprintf(stderr, "  This mod is not compatible with this version of the game. Halting.\n");
+        fflush(stderr);
+        exit(1);
     }
 
     Py_RETURN_NONE;

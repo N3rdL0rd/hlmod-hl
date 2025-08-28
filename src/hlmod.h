@@ -30,6 +30,8 @@ PyObject* hlmod_py_set_obj_field(PyObject *self, PyObject *args);
 PyObject* hlmod_py_set_fixed_prng(PyObject *self, PyObject *args);
 PyObject* hlmod_py_get_fixed_prng(PyObject *self, PyObject *args);
 
+PyObject *hlmod_py_assert_code_sha(PyObject* self, PyObject* args);
+
 extern THREAD_LOCAL int64 g_return_value_int;
 extern THREAD_LOCAL double g_return_value_double;
 extern THREAD_LOCAL bool g_is_passthrough_call;
@@ -47,6 +49,8 @@ typedef struct HookRegistryEntry {
 extern HookRegistryEntry* g_hook_registry;
 extern hl_module *g_module;
 extern hl_code *g_code;
+
+extern char g_code_sha256[65];
 
 void hlmod_register_hook(int findex, PyObject* callback);
 
