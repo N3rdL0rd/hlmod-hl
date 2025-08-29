@@ -899,6 +899,31 @@ void hlmod_generate_stubs(hl_code *code)
                 fprintf(f, "\n");
             }
 
+            fprintf(f, "    _hl_fields = {\n");
+            
+            hl_type* inheritance_chain[HLMOD_MAX_INHERITANCE];
+            int chain_depth = 0;
+            hl_type* current_type = t;
+            while(current_type && chain_depth < HLMOD_MAX_INHERITANCE) {
+                inheritance_chain[chain_depth++] = current_type;
+                current_type = current_type->obj ? current_type->obj->super : NULL;
+            }
+
+            int absolute_field_index = 0;
+            for (int depth = chain_depth - 1; depth >= 0; depth--) {
+                hl_type* type_in_chain = inheritance_chain[depth];
+                if (type_in_chain->obj) {
+                    for (int j = 0; j < type_in_chain->obj->nfields; j++) {
+                        hl_obj_field* field = &type_in_chain->obj->fields[j];
+                        char safe_name[512];
+                        to_python_safe_name(field->name, safe_name, sizeof(safe_name));
+                        fprintf(f, "        \"%s\": %d,\n", safe_name, absolute_field_index);
+                        absolute_field_index++;
+                    }
+                }
+            }
+            fprintf(f, "    }\n\n");
+
             int *binding_map = NULL;
             if (t->obj->nfields > 0)
             {

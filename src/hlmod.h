@@ -7,6 +7,7 @@
 #include <hlmodule.h>
 
 #define HL_MAX_ARGS 64
+#define HLMOD_MAX_INHERITANCE 128
 
 typedef struct {
     PyObject_HEAD
