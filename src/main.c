@@ -103,10 +103,10 @@ static hl_code *load_code( const pchar *file, char **error_msg, bool print_error
 	}
 	fclose(f);
     SHA256_CTX ctx;
-    BYTE hash[SHA256_BLOCK_SIZE];
+    SHA256_BYTE hash[SHA256_BLOCK_SIZE];
 
     sha256_init(&ctx);
-    sha256_update(&ctx, (BYTE*)fdata, size);
+    sha256_update(&ctx, (SHA256_BYTE*)fdata, size);
     sha256_final(&ctx, hash);
 
     for(int i = 0; i < SHA256_BLOCK_SIZE; i++)
