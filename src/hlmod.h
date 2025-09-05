@@ -54,5 +54,6 @@ extern hl_code *g_code;
 extern char g_code_sha256[65];
 
 void hlmod_register_hook(int findex, PyObject* callback);
+const char *kind2str(hl_type_kind kind);
 
 #endif // HLMOD_H

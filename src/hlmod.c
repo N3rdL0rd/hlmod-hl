@@ -834,3 +834,57 @@ int jit_dispatch_hook(int findex, int nargs, void **args)
         return res;
     }
 }
+
+const char *kind2str(hl_type_kind kind) {
+    switch(kind) {
+        case HVOID:
+            return "void";
+        case HUI8:
+            return "u8";
+        case HUI16:
+            return "u16";
+        case HI32:
+            return "i32";
+        case HI64:
+            return "i64";
+        case HF32:
+            return "f32";
+        case HF64:
+            return "f64";
+        case HBOOL:
+            return "bool";
+        case HBYTES:
+            return "bytes";
+        case HDYN:
+            return "dyn";
+        case HFUN:
+            return "fun";
+        case HOBJ:
+            return "obj";
+        case HARRAY:
+            return "array";
+        case HTYPE:
+            return "type";
+        case HREF:
+            return "ref";
+        case HVIRTUAL:
+            return "virtual";
+        case HDYNOBJ:
+            return "dynobj";
+        case HABSTRACT:
+            return "abstract";
+        case HENUM:
+            return "enum";
+        case HNULL:
+            return "null";
+        case HMETHOD:
+            return "method";
+        case HSTRUCT:
+            return "struct";
+        case HPACKED:
+            return "packed";
+        case HGUID:
+            return "guid";
+    }
+    return "unknown";
+}
