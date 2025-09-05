@@ -1,3 +1,7 @@
+# hlmod Hashlink fork
+
+See [hlmod](https://github.com/N3rdL0rd/hlmod) for more information. This fork is independently maintained from the Haxe Foundation and issues with it should not be escalated upstream.
+
 <a href="https://hashlink.haxe.org"><img src="https://hashlink.haxe.org/hashlink.svg" alt="HashLink" align="right" /></a>
 
 # HashLink
