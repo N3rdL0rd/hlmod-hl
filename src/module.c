@@ -370,8 +370,9 @@ static void *resolve_library( const char *lib, bool is_opt ) {
 
 	strcpy(tmp+strlen(lib),".hdll");
 	h = dlopen(tmp,RTLD_LAZY);
-	if( h == NULL && !is_opt )
+	if( h == NULL && !is_opt ) {
 		hl_fatal1("Failed to load library %s",tmp);
+	}
 	return h;
 }
 
@@ -565,6 +566,9 @@ static void hl_module_init_natives( hl_module *m ) {
 				m->functions_ptrs[n->findex] = hl_prim_not_loaded;
 				continue;
 			}
+#ifndef HL_WIN
+			printf("[hlmod] Failed to load function: %s\n", dlerror());
+#endif
 			hl_fatal2("Failed to load function %s@%s",n->lib,n->name);
 		}
 		m->functions_ptrs[n->findex] = ((void *(*)( const char **p ))f)(&sign);
