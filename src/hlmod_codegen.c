@@ -209,9 +209,9 @@ static void print_method_stub_from_func(FILE *f, const char *name, hl_function *
 {
     if (!func || !func->type || (func->type->kind != HFUN && func->type->kind != HMETHOD))
     {
-        fprintf(f, "    def %s(self, *args, **kwargs) -> Any:\n", name);
+        fprintf(f, "    def %s(self, *args) -> Any:\n", name);
         print_docstring(f, docstring, "        ");
-        fprintf(f, "        ... # findex: %d\n", findex);
+        fprintf(f, "        return self._hlmod_call_findex(%d, *args) # FALLBACK! f@%d\n", findex, findex);
         return;
     }
 
@@ -246,7 +246,24 @@ static void print_method_stub_from_func(FILE *f, const char *name, hl_function *
     }
     fprintf(f, ") -> %s:\n", (char *)hl_to_utf8(python_type_str(func->type->fun->ret)));
     print_docstring(f, docstring, "        ");
-    fprintf(f, "        ... # findex: %d\n", findex);
+    fprintf(f, "        return self._hlmod_call_findex(%d", findex);
+    for (int k = 1; k < nargs; k++)
+    {
+        const char *arg_name_utf8;
+        char fallback_name[16];
+
+        if (arg_names[k - 1])
+        {
+            arg_name_utf8 = (char *)hl_to_utf8(arg_names[k - 1]);
+        }
+        else
+        {
+            snprintf(fallback_name, sizeof(fallback_name), "arg%d", k - 1);
+            arg_name_utf8 = fallback_name;
+        }
+        fprintf(f, ", %s", arg_name_utf8);
+    }
+    fprintf(f, ") # findex: %d\n", findex);
 }
 
 static void print_method_stub_from_type(FILE *f, const char *name, hl_type_fun *fun_type, const char *docstring)

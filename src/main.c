@@ -177,6 +177,7 @@ static PyMethodDef HlmodMethods[] = {
     {"set_fixed_prng", hlmod_py_set_fixed_prng, METH_VARARGS, "Sets the PRNG to a fixed or random state."},
     {"get_fixed_prng", hlmod_py_get_fixed_prng, METH_NOARGS, "Gets whether the PRNG is in a fixed state."},
     {"assert_code_sha", hlmod_py_assert_code_sha, METH_VARARGS, "Asserts the bytecode SHA256, exiting if it mismatches."},
+    {"call", hlmod_py_call, METH_VARARGS, "Calls an HL function by findex."},
     {NULL, NULL, 0, NULL}
 };
 static struct PyModuleDef hlmod_module_def = {

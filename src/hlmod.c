@@ -30,6 +30,9 @@ static int g_hlobjs_l = 0;
 static PyObject *HlPtr_New(void *ptr, int kind);
 static PyObject *HlPtr_get_ptr(HlPtr *self, void *closure);
 static PyObject *HlPtr_get_kind(HlPtr *self, void *closure);
+static int HlPtr_init(HlPtr *self, PyObject *args, PyObject *kwds);
+static void HlPtr_dealloc(HlPtr *self);
+
 
 static PyGetSetDef HlPtr_getsetters[] = {
     {"ptr", (getter)HlPtr_get_ptr, NULL, "The raw pointer value", NULL},
@@ -45,17 +48,63 @@ PyTypeObject HlPtrType = {
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_new = PyType_GenericNew,
     .tp_getset = HlPtr_getsetters,
+    .tp_init = (initproc)HlPtr_init,
+    .tp_dealloc = (destructor)HlPtr_dealloc,
 };
 
 static PyObject *HlPtr_New(void *ptr, int kind)
 {
-    HlPtr *self = (HlPtr *)HlPtrType.tp_alloc(&HlPtrType, 0);
-    if (self != NULL)
-    {
-        self->ptr = ptr;
-        self->kind = kind;
+    PyObject *args = Py_BuildValue("(Ki)", (unsigned long long)ptr, kind);
+    if (args == NULL) {
+        return NULL;
     }
-    return (PyObject *)self;
+
+    PyObject *self = PyObject_CallObject((PyObject *)&HlPtrType, args);
+    
+    Py_DECREF(args);
+
+    return self;
+}
+
+static void HlPtr_dealloc(HlPtr *self)
+{
+    if (self->root != NULL)
+    {
+        hl_remove_root(self->root);
+        self->root = NULL; // Prevent double-free
+    }
+    Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+static int HlPtr_init(HlPtr *self, PyObject *args, PyObject *kwds)
+{
+    unsigned long long ptr_val;
+    int kind = 0;
+    static char *kwlist[] = {"ptr", "kind", NULL};
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "K|i", kwlist, &ptr_val, &kind))
+    {
+        return -1;
+    }
+
+    self->ptr = (void *)ptr_val;
+    self->kind = kind;
+    self->root = NULL;
+
+    if (self->ptr != NULL)
+    {
+        self->root = (void **)hl_gc_alloc_raw(sizeof(void *));
+        if (self->root == NULL) {
+            PyErr_SetString(PyExc_MemoryError, "Failed to allocate memory for HL GC root.");
+            return -1;
+        }
+
+        *(self->root) = self->ptr;
+
+        hl_add_root(self->root);
+    }
+
+    return 0;
 }
 
 static PyObject *HlPtr_get_ptr(HlPtr *self, void *closure)
@@ -710,6 +759,82 @@ PyObject *hlmod_py_assert_code_sha(PyObject* self, PyObject* args)
     }
 
     Py_RETURN_NONE;
+}
+
+#pragma endregion
+
+#pragma region Call
+
+PyObject *hlmod_py_call(PyObject *self, PyObject *args)
+{
+    int findex;
+    PyObject *py_args_tuple;
+
+    if (!PyArg_ParseTuple(args, "iO!", &findex, &PyTuple_Type, &py_args_tuple))
+    {
+        PyErr_SetString(PyExc_TypeError, "Usage: call(findex: int, args: tuple)");
+        return NULL;
+    }
+
+    if (findex < 0 || findex >= g_module->code->nfunctions) {
+        PyErr_Format(PyExc_IndexError, "Function index %d is out of bounds.", findex);
+        return NULL;
+    }
+    hl_function *f = g_module->code->functions + g_module->functions_indexes[findex];
+    hl_type_fun *fun_type = f->type->fun;
+    int nargs = fun_type->nargs;
+
+    if (PyTuple_Size(py_args_tuple) != nargs)
+    {
+        PyErr_Format(PyExc_TypeError, "Haxe function f@%d expected %d arguments, but got %zd", findex, nargs, PyTuple_Size(py_args_tuple));
+        return NULL;
+    }
+
+    vdynamic *vargs[HL_MAX_ARGS];
+    if (nargs > HL_MAX_ARGS)
+    {
+        PyErr_SetString(PyExc_ValueError, "Cannot call Haxe function with more than HL_MAX_ARGS arguments.");
+        return NULL;
+    }
+
+    for (int i = 0; i < nargs; i++)
+    {
+        PyObject *py_arg = PyTuple_GetItem(py_args_tuple, i);
+        hl_type *hl_arg_type = fun_type->args[i];
+
+        void *hl_val_ptr = hlmod_cast_to_hl(py_arg, hl_arg_type);
+        if (hl_val_ptr == NULL)
+        {
+            return NULL;
+        }
+
+        vargs[i] = hl_make_dyn(hl_val_ptr, hl_arg_type);
+    }
+
+    vclosure cl;
+    cl.t = f->type;
+    cl.fun = g_module->functions_ptrs[findex];
+    cl.hasValue = 0;
+
+    bool is_exc;
+    vdynamic *hl_result = hl_dyn_call_safe(&cl, nargs > 0 ? vargs : NULL, nargs, &is_exc);
+
+    if (is_exc)
+    {
+        uchar *u_exc_str = hl_to_string(hl_result);
+        char *exc_str_utf8 = hl_to_utf8(u_exc_str);
+        PyErr_Format(PyExc_RuntimeError, "An exception occurred in the Haxe function f@%d: %s", findex, exc_str_utf8);
+        return NULL;
+    }
+
+    if (fun_type->ret->kind == HVOID)
+    {
+        Py_RETURN_NONE;
+    }
+
+    PyObject *py_result = hlmod_cast_to_py(fun_type->ret, &hl_result->v);
+    
+    return py_result;
 }
 
 #pragma endregion
