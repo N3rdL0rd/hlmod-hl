@@ -421,6 +421,17 @@ __declspec(dllexport) DWORD NvOptimusEnablement = 1;
 __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #endif
 
+bool fileExists(const char *path)
+{
+    FILE *fptr = fopen(path, "r");
+
+    if (fptr == NULL)
+        return false;
+
+    fclose(fptr);
+
+    return true;
+}
 
 #ifdef HL_WIN
 int wmain(int argc, pchar *argv[]) {
@@ -470,14 +481,22 @@ int main(int argc, pchar *argv[]) {
 		file = arg;
 		break;
 	}
+#define COPOUT printf("HL/JIT %d.%d.%d (c)2015-2025 Haxe Foundation. hlmod (c)2025 N3rdL0rd\n  Usage: hl <file>\n",HL_VERSION>>16,(HL_VERSION>>8)&0xFF,HL_VERSION&0xFF);return 1;
 	if( file == NULL ) {
 		FILE *fchk;
-		file = PSTR("hlboot.dat");
+        if (fileExists("hlboot.dat")) {
+		    file = PSTR("hlboot.dat");
+        } else if (fileExists("deadcells.exe")) {
+            file = PSTR("deadcells.exe"); // deadcells (and ONLY deadcells) bundles the hlboot with the main executable
+        } else {
+            COPOUT
+        }
+        printf("[hlmod] Defaulting to %s\n", file);
 		fchk = pfopen(file,"rb");
 		if( fchk == NULL ) {
-			printf("HL/JIT %d.%d.%d (c)2015-2025 Haxe Foundation. hlmod (c)2025 N3rdL0rd\n  Usage: hl <file>\n",HL_VERSION>>16,(HL_VERSION>>8)&0xFF,HL_VERSION&0xFF);
-			return 1;
+            COPOUT
 		}
+#undef COPOUT
 		fclose(fchk);
 		if( first_boot_arg >= 0 ) {
 			argv -= first_boot_arg;
