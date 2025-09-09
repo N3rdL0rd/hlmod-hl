@@ -49,6 +49,10 @@ if(MSVC)
     add_definitions(-DUNICODE -D_UNICODE)
 endif()
 
+if (MINGW)
+    add_compile_options(-municode)
+endif()
+
 list(APPEND CMAKE_MODULE_PATH
     ${CMAKE_CURRENT_SOURCE_DIR}/other/cmake
 )
@@ -170,7 +174,7 @@ set_target_properties(libhl
     PUBLIC_HEADER "${public_headers}"
 )
 
-if(WIN32)
+if(WIN32 AND MSVC)
     set_target_properties(libhl
         PROPERTIES
         OUTPUT_NAME libhl
@@ -219,7 +223,7 @@ if (WITH_VM)
     target_include_directories(hl PRIVATE ${Python_INCLUDE_DIRS})
     
     if (WIN32)
-        target_link_libraries(hl user32)
+        target_link_libraries(hl user32 shell32)
     endif()
 endif()
 

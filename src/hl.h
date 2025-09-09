@@ -184,6 +184,8 @@
 #	define IS_64	1
 #	ifdef HL_VCC
 #		define _PTR_FMT	L"%IX"
+#   elif defined(HL_MINGW)
+#		define _PTR_FMT	L"%lX"
 #	else
 #		define _PTR_FMT	u"%lX"
 #	endif

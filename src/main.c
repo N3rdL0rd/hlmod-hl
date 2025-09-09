@@ -434,7 +434,13 @@ bool fileExists(const char *path)
 }
 
 #ifdef HL_WIN
+#if defined(HL_WIN_DESKTOP) && defined(HL_MINGW)
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR lpCmdLine, INT nCmdShow) {
+    int argc = 0;
+    LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+#else
 int wmain(int argc, pchar *argv[]) {
+#endif
 #else
 int main(int argc, pchar *argv[]) {
 #endif
@@ -466,7 +472,7 @@ int main(int argc, pchar *argv[]) {
 		pchar *arg = *argv++;
 		argc--;
 		if( pcompare(arg,PSTR("--version")) == 0 ) {
-			printf("%d.%d.%d (hlmod)",HL_VERSION>>16,(HL_VERSION>>8)&0xFF,HL_VERSION&0xFF);
+			printf("%d.%d.%d (hlmod)\n",HL_VERSION>>16,(HL_VERSION>>8)&0xFF,HL_VERSION&0xFF);
 			return 0;
 		}
 		if( *arg == '-' || *arg == '+' ) {
@@ -531,7 +537,7 @@ int main(int argc, pchar *argv[]) {
     g_module = ctx.m;
     g_code = ctx.code;
 
-	printf("[hlmod] Fnding mods...\n");
+	printf("[hlmod] Finding mods...\n");
     const char* mods_directory = "./mods";
 
     PyObject* sys_path = PySys_GetObject("path");
