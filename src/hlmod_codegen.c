@@ -34,6 +34,7 @@ static cJSON *g_docs_root = NULL;
 const uchar *python_type_str(hl_type *t);
 static void mkdir_p(const char *path);
 static hl_function *find_function_by_findex(hl_code *code, int findex);
+static void sanitize_name_for_python(const char *input_name, char *buffer, size_t buffer_size);
 static void to_python_safe_name(const uchar *u_name, char *buffer, size_t buffer_size);
 static void print_method_stub_from_func(FILE *f, const char *name, hl_function *func, int findex, hl_code *code, const char *docstring);
 static void print_method_stub_from_type(FILE *f, const char *name, hl_type_fun *fun_type, const char *docstring);
@@ -49,6 +50,28 @@ static void free_documentation();
 static const char *get_doc_for_type(hl_type *t);
 static const char *get_doc_for_member(const char *type_name_full, const char *member_type, const char *member_name);
 static void print_docstring(FILE *f, const char *doc, const char *indent);
+static bool is_python_keyword(const char *s);
+
+static const char *PYTHON_KEYWORDS[] = {
+    "False", "None", "True", "and", "as", "assert", "async", "await",
+    "break", "class", "continue", "def", "del", "elif", "else",
+    "except", "finally", "for", "from", "global", "if", "import",
+    "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise",
+    "return", "try", "while", "with", "yield", NULL};
+
+static bool is_python_keyword(const char *s)
+{
+    if (!s)
+        return false;
+    for (int i = 0; PYTHON_KEYWORDS[i] != NULL; i++)
+    {
+        if (strcmp(s, PYTHON_KEYWORDS[i]) == 0)
+        {
+            return true;
+        }
+    }
+    return false;
+}
 
 static void _str_append(uchar *buf, int *pos, int buf_size, const uchar *str)
 {
@@ -223,45 +246,39 @@ static void print_method_stub_from_func(FILE *f, const char *name, hl_function *
         exit(65);
     }
     const uchar *arg_names[HL_MAX_ARGS];
+    char safe_arg_names[HL_MAX_ARGS][512];
+
     for (int i = 0; i < real_nargs; i++)
         arg_names[i] = NULL;
     get_argument_names(func, code, arg_names, real_nargs);
 
-    fprintf(f, "    def %s(self", name);
-    for (int k = 1; k < nargs; k++)
-    { // Start at 1 to skip 'this'
+    for (int i = 0; i < real_nargs; i++)
+    {
         const char *arg_name_utf8;
         char fallback_name[16];
-
-        if (arg_names[k - 1])
+        if (arg_names[i])
         {
-            arg_name_utf8 = (char *)hl_to_utf8(arg_names[k - 1]);
+            arg_name_utf8 = (char *)hl_to_utf8(arg_names[i]);
         }
         else
         {
-            snprintf(fallback_name, sizeof(fallback_name), "arg%d", k - 1);
+            snprintf(fallback_name, sizeof(fallback_name), "arg%d", i);
             arg_name_utf8 = fallback_name;
         }
-        fprintf(f, ", %s: %s", arg_name_utf8, (char *)hl_to_utf8(python_type_str(func->type->fun->args[k])));
+        sanitize_name_for_python(arg_name_utf8, safe_arg_names[i], 512);
+    }
+
+    fprintf(f, "    def %s(self", name);
+    for (int k = 1; k < nargs; k++)
+    { // Start at 1 to skip 'this'
+        fprintf(f, ", %s: %s", safe_arg_names[k - 1], (char *)hl_to_utf8(python_type_str(func->type->fun->args[k])));
     }
     fprintf(f, ") -> %s:\n", (char *)hl_to_utf8(python_type_str(func->type->fun->ret)));
     print_docstring(f, docstring, "        ");
     fprintf(f, "        return self._hlmod_call_findex(%d", findex);
     for (int k = 1; k < nargs; k++)
     {
-        const char *arg_name_utf8;
-        char fallback_name[16];
-
-        if (arg_names[k - 1])
-        {
-            arg_name_utf8 = (char *)hl_to_utf8(arg_names[k - 1]);
-        }
-        else
-        {
-            snprintf(fallback_name, sizeof(fallback_name), "arg%d", k - 1);
-            arg_name_utf8 = fallback_name;
-        }
-        fprintf(f, ", %s", arg_name_utf8);
+        fprintf(f, ", %s", safe_arg_names[k - 1]);
     }
     fprintf(f, ") # findex: %d\n", findex);
 }
@@ -461,8 +478,6 @@ static const char *get_doc_for_member(const char *type_name_full, const char *me
     return NULL;
 }
 
-
-
 static void mkdir_p(const char *path)
 {
     char tmp[1024];
@@ -489,6 +504,42 @@ static void mkdir_p(const char *path)
     }
 }
 
+static void sanitize_name_for_python(const char *input_name, char *buffer, size_t buffer_size)
+{
+    char temp_buffer[1024];
+    size_t out_pos = 0;
+
+    // Step 1: Handle `$` characters
+    for (size_t i = 0; input_name[i] != '\0' && out_pos < sizeof(temp_buffer) - 1; ++i)
+    {
+        if (input_name[i] == '$')
+        {
+            if (out_pos < sizeof(temp_buffer) - 2)
+            {
+                temp_buffer[out_pos++] = 'S';
+                temp_buffer[out_pos++] = '_';
+            }
+        }
+        else
+        {
+            temp_buffer[out_pos++] = input_name[i];
+        }
+    }
+    temp_buffer[out_pos] = '\0';
+
+    // Step 2: Handle Python keywords
+    if (is_python_keyword(temp_buffer))
+    {
+        snprintf(buffer, buffer_size, "%s_", temp_buffer);
+    }
+    else
+    {
+        strncpy(buffer, temp_buffer, buffer_size);
+        if (buffer_size > 0)
+            buffer[buffer_size - 1] = '\0';
+    }
+}
+
 static void to_python_safe_name(const uchar *u_name, char *buffer, size_t buffer_size)
 {
     if (!u_name || buffer_size == 0)
@@ -498,23 +549,7 @@ static void to_python_safe_name(const uchar *u_name, char *buffer, size_t buffer
         return;
     }
     char *utf8_name = (char *)hl_to_utf8(u_name);
-    size_t out_pos = 0;
-    for (size_t i = 0; utf8_name[i] != '\0' && out_pos < buffer_size - 1; ++i)
-    {
-        if (utf8_name[i] == '$')
-        {
-            if (out_pos < buffer_size - 2)
-            {
-                buffer[out_pos++] = 'S';
-                buffer[out_pos++] = '_';
-            }
-        }
-        else
-        {
-            buffer[out_pos++] = utf8_name[i];
-        }
-    }
-    buffer[out_pos] = '\0';
+    sanitize_name_for_python(utf8_name, buffer, buffer_size);
 }
 
 static void type_set_init(hl_type_set *set)
@@ -599,52 +634,59 @@ static void get_python_path_for_type(hl_type *t, const char *base_dir, char *dir
     }
     else
     {
-        if (dir_path_out)
-            dir_path_out[0] = '\0';
-        if (class_name_out)
-            class_name_out[0] = '\0';
+        if (dir_path_out) dir_path_out[0] = '\0';
+        if (class_name_out) class_name_out[0] = '\0';
         return;
     }
 
     if (type_name == NULL)
     {
-        if (dir_path_out)
-            dir_path_out[0] = '\0';
-        if (class_name_out)
-            class_name_out[0] = '\0';
+        if (dir_path_out) dir_path_out[0] = '\0';
+        if (class_name_out) class_name_out[0] = '\0';
         return;
     }
 
-    char class_path_full_safe[1024];
-    to_python_safe_name(type_name, class_path_full_safe, sizeof(class_path_full_safe));
+    char class_path_full[1024];
+    char* utf8_name = (char*)hl_to_utf8(type_name);
+    strncpy(class_path_full, utf8_name, sizeof(class_path_full) - 1);
+    class_path_full[sizeof(class_path_full) - 1] = '\0';
 
-    char *last_dot = strrchr(class_path_full_safe, '.');
+    char *last_dot = strrchr(class_path_full, '.');
     if (last_dot)
     {
         if (class_name_out && class_name_size > 0)
         {
-            strncpy(class_name_out, last_dot + 1, class_name_size - 1);
-            class_name_out[class_name_size - 1] = '\0';
+            sanitize_name_for_python(last_dot + 1, class_name_out, class_name_size);
         }
 
         if (dir_path_out && dir_path_size > 0)
         {
-            char package_path[1024];
-            size_t package_len = last_dot - class_path_full_safe;
-            strncpy(package_path, class_path_full_safe, package_len);
-            package_path[package_len] = '\0';
-            for (char *p = package_path; *p; ++p)
-                if (*p == '.')
-                    *p = '/';
-            snprintf(dir_path_out, dir_path_size, "%s/%s", base_dir, package_path);
+            *last_dot = '\0';
+            char *package_path = class_path_full;
+
+            snprintf(dir_path_out, dir_path_size, "%s", base_dir);
+            size_t current_len = strlen(dir_path_out);
+
+            char *component = strtok(package_path, ".");
+            while (component != NULL)
+            {
+                char sanitized_component[512];
+                sanitize_name_for_python(component, sanitized_component, sizeof(sanitized_component));
+
+                int written = snprintf(dir_path_out + current_len, dir_path_size - current_len, "/%s", sanitized_component);
+                if (written > 0)
+                {
+                    current_len += written;
+                }
+                component = strtok(NULL, ".");
+            }
         }
     }
     else
     {
         if (class_name_out && class_name_size > 0)
         {
-            strncpy(class_name_out, class_path_full_safe, class_name_size - 1);
-            class_name_out[class_name_size - 1] = '\0';
+            sanitize_name_for_python(class_path_full, class_name_out, class_name_size);
         }
         if (dir_path_out && dir_path_size > 0)
         {
@@ -917,24 +959,31 @@ void hlmod_generate_stubs(hl_code *code)
             }
 
             fprintf(f, "    _hl_fields = {\n");
-            
-            hl_type* inheritance_chain[HLMOD_MAX_INHERITANCE];
+
+            hl_type *inheritance_chain[HLMOD_MAX_INHERITANCE];
             int chain_depth = 0;
-            hl_type* current_type = t;
-            while(current_type && chain_depth < HLMOD_MAX_INHERITANCE) {
+            hl_type *current_type = t;
+            while (current_type && chain_depth < HLMOD_MAX_INHERITANCE)
+            {
                 inheritance_chain[chain_depth++] = current_type;
                 current_type = current_type->obj ? current_type->obj->super : NULL;
             }
 
             int absolute_field_index = 0;
-            for (int depth = chain_depth - 1; depth >= 0; depth--) {
-                hl_type* type_in_chain = inheritance_chain[depth];
-                if (type_in_chain->obj) {
-                    for (int j = 0; j < type_in_chain->obj->nfields; j++) {
-                        hl_obj_field* field = &type_in_chain->obj->fields[j];
+            for (int depth = chain_depth - 1; depth >= 0; depth--)
+            {
+                hl_type *type_in_chain = inheritance_chain[depth];
+                if (type_in_chain->obj)
+                {
+                    for (int j = 0; j < type_in_chain->obj->nfields; j++)
+                    {
+                        hl_obj_field *field = &type_in_chain->obj->fields[j];
                         char safe_name[512];
                         to_python_safe_name(field->name, safe_name, sizeof(safe_name));
-                        fprintf(f, "        \"%s\": %d,\n", safe_name, absolute_field_index);
+                        if (safe_name[0] != '\0')
+                        {
+                            fprintf(f, "        \"%s\": %d,\n", safe_name, absolute_field_index);
+                        }
                         absolute_field_index++;
                     }
                 }
@@ -965,6 +1014,11 @@ void hlmod_generate_stubs(hl_code *code)
                     hl_obj_field *field = &t->obj->fields[j];
                     char safe_field_name[512];
                     to_python_safe_name(field->name, safe_field_name, sizeof(safe_field_name));
+                    if (safe_field_name[0] == '\0')
+                    {
+                        continue;
+                    }
+
                     const char *field_doc = get_doc_for_member(type_name_full, "fields", safe_field_name);
 
                     if (binding_map && binding_map[j] != -1)
