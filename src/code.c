@@ -31,6 +31,8 @@
 #define OP_END };
 #include "opcodes.h"
 
+#include <time.h>
+
 typedef struct {
 	const unsigned char *b;
 	int size;
@@ -423,6 +425,7 @@ static int *hl_read_debug_infos( hl_reader *r, int nops ) {
 }
 
 hl_code *hl_code_read( const unsigned char *data, int size, char **error_msg ) {
+	clock_t start_time = clock();
 	hl_reader _r = { data, size, 0, 0, NULL };
 	hl_reader *r = &_r;
 	hl_code *c;
@@ -452,6 +455,8 @@ hl_code *hl_code_read( const unsigned char *data, int size, char **error_msg ) {
 		}
 		r->pos = start_pos;
 	}
+
+	printf("[hlmod] Start bytecode read.\n");
 
 	if( READ() != 'H' || READ() != 'L' || READ() != 'B' )
 		EXIT("Invalid HL bytecode header");
@@ -556,6 +561,11 @@ hl_code *hl_code_read( const unsigned char *data, int size, char **error_msg ) {
 			k->fields[j] = UINDEX();
 		CHK_ERROR();
 	}
+    
+	clock_t end_time = clock();
+	double elapsed_us = (double)(end_time - start_time) * 1000000.0 / CLOCKS_PER_SEC;
+	printf("[hlmod] Code read took %f μs.\n", elapsed_us);
+
 	return c;
 }
 
