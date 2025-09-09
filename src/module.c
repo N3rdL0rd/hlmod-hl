@@ -32,6 +32,10 @@ EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 #	include <dlfcn.h>
 #endif
 
+#include <libgen.h>
+#include <unistd.h>
+#include <stdlib.h>
+
 #define HOT_RELOAD_EXTRA_GLOBALS	4096
 
 HL_API void hl_prim_not_loaded( const uchar *err );
@@ -324,9 +328,74 @@ static void append_fields( char **p, hl_type *t ) {
 
 #define DISABLED_LIB_PTR ((void*)(int_val)2)
 
+static int get_executable_dir(char *path, int size) {
+#if defined(HL_WIN)
+    // Windows implementation
+    if (GetModuleFileNameA(NULL, path, size) == 0) return 0;
+    char *last_slash = strrchr(path, '\\');
+    if (last_slash) *last_slash = '\0';
+    return 1;
+#elif defined(HL_MAC)
+    // macOS implementation
+    uint32_t path_size = size;
+    if (_NSGetExecutablePath(path, &path_size) != 0) return 0;
+    char *real_path = realpath(path, NULL);
+    if (!real_path) return 0;
+    strncpy(path, dirname(real_path), size -1);
+    path[size - 1] = '\0';
+    free(real_path);
+    return 1;
+#else // Linux
+    ssize_t len = readlink("/proc/self/exe", path, size - 1);
+    if (len == -1) return 0;
+    path[len] = '\0';
+    if (dirname(path) == NULL) return 0;
+    return 1;
+#endif
+}
+
+static void setup_dynamic_library_path() {
+    static bool path_is_set = false;
+    if (path_is_set) return;
+    path_is_set = true;
+
+    char exe_dir[1024];
+    if (!get_executable_dir(exe_dir, sizeof(exe_dir))) return;
+
+    const char *old_path = getenv("LD_LIBRARY_PATH");
+
+    char new_path[2048];
+    if (old_path && *old_path) {
+        snprintf(new_path, sizeof(new_path), "%s:%s", exe_dir, old_path);
+    } else {
+        strncpy(new_path, exe_dir, sizeof(new_path));
+    }
+
+    setenv("LD_LIBRARY_PATH", new_path, 1);
+}
+
+
 static void *resolve_library( const char *lib, bool is_opt ) {
-	char tmp[256];
+	char tmp[1024];
 	void *h;
+
+	setup_dynamic_library_path();
+
+	char exe_path[1024];
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+
+    if (len != -1) {
+        exe_path[len] = '\0';
+        char *exe_dir = dirname(exe_path);
+
+        snprintf(tmp, sizeof(tmp), "%s/%s.hdll", exe_dir, lib);
+        h = dlopen(tmp, RTLD_LAZY);
+        if (h != NULL) return h;
+
+        snprintf(tmp, sizeof(tmp), "hdll/%s.hdll", exe_dir, lib);
+        h = dlopen(tmp, RTLD_LAZY);
+        if (h != NULL) return h;
+    }
 
 #	ifndef HL_CONSOLE
 	static char *DISABLED_LIBS = NULL;
@@ -371,6 +440,9 @@ static void *resolve_library( const char *lib, bool is_opt ) {
 	strcpy(tmp+strlen(lib),".hdll");
 	h = dlopen(tmp,RTLD_LAZY);
 	if( h == NULL && !is_opt ) {
+#	ifndef HL_WIN
+		printf("[hlmod] %s\n", dlerror());
+#	endif
 		hl_fatal1("Failed to load library %s",tmp);
 	}
 	return h;
