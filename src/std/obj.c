@@ -182,6 +182,7 @@ HL_PRIM hl_runtime_obj *hl_get_obj_rt( hl_type *ot ) {
 	hl_global_lock(true);
 	if( o->rt ) {
 		hl_global_lock(false);
+		// printf("[hlmod DEBUG] Using existing o->rt for t @ %p\n", ot);
 		return o->rt;
 	}
 

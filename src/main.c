@@ -20,6 +20,7 @@
  * DEALINGS IN THE SOFTWARE.
  */
 #define USE_HLMOD_CRASH // TODO: some arg for this
+// #define NO_STUBGEN
 
 #include <hl.h>
 #include <hlmodule.h>
@@ -177,7 +178,9 @@ static PyMethodDef HlmodMethods[] = {
     {"set_fixed_prng", hlmod_py_set_fixed_prng, METH_VARARGS, "Sets the PRNG to a fixed or random state."},
     {"get_fixed_prng", hlmod_py_get_fixed_prng, METH_NOARGS, "Gets whether the PRNG is in a fixed state."},
     {"assert_code_sha", hlmod_py_assert_code_sha, METH_VARARGS, "Asserts the bytecode SHA256, exiting if it mismatches."},
+    {"get_global", hlmod_py_get_global, METH_VARARGS, "Gets the global instance of a type by index. Useful for static types."},
     {"call", hlmod_py_call, METH_VARARGS, "Calls an HL function by findex."},
+    {"dump_stack", hlmod_py_dump_stack, METH_NOARGS, "Dumps the current HL stack."},
     {NULL, NULL, 0, NULL}
 };
 static struct PyModuleDef hlmod_module_def = {
@@ -239,6 +242,10 @@ const char *g_sorter_script =
     "            filepath = os.path.join(mods_dir, filename)\n"
     "            info = get_mod_info(filepath)\n"
     "            if info and 'id' in info and 'dependencies' in info:\n"
+    "                # Check for 'enabled' field\n"
+    "                if 'enabled' in info and info['enabled'] is False:\n"
+    "                    print(f\"    -> Skipping disabled mod: '{info['id']}'\")\n"
+    "                    continue # Skip this mod if it's explicitly disabled\n"
     "                mods[info['id']] = {\n"
     "                    'info': info,\n"
     "                    'filepath': filepath,\n"
@@ -524,7 +531,9 @@ int main(int argc, pchar *argv[]) {
 	hlmod_setup_handler();
 #endif
 
+#ifndef NO_STUBGEN
     hlmod_generate_stubs(ctx.code);
+#endif
 
     printf("[hlmod] Initializing HL module...\n");
 

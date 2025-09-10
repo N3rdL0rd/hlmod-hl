@@ -243,7 +243,7 @@ PyObject *hlmod_cast_to_py(hl_type *type, void *ptr)
 {
     if (type == NULL)
     {
-        fprintf(stderr, "[hlmod] [ERROR] [hl->py] Received NULL type.\n");
+        fprintf(stderr, "[hlmod] [ERROR] [hl->py] Received NULL type with pointer %p.\n", ptr);
         Py_RETURN_NONE;
     }
 
@@ -625,15 +625,23 @@ PyObject *hlmod_py_get_obj_field(PyObject *self, PyObject *args)
     }
 
     hl_runtime_obj *rt = hl_get_obj_rt(obj->t);
+    // printf("rt points to %p\n", rt);
+    // printf("t is %p\n", rt->t);
+    // printf("field indexes at %p\n", rt->fields_indexes);
 
     if (field_index < 0 || field_index >= rt->nfields)
     {
-        PyErr_Format(PyExc_IndexError, "Field index %d is out of bounds for type '%s' (0-%d).",
-                     field_index, (char *)hl_to_utf8(obj->t->obj->name), rt->nfields - 1);
+        PyErr_Format(PyExc_IndexError, "Field index %d is out of bounds (0 to %d).",
+                     field_index, rt->nfields);
         return NULL;
     }
 
-    hl_type *field_type = obj->t->obj->fields[field_index].t;
+    hl_obj_field* field_info = hl_obj_field_fetch(obj->t, field_index);
+    if (field_info == NULL) {
+        PyErr_Format(PyExc_IndexError, "Could not fetch field info for index %d.", field_index);
+        return NULL;
+    }
+    hl_type *field_type = field_info->t;
     int field_offset = rt->fields_indexes[field_index];
 
     void *field_ptr = (char *)obj + field_offset;
@@ -758,6 +766,59 @@ PyObject *hlmod_py_assert_code_sha(PyObject* self, PyObject* args)
         exit(1);
     }
 
+    Py_RETURN_NONE;
+}
+
+PyObject *hlmod_py_get_global(PyObject* self, PyObject* args)
+{
+    int type_index;
+
+    if (!PyArg_ParseTuple(args, "i", &type_index))
+    {
+        return NULL;
+    }
+
+    if (g_module == NULL || g_module->code == NULL)
+    {
+        PyErr_SetString(PyExc_RuntimeError, "hlmod is not initialized.");
+        return NULL;
+    }
+
+    if (type_index < 0 || type_index >= g_module->code->ntypes)
+    {
+        PyErr_Format(PyExc_IndexError, "Type index %d is out of bounds.", type_index);
+        return NULL;
+    }
+
+    hl_type *target_type = &g_module->code->types[type_index];
+
+    // Iterate through the entire list of globals in the module.
+    for (int i = 0; i < g_module->code->nglobals; i++)
+    {
+        // Get the type of the global at the current index 'i'.
+        hl_type *current_global_type = g_module->code->globals[i];
+
+        // Compare the pointers. If they match, we've found our global.
+        if (current_global_type == target_type)
+        {
+            // printf("Found global g@%i\n", i);
+            void *addr = g_module->globals_data + g_module->globals_indexes[i];
+            // printf("addr: %p\n", addr);
+            return hlmod_cast_to_py(target_type, addr);
+        }
+    }
+
+    // If the loop completes without finding a match, no global of that type exists.
+    Py_RETURN_NONE;
+}
+
+PyObject *hlmod_py_dump_stack(PyObject *self, PyObject *args)
+{
+    if( hl_get_thread() != NULL ) {
+		hl_dump_stack();
+	} else {
+        printf("[hlmod] No active HL thread!\n");
+    }
     Py_RETURN_NONE;
 }
 
