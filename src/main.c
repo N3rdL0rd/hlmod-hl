@@ -181,6 +181,7 @@ static PyMethodDef HlmodMethods[] = {
     {"get_global", hlmod_py_get_global, METH_VARARGS, "Gets the global instance of a type by index. Useful for static types."},
     {"call", hlmod_py_call, METH_VARARGS, "Calls an HL function by findex."},
     {"dump_stack", hlmod_py_dump_stack, METH_NOARGS, "Dumps the current HL stack."},
+    {"findex_for_name", hlmod_py_findex_for_name, METH_VARARGS, "Gets the findex for a specific function by its name"},
     {NULL, NULL, 0, NULL}
 };
 static struct PyModuleDef hlmod_module_def = {
@@ -228,6 +229,8 @@ PyMODINIT_FUNC PyInit_hlmod(void) {
 }
 
 
+// TODO: make this better please god please looking at this makes me regret all my life choices leading up to this moment
+// time wasted here: 1 hour
 const char *g_sorter_script =
     "import os\n"
     "import ast\n"

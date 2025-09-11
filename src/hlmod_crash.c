@@ -10,6 +10,9 @@
 #include <string.h>
 #include <dlfcn.h>
 
+// TODO: this is horribly hacky on linux and i hate it. but it works!
+// gdb still seems to give better backtraces than we do, so is there a way to use the same technique they do to get similar results?
+
 static void hlmod_handler(int signum) {
     signal(signum, SIG_DFL);
     fprintf(stderr, "\n--------------------------- SIGNAL %d ---------------------------\n", signum);

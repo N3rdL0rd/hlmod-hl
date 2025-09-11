@@ -39,6 +39,7 @@ PyObject *hlmod_py_assert_code_sha(PyObject* self, PyObject* args);
 PyObject *hlmod_py_call(PyObject *self, PyObject *args);
 PyObject *hlmod_py_get_global(PyObject* self, PyObject* args);
 PyObject *hlmod_py_dump_stack(PyObject *self, PyObject *args);
+PyObject *hlmod_py_findex_for_name(PyObject *self, PyObject *args);
 
 extern THREAD_LOCAL int64 g_return_value_int;
 extern THREAD_LOCAL double g_return_value_double;

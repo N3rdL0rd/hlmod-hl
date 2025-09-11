@@ -825,6 +825,19 @@ PyObject *hlmod_py_dump_stack(PyObject *self, PyObject *args)
     Py_RETURN_NONE;
 }
 
+PyObject *hlmod_py_findex_for_name(PyObject *self, PyObject *args)
+{
+    char *name;
+    
+    if (!PyArg_ParseTuple(args, "s", &name)) {
+        return NULL;
+    }
+
+    for (int i = 0; i <= g_code->nfunctions; i++) {
+        printf("%i\n", i);
+    }
+}
+
 #pragma endregion
 
 #pragma region Call
