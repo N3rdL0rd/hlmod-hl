@@ -9,6 +9,8 @@
 #define HL_MAX_ARGS 64
 #define HLMOD_MAX_INHERITANCE 128
 
+#define HLMOD_VERSION "0.0.1a"
+
 typedef struct {
     PyObject_HEAD
     void* ptr;

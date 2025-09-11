@@ -215,6 +215,15 @@ PyMODINIT_FUNC PyInit_hlmod(void) {
         return NULL;
     }
 
+    PyObject* version_str = PyUnicode_FromString(HLMOD_VERSION);
+    if (version_str == NULL) {
+        Py_DECREF(&HlHookType);
+        Py_DECREF(&HlPtrType);
+        Py_DECREF(m);
+        return NULL;
+    }
+    PyModule_AddObject(m, "version", version_str);
+
     return m;
 }
 
