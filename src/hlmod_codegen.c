@@ -148,6 +148,11 @@ static void _python_type_str_rec(hl_type *t, uchar *buf, int *pos, int buf_size)
     case HOBJ:
     case HSTRUCT:
     case HENUM:
+        if (t->kind == HOBJ && t->obj && t->obj->name && ucmp(t->obj->name, USTR("String")) == 0)
+        {
+            _str_append(buf, pos, buf_size, USTR("str"));
+            break;
+        }
         _str_append(buf, pos, buf_size, USTR("\""));
         const uchar *name_to_convert = NULL;
         if (t->kind == HENUM && t->tenum)
@@ -799,6 +804,8 @@ void hlmod_generate_stubs(hl_code *code)
     {
         hl_type *t = &code->types[i];
         if (t->kind != HOBJ && t->kind != HSTRUCT && t->kind != HENUM)
+            continue;
+        if (t->kind == HOBJ && t->obj && t->obj->name && ucmp(t->obj->name, USTR("String")) == 0)
             continue;
 
         char dir_path[1024], class_name_only[512];
