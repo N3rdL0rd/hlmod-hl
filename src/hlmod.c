@@ -41,7 +41,7 @@ static PyGetSetDef HlPtr_getsetters[] = {
 
 PyTypeObject HlPtrType = {
     PyVarObject_HEAD_INIT(NULL, 0)
-        .tp_name = "hlmod.HlPtr",
+    .tp_name = "hlmod.HlPtr",
     .tp_doc = "A wrapper for a Haxe pointer and its type kind.",
     .tp_basicsize = sizeof(HlPtr),
     .tp_itemsize = 0,
@@ -270,7 +270,9 @@ PyObject *hlmod_cast_to_py(hl_type *type, void *ptr)
         }
         if (type->obj != NULL && type->obj->name != NULL && uchar_eq(type->obj->name, u"String"))
         {
+            // printf("%s: ", type->obj->name);
             vstring *s = (vstring *)obj_ptr;
+            // printf("s: %p s->bytes: %p s->length: %p\n", s, s->bytes, s->length);
             return PyUnicode_DecodeUTF16((const char *)s->bytes, s->length * sizeof(uchar), "strict", NULL);
         }
         if (g_code == NULL)
@@ -676,7 +678,12 @@ PyObject *hlmod_py_set_obj_field(PyObject *self, PyObject *args)
         return NULL;
     }
 
-    hl_type *field_type = obj->t->obj->fields[field_index].t;
+    hl_obj_field* field_info = hl_obj_field_fetch(obj->t, field_index);
+    if (field_info == NULL) {
+        PyErr_Format(PyExc_IndexError, "Could not fetch field info for index %d.", field_index);
+        return NULL;
+    }
+    hl_type *field_type = field_info->t;
     int field_offset = rt->fields_indexes[field_index];
 
     void *field_ptr = (char *)obj + field_offset;
@@ -792,13 +799,10 @@ PyObject *hlmod_py_get_global(PyObject* self, PyObject* args)
 
     hl_type *target_type = &g_module->code->types[type_index];
 
-    // Iterate through the entire list of globals in the module.
     for (int i = 0; i < g_module->code->nglobals; i++)
     {
-        // Get the type of the global at the current index 'i'.
         hl_type *current_global_type = g_module->code->globals[i];
 
-        // Compare the pointers. If they match, we've found our global.
         if (current_global_type == target_type)
         {
             // printf("Found global g@%i\n", i);
@@ -808,7 +812,6 @@ PyObject *hlmod_py_get_global(PyObject* self, PyObject* args)
         }
     }
 
-    // If the loop completes without finding a match, no global of that type exists.
     Py_RETURN_NONE;
 }
 
@@ -893,7 +896,15 @@ PyObject *hlmod_py_call(PyObject *self, PyObject *args)
         Py_RETURN_NONE;
     }
 
-    PyObject *py_result = hlmod_cast_to_py(fun_type->ret, &hl_result->v);
+    void* result_val_ptr;
+    if (hl_is_ptr(fun_type->ret)) {
+        // for pointer types, hl_dyn_call_safe returns the pointer directly. really???
+        result_val_ptr = &hl_result;
+    } else {
+        // for primitive types, it returns a vdynamic* box.
+        result_val_ptr = &hl_result->v;
+    }
+    PyObject *py_result = hlmod_cast_to_py(fun_type->ret, result_val_ptr);
     
     return py_result;
 }
