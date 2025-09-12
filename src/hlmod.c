@@ -827,15 +827,31 @@ PyObject *hlmod_py_dump_stack(PyObject *self, PyObject *args)
 
 PyObject *hlmod_py_findex_for_name(PyObject *self, PyObject *args)
 {
-    char *name;
+    const char *name;
     
     if (!PyArg_ParseTuple(args, "s", &name)) {
         return NULL;
     }
 
-    for (int i = 0; i <= g_code->nfunctions; i++) {
-        printf("%i\n", i);
+    for (int i = 0; i < g_code->nfunctions; i++) {
+        hl_function *f = &g_code->functions[i];
+
+        if (f->obj == NULL || f->obj->name == NULL || f->field.name == NULL) {
+            continue;
+        }
+
+        const char *class_u8 = (char*)hl_to_utf8(f->obj->name);
+        const char *method_u8 = (char*)hl_to_utf8(f->field.name);
+
+        char res[1024];
+        snprintf(res, sizeof(res), "%s.%s", class_u8, method_u8);
+
+        if (strcmp(res, name) == 0) {
+            return PyLong_FromLong(f->findex);
+        }
     }
+    PyErr_SetString(PyExc_NameError, "No such function!");
+    return NULL;
 }
 
 #pragma endregion
