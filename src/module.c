@@ -32,8 +32,10 @@ EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 #	include <dlfcn.h>
 #endif
 
-#include <libgen.h>
-#include <unistd.h>
+#ifndef HL_WIN
+#	include <libgen.h>
+#	include <unistd.h>
+#endif
 #include <stdlib.h>
 
 #define HOT_RELOAD_EXTRA_GLOBALS	4096
@@ -354,6 +356,7 @@ static int get_executable_dir(char *path, int size) {
 #endif
 }
 
+#ifndef HL_WIN
 static void setup_dynamic_library_path() {
     static bool path_is_set = false;
     if (path_is_set) return;
@@ -373,12 +376,14 @@ static void setup_dynamic_library_path() {
 
     setenv("LD_LIBRARY_PATH", new_path, 1);
 }
+#endif
 
 
 static void *resolve_library( const char *lib, bool is_opt ) {
 	char tmp[1024];
 	void *h;
 
+#	ifndef HL_WIN
 	setup_dynamic_library_path();
 
 	char exe_path[1024];
@@ -393,9 +398,22 @@ static void *resolve_library( const char *lib, bool is_opt ) {
         if (h != NULL) return h;
 
         snprintf(tmp, sizeof(tmp), "hdll/%s.hdll", exe_dir, lib);
+ 
+        snprintf(tmp, sizeof(tmp), "%s/hdll/%s.hdll", exe_dir, lib);
         h = dlopen(tmp, RTLD_LAZY);
         if (h != NULL) return h;
     }
+#	else // HL_WIN
+	char exe_path[1024];
+	if (get_executable_dir(exe_path, sizeof(exe_path))) {
+		snprintf(tmp, sizeof(tmp), "%s\\%s.hdll", exe_path, lib);
+		h = dlopen(tmp, RTLD_LAZY);
+		if (h != NULL) return h;
+		snprintf(tmp, sizeof(tmp), "%s\\hdll\\%s.hdll", exe_path, lib);
+		h = dlopen(tmp, RTLD_LAZY);
+		if (h != NULL) return h;
+	}
+#	endif
 
 #	ifndef HL_CONSOLE
 	static char *DISABLED_LIBS = NULL;

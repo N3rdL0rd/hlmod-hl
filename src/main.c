@@ -516,7 +516,11 @@ int main(int argc, pchar *argv[]) {
         } else {
             COPOUT
         }
+#       ifdef HL_WIN
+        pprintf("[hlmod] Defaulting to %s\n", file);
+#       else
         printf("[hlmod] Defaulting to %s\n", file);
+#       endif
 		fchk = pfopen(file,"rb");
 		if( fchk == NULL ) {
             COPOUT
