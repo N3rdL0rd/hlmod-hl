@@ -22,6 +22,8 @@
 #include <hl.h>
 #include <hlmodule.h>
 
+// #define HL_DEBUG_LOAD_ERRORS
+
 #ifdef HL_WIN
 #	undef _GUID
 #	include <windows.h>
@@ -412,16 +414,84 @@ static void *resolve_library( const char *lib, bool is_opt ) {
 		snprintf(tmp, sizeof(tmp), "%s\\%s.hdll", exe_path, lib);
 		h = dlopen(tmp, RTLD_LAZY);
 		if (h != NULL) { strncpy(resolved_path, tmp, sizeof(resolved_path)-1); goto end; }
+#if defined(HL_DEBUG_LOAD_ERRORS)
+		else {
+			DWORD error = GetLastError();
+			LPSTR lpMsgBuf = NULL;
+			FormatMessageA(
+				FORMAT_MESSAGE_ALLOCATE_BUFFER |
+				FORMAT_MESSAGE_FROM_SYSTEM |
+				FORMAT_MESSAGE_IGNORE_INSERTS,
+				NULL,
+				error,
+				MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+				(LPSTR)&lpMsgBuf,
+				0,
+				NULL);
+			if (lpMsgBuf != NULL) {
+				printf("[hlmod] Failed to load library \'%s\': %s", tmp, lpMsgBuf);
+				LocalFree(lpMsgBuf);
+			} else {
+				printf("[hlmod] Failed to load library \'%s\': Unknown error %d\n", tmp, error);
+			}
+		}
+#endif
 
 		snprintf(tmp, sizeof(tmp), "hdll\\%s.hdll", lib);
 		h = dlopen(tmp, RTLD_LAZY);
 		if (h != NULL) { strncpy(resolved_path, tmp, sizeof(resolved_path)-1); goto end; }
+#if defined(HL_DEBUG_LOAD_ERRORS)
+		else {
+			DWORD error = GetLastError();
+			LPSTR lpMsgBuf = NULL;
+			FormatMessageA(
+				FORMAT_MESSAGE_ALLOCATE_BUFFER |
+				FORMAT_MESSAGE_FROM_SYSTEM |
+				FORMAT_MESSAGE_IGNORE_INSERTS,
+				NULL,
+				error,
+				MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+				(LPSTR)&lpMsgBuf,
+				0,
+				NULL);
+			if (lpMsgBuf != NULL) {
+				printf("[hlmod] Failed to load library \'%s\': %s", tmp, lpMsgBuf);
+				LocalFree(lpMsgBuf);
+			} else {
+				printf("[hlmod] Failed to load library \'%s\': Unknown error %d\n", tmp, error);
+			}
+		}
+#endif
 
 		snprintf(tmp, sizeof(tmp), "%s\\hdll\\%s.hdll", exe_path, lib);
 		h = dlopen(tmp, RTLD_LAZY);
 		if (h != NULL) { strncpy(resolved_path, tmp, sizeof(resolved_path)-1); goto end; }
+#if defined(HL_DEBUG_LOAD_ERRORS)
+		else {
+			DWORD error = GetLastError();
+			LPSTR lpMsgBuf = NULL;
+			FormatMessageA(
+				FORMAT_MESSAGE_ALLOCATE_BUFFER |
+				FORMAT_MESSAGE_FROM_SYSTEM |
+				FORMAT_MESSAGE_IGNORE_INSERTS,
+				NULL,
+				error,
+				MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+				(LPSTR)&lpMsgBuf,
+				0,
+				NULL);
+			if (lpMsgBuf != NULL) {
+				printf("[hlmod] Failed to load library \'%s\': %s", tmp, lpMsgBuf);
+				LocalFree(lpMsgBuf);
+			} else {
+				printf("[hlmod] Failed to load library \'%s\': Unknown error %d\n", tmp, error);
+			}
+		}
+#endif
 	}
 #	endif
+
+
 
 #	ifndef HL_CONSOLE
 	static char *DISABLED_LIBS = NULL;
