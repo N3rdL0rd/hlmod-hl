@@ -796,9 +796,16 @@ HL_PRIM bool HL_NAME(win_get_next_event)( dx_window *win, dx_event *e ) {
 	return true;
 }
 
-HL_PRIM void HL_NAME(win_clip_cursor)(dx_window *win, bool enable) {
-	capture_mouse = enable;
-	updateClipCursor(win);
+// TODO: this is changed to match the mt fork. do games actually rely on having the new version of this function? if so, this will have to be reverted.
+HL_PRIM void HL_NAME(win_clip_cursor)(dx_window *win) {
+	capture_mouse = (win != NULL);
+    if (win) {
+	    updateClipCursor(win);
+    } else if (cur_clip_cursor_window) {
+        updateClipCursor(cur_clip_cursor_window);
+    } else {
+		ClipCursor(NULL);
+	}
 }
 
 HL_PRIM bool HL_NAME(set_cursor_pos)( int x, int y ) {
@@ -944,7 +951,7 @@ DEFINE_PRIM(_F64, win_get_opacity, TWIN);
 DEFINE_PRIM(_BOOL, win_set_opacity, TWIN _F64);
 DEFINE_PRIM(_VOID, win_destroy, TWIN);
 DEFINE_PRIM(_BOOL, win_get_next_event, TWIN _DYN);
-DEFINE_PRIM(_VOID, win_clip_cursor, TWIN _BOOL);
+DEFINE_PRIM(_VOID, win_clip_cursor, TWIN);
 DEFINE_PRIM(_BOOL, set_cursor_pos, _I32 _I32);
 DEFINE_PRIM(_BOOL, win_set_cursor_pos, TWIN _I32 _I32);
 DEFINE_PRIM(_BOOL, win_set_relative_mouse_mode, TWIN _BOOL);

@@ -381,7 +381,8 @@ static void setup_dynamic_library_path() {
 
 static void *resolve_library( const char *lib, bool is_opt ) {
 	char tmp[1024];
-	void *h;
+	void *h = NULL;
+	char resolved_path[1024] = {0};
 
 #	ifndef HL_WIN
 	setup_dynamic_library_path();
@@ -395,30 +396,30 @@ static void *resolve_library( const char *lib, bool is_opt ) {
 
         snprintf(tmp, sizeof(tmp), "%s/%s.hdll", exe_dir, lib);
         h = dlopen(tmp, RTLD_LAZY);
-        if (h != NULL) return h;
+        if (h != NULL) { strncpy(resolved_path, tmp, sizeof(resolved_path)-1); goto end; }
 
         snprintf(tmp, sizeof(tmp), "hdll/%s.hdll", lib);
 		h = dlopen(tmp, RTLD_LAZY);
-        if (h != NULL) return h;
+        if (h != NULL) { strncpy(resolved_path, tmp, sizeof(resolved_path)-1); goto end; }
  
         snprintf(tmp, sizeof(tmp), "%s/hdll/%s.hdll", exe_dir, lib);
         h = dlopen(tmp, RTLD_LAZY);
-        if (h != NULL) return h;
+        if (h != NULL) { strncpy(resolved_path, tmp, sizeof(resolved_path)-1); goto end; }
     }
 #	else // HL_WIN
 	char exe_path[1024];
 	if (get_executable_dir(exe_path, sizeof(exe_path))) {
 		snprintf(tmp, sizeof(tmp), "%s\\%s.hdll", exe_path, lib);
 		h = dlopen(tmp, RTLD_LAZY);
-		if (h != NULL) return h;
+		if (h != NULL) { strncpy(resolved_path, tmp, sizeof(resolved_path)-1); goto end; }
 
 		snprintf(tmp, sizeof(tmp), "hdll\\%s.hdll", lib);
 		h = dlopen(tmp, RTLD_LAZY);
-		if (h != NULL) return h;
+		if (h != NULL) { strncpy(resolved_path, tmp, sizeof(resolved_path)-1); goto end; }
 
 		snprintf(tmp, sizeof(tmp), "%s\\hdll\\%s.hdll", exe_path, lib);
 		h = dlopen(tmp, RTLD_LAZY);
-		if (h != NULL) return h;
+		if (h != NULL) { strncpy(resolved_path, tmp, sizeof(resolved_path)-1); goto end; }
 	}
 #	endif
 
@@ -431,27 +432,39 @@ static void *resolve_library( const char *lib, bool is_opt ) {
 	char *disPart = strstr(DISABLED_LIBS, lib);
 	if( disPart ) {
 		disPart += strlen(lib);
-		if( *disPart == 0 || *disPart == ',' )
-			return DISABLED_LIB_PTR;
+		if( *disPart == 0 || *disPart == ',' ) {
+			h = DISABLED_LIB_PTR;
+            goto end;
+        }
 	}
 #	endif
 
-	if( strcmp(lib,"builtin") == 0 )
-		return dlopen(NULL,RTLD_LAZY);
+	if(strcmp(lib,"builtin") == 0 ) {
+		h = dlopen(NULL,RTLD_LAZY);
+        if( h != NULL ) strncpy(resolved_path, "builtin", sizeof(resolved_path)-1);
+		goto end;
+    }
 
-	if( strcmp(lib,"std") == 0 ) {
+	if(strcmp(lib,"std") == 0 ) {
 #	ifdef HL_WIN
 #		ifdef HL_64
 		h = dlopen("libhl64.dll",RTLD_LAZY);
-		if( h == NULL ) h = dlopen("libhl.dll",RTLD_LAZY);
+		if( h != NULL ) {
+            strncpy(resolved_path, "libhl64.dll", sizeof(resolved_path)-1);
+        } else {
+            h = dlopen("libhl.dll",RTLD_LAZY);
+            if( h != NULL ) strncpy(resolved_path, "libhl.dll", sizeof(resolved_path)-1);
+        }
 #		else
 		h = dlopen("libhl.dll",RTLD_LAZY);
+        if( h != NULL ) strncpy(resolved_path, "libhl.dll", sizeof(resolved_path)-1);
 #		endif
 		if( h == NULL && !is_opt ) hl_fatal1("Failed to load library %s","libhl.dll");
-		return h;
 #	else
-		return RTLD_DEFAULT;
+		h = RTLD_DEFAULT;
+        strncpy(resolved_path, "RTLD_DEFAULT", sizeof(resolved_path)-1);
 #	endif
+        goto end;
 	}
 
 	strcpy(tmp,lib);
@@ -459,17 +472,24 @@ static void *resolve_library( const char *lib, bool is_opt ) {
 #	ifdef HL_64
 	strcpy(tmp+strlen(lib),"64.hdll");
 	h = dlopen(tmp,RTLD_LAZY);
-	if( h != NULL ) return h;
+	if( h != NULL ) { strncpy(resolved_path, tmp, sizeof(resolved_path)-1); goto end; }
 #	endif
 
 	strcpy(tmp+strlen(lib),".hdll");
 	h = dlopen(tmp,RTLD_LAZY);
-	if( h == NULL && !is_opt ) {
+	if( h != NULL ) {
+        strncpy(resolved_path, tmp, sizeof(resolved_path)-1);
+    } else if( !is_opt ) {
 #	ifndef HL_WIN
 		printf("[hlmod] %s\n", dlerror());
 #	endif
 		hl_fatal1("Failed to load library %s",tmp);
 	}
+
+end:
+    if (h != NULL && h != DISABLED_LIB_PTR && resolved_path[0] != '\0') {
+        printf("[hlmod] Resolved library '%s' to '%s'\n", lib, resolved_path);
+    }
 	return h;
 }
 
