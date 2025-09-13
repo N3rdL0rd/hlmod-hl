@@ -397,7 +397,9 @@ static void *resolve_library( const char *lib, bool is_opt ) {
         h = dlopen(tmp, RTLD_LAZY);
         if (h != NULL) return h;
 
-        snprintf(tmp, sizeof(tmp), "hdll/%s.hdll", exe_dir, lib);
+        snprintf(tmp, sizeof(tmp), "hdll/%s.hdll", lib);
+		h = dlopen(tmp, RTLD_LAZY);
+        if (h != NULL) return h;
  
         snprintf(tmp, sizeof(tmp), "%s/hdll/%s.hdll", exe_dir, lib);
         h = dlopen(tmp, RTLD_LAZY);
@@ -409,6 +411,11 @@ static void *resolve_library( const char *lib, bool is_opt ) {
 		snprintf(tmp, sizeof(tmp), "%s\\%s.hdll", exe_path, lib);
 		h = dlopen(tmp, RTLD_LAZY);
 		if (h != NULL) return h;
+
+		snprintf(tmp, sizeof(tmp), "hdll\\%s.hdll", lib);
+		h = dlopen(tmp, RTLD_LAZY);
+		if (h != NULL) return h;
+
 		snprintf(tmp, sizeof(tmp), "%s\\hdll\\%s.hdll", exe_path, lib);
 		h = dlopen(tmp, RTLD_LAZY);
 		if (h != NULL) return h;
