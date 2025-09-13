@@ -564,7 +564,11 @@ hl_code *hl_code_read( const unsigned char *data, int size, char **error_msg ) {
     
 	clock_t end_time = clock();
 	double elapsed_us = (double)(end_time - start_time) * 1000000.0 / CLOCKS_PER_SEC;
+	#ifdef HL_WIN
+	printf("[hlmod] Code read took %f ms.\n", elapsed_us / 1000.0);
+#else
 	printf("[hlmod] Code read took %f μs.\n", elapsed_us);
+#endif
 
 	return c;
 }
