@@ -46,7 +46,7 @@ struct _hl_tls {
 	void *value;
 };
 
-#elif defined(HL_WIN)
+#elif defined(HL_VCC)
 
 struct _hl_mutex {
 	void (*free)( hl_mutex * );
@@ -119,7 +119,7 @@ HL_PRIM hl_mutex *hl_mutex_alloc( bool gc_thread ) {
 #	if !defined(HL_THREADS)
 	static struct _hl_mutex null_mutex = {0};
 	return (hl_mutex*)&null_mutex;
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	hl_mutex *l = (hl_mutex*)hl_gc_alloc_finalizer(sizeof(hl_mutex));
 	l->free = hl_mutex_free;
 	l->is_gc = gc_thread;
@@ -140,7 +140,7 @@ HL_PRIM hl_mutex *hl_mutex_alloc( bool gc_thread ) {
 
 HL_PRIM void hl_mutex_acquire( hl_mutex *l ) {
 #	if !defined(HL_THREADS)
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	if( l->is_gc ) hl_blocking(true);
 	EnterCriticalSection(&l->cs);
 	if( l->is_gc ) hl_blocking(false);
@@ -154,7 +154,7 @@ HL_PRIM void hl_mutex_acquire( hl_mutex *l ) {
 HL_PRIM bool hl_mutex_try_acquire( hl_mutex *l ) {
 #if	!defined(HL_THREADS)
 	return true;
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	return (bool)TryEnterCriticalSection(&l->cs);
 #	else
 	return pthread_mutex_trylock(&l->lock) == 0;
@@ -163,7 +163,7 @@ HL_PRIM bool hl_mutex_try_acquire( hl_mutex *l ) {
 
 HL_PRIM void hl_mutex_release( hl_mutex *l ) {
 #	if !defined(HL_THREADS)
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	LeaveCriticalSection(&l->cs);
 #	else
 	pthread_mutex_unlock(&l->lock);
@@ -172,7 +172,7 @@ HL_PRIM void hl_mutex_release( hl_mutex *l ) {
 
 HL_PRIM void hl_mutex_free( hl_mutex *l ) {
 #	if !defined(HL_THREADS)
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	if( l->free ) {
 		DeleteCriticalSection(&l->cs);
 		l->free = NULL;
@@ -198,7 +198,7 @@ HL_PRIM hl_semaphore *hl_semaphore_alloc(int value) {
 #	if !defined(HL_THREADS)
 	static struct _hl_semaphore null_semaphore = {0};
 	return (hl_semaphore *)&null_semaphore;
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	hl_semaphore *sem =
 	    (hl_semaphore *)hl_gc_alloc_finalizer(sizeof(hl_semaphore));
 	sem->free = hl_semaphore_free;
@@ -219,7 +219,7 @@ HL_PRIM hl_semaphore *hl_semaphore_alloc(int value) {
 
 HL_PRIM void hl_semaphore_acquire(hl_semaphore *sem) {
 #	if !defined(HL_THREADS)
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	hl_blocking(true);
 	WaitForSingleObject(sem->sem, INFINITE);
 	hl_blocking(false);
@@ -239,7 +239,7 @@ HL_PRIM void hl_semaphore_acquire(hl_semaphore *sem) {
 HL_PRIM bool hl_semaphore_try_acquire(hl_semaphore *sem, vdynamic *timeout) {
 #	if !defined(HL_THREADS)
 	return true;
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	hl_blocking(true);
 	bool ret = WaitForSingleObject(sem->sem,
 	                           timeout ? (DWORD)((FLOAT)timeout->v.d * 1000.0)
@@ -283,7 +283,7 @@ HL_PRIM bool hl_semaphore_try_acquire(hl_semaphore *sem, vdynamic *timeout) {
 
 HL_PRIM void hl_semaphore_release(hl_semaphore *sem) {
 #	if !defined(HL_THREADS)
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	ReleaseSemaphore(sem->sem, 1, NULL);
 #	else
 #	ifdef __APPLE__
@@ -296,7 +296,7 @@ HL_PRIM void hl_semaphore_release(hl_semaphore *sem) {
 
 HL_PRIM void hl_semaphore_free(hl_semaphore *sem) {
 #	if !defined(HL_THREADS)
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	if (sem->free) {
 		CloseHandle(sem->sem);
 		sem->free = NULL;
@@ -323,7 +323,7 @@ HL_PRIM hl_condition *hl_condition_alloc() {
 #	if !defined(HL_THREADS)
 	static struct _hl_condition null_condition = {0};
 	return (hl_condition *)&null_condition;
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	hl_condition *cond =
 	    (hl_condition *)hl_gc_alloc_finalizer(sizeof(hl_condition));
 	cond->free = hl_condition_free;
@@ -348,7 +348,7 @@ HL_PRIM hl_condition *hl_condition_alloc() {
 }
 HL_PRIM void hl_condition_acquire(hl_condition *cond) {
 #	if !defined(HL_THREADS)
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	hl_blocking(true);
 	EnterCriticalSection(&cond->cs);
 	hl_blocking(false);
@@ -362,7 +362,7 @@ HL_PRIM void hl_condition_acquire(hl_condition *cond) {
 HL_PRIM bool hl_condition_try_acquire(hl_condition *cond) {
 #	if !defined(HL_THREADS)
 	return true;
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	return (bool)TryEnterCriticalSection(&cond->cs);
 #	else
 	return pthread_mutex_trylock(&cond->mutex) == 0;
@@ -371,7 +371,7 @@ HL_PRIM bool hl_condition_try_acquire(hl_condition *cond) {
 
 HL_PRIM void hl_condition_release(hl_condition *cond) {
 #	if !defined(HL_THREADS)
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	LeaveCriticalSection(&cond->cs);
 #	else
 	pthread_mutex_unlock(&cond->mutex);
@@ -379,7 +379,7 @@ HL_PRIM void hl_condition_release(hl_condition *cond) {
 }
 HL_PRIM void hl_condition_wait(hl_condition *cond) {
 #	if !defined(HL_THREADS)
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	hl_blocking(true);
 	SleepConditionVariableCS(&cond->cond, &cond->cs, INFINITE);
 	hl_blocking(false);
@@ -393,7 +393,7 @@ HL_PRIM void hl_condition_wait(hl_condition *cond) {
 HL_PRIM bool hl_condition_timed_wait(hl_condition *cond, double timeout) {
 #	if !defined(HL_THREADS)
 	return true;
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	hl_blocking(true);
 	SleepConditionVariableCS(&cond->cond, &cond->cs,
 	                         (DWORD)((FLOAT)timeout * 1000.0));
@@ -421,7 +421,7 @@ HL_PRIM bool hl_condition_timed_wait(hl_condition *cond, double timeout) {
 
 HL_PRIM void hl_condition_signal(hl_condition *cond) {
 #	if !defined(HL_THREADS)
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	WakeConditionVariable(&cond->cond);
 #	else
 	pthread_cond_signal(&cond->cond);
@@ -429,7 +429,7 @@ HL_PRIM void hl_condition_signal(hl_condition *cond) {
 }
 HL_PRIM void hl_condition_broadcast(hl_condition *cond) {
 #	if !defined(HL_THREADS)
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	WakeAllConditionVariable(&cond->cond);
 #	else
 	pthread_cond_broadcast(&cond->cond);
@@ -437,7 +437,7 @@ HL_PRIM void hl_condition_broadcast(hl_condition *cond) {
 }
 HL_PRIM void hl_condition_free(hl_condition *cond) {
 #	if !defined(HL_THREADS)
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	if (cond->free) {
 		DeleteCriticalSection(&cond->cs);
 		cond->free = NULL;
@@ -465,14 +465,14 @@ DEFINE_PRIM(_VOID, condition_broadcast, _CONDITION)
 
 #if defined(HL_THREADS)
 static void **_tls_get( hl_tls *t ) {
-#	ifdef HL_WIN
+#	ifdef HL_VCC
 	return (void**)TlsGetValue(t->tid);
 #	else
 	return (void**)pthread_getspecific(t->key);
 #	endif
 }
 static void _tls_set( hl_tls *t, void *store ) {
-#	ifdef HL_WIN
+#	ifdef HL_VCC
 	TlsSetValue(t->tid, store);
 #	else
 	pthread_setspecific(t->key, store);
@@ -486,7 +486,7 @@ HL_PRIM hl_tls *hl_tls_alloc( bool gc_value ) {
 	l->free = hl_tls_free;
 	l->value = NULL;
 	return l;
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	hl_tls *l = (hl_tls*)hl_gc_alloc_finalizer(sizeof(hl_tls));
 	l->free = hl_tls_free;
 	l->tid = TlsAlloc();
@@ -505,7 +505,7 @@ HL_PRIM hl_tls *hl_tls_alloc( bool gc_value ) {
 HL_PRIM void hl_tls_free( hl_tls *l ) {
 #	if !defined(HL_THREADS)
 	free(l);
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	if( l->free ) {
 		TlsFree(l->tid);
 		l->free = NULL;
@@ -574,7 +574,7 @@ struct _hl_deque {
 	tqueue *first;
 	tqueue *last;
 #ifdef HL_THREADS
-#	ifdef HL_WIN
+#	ifdef HL_VCC
 	CRITICAL_SECTION lock;
 	HANDLE wait;
 #	else
@@ -588,7 +588,7 @@ struct _hl_deque {
 #	define LOCK(l)
 #	define UNLOCK(l)
 #	define SIGNAL(l)
-#elif defined(HL_WIN)
+#elif defined(HL_VCC)
 #	define LOCK(l)		EnterCriticalSection(&(l))
 #	define UNLOCK(l)	LeaveCriticalSection(&(l))
 #	define SIGNAL(l)	ReleaseSemaphore(l,1,NULL)
@@ -601,7 +601,7 @@ struct _hl_deque {
 static void hl_deque_free( hl_deque *q ) {
 	hl_remove_root(&q->first);
 #	if !defined(HL_THREADS)
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	DeleteCriticalSection(&q->lock);
 	CloseHandle(q->wait);
 #	else
@@ -617,7 +617,7 @@ HL_PRIM hl_deque *hl_deque_alloc() {
 	q->last = NULL;
 	hl_add_root(&q->first);
 #	if !defined(HL_THREADS)
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	q->wait = CreateSemaphore(NULL,0,(1 << 30),NULL);
 	InitializeCriticalSection(&q->lock);
 #	else
@@ -660,7 +660,7 @@ HL_PRIM vdynamic *hl_deque_pop( hl_deque *q, bool block ) {
 	while( q->first == NULL )
 		if( block ) {
 #			if !defined(HL_THREADS)
-#			elif defined(HL_WIN)
+#			elif defined(HL_VCC)
 			UNLOCK(q->lock);
 			WaitForSingleObject(q->wait,INFINITE);
 			LOCK(q->lock);
@@ -699,7 +699,7 @@ struct _hl_lock {
 	void (*free)( hl_lock * );
 #if !defined(HL_THREADS)
 	int counter;
-#elif defined(HL_WIN)
+#elif defined(HL_VCC)
 	HANDLE wait;
 #else
 	pthread_mutex_t lock;
@@ -710,7 +710,7 @@ struct _hl_lock {
 
 static void hl_lock_free( hl_lock *l ) {
 #	if !defined(HL_THREADS)
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	CloseHandle(l->wait);
 #	else
 	pthread_mutex_destroy(&l->lock);
@@ -723,7 +723,7 @@ HL_PRIM hl_lock *hl_lock_create() {
 	l->free = hl_lock_free;
 #	if !defined(HL_THREADS)
 	l->counter = 0;
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	l->wait = CreateSemaphore(NULL,0,(1 << 30),NULL);
 #	else
 	l->counter = 0;
@@ -736,7 +736,7 @@ HL_PRIM hl_lock *hl_lock_create() {
 HL_PRIM void hl_lock_release( hl_lock *l ) {
 #	if !defined(HL_THREADS)
 	l->counter++;
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	ReleaseSemaphore(l->wait,1,NULL);
 #	else
 	pthread_mutex_lock(&l->lock);
@@ -751,7 +751,7 @@ HL_PRIM bool hl_lock_wait( hl_lock *l, vdynamic *timeout ) {
 	if( l->counter == 0 ) return false;
 	l->counter--;
 	return true;
-#	elif defined(HL_WIN)
+#	elif defined(HL_VCC)
 	DWORD ret;
 	hl_blocking(true);
 	ret = WaitForSingleObject(l->wait, timeout?(DWORD)((FLOAT)timeout->v.d * 1000.0):INFINITE);
@@ -811,7 +811,7 @@ DEFINE_PRIM(_BOOL, lock_wait, _LOCK _NULL(_F64));
 HL_PRIM hl_thread *hl_thread_current() {
 #if !defined(HL_THREADS)
 	return NULL;
-#elif defined(HL_WIN)
+#elif defined(HL_VCC)
 	return (hl_thread*)(int_val)GetCurrentThreadId();
 #else
 	return (hl_thread*)pthread_self();
@@ -821,7 +821,7 @@ HL_PRIM hl_thread *hl_thread_current() {
 HL_PRIM void hl_thread_yield() {
 #if !defined(Hl_THREADS)
 	// nothing
-#elif defined(HL_WIN)
+#elif defined(HL_VCC)
 	Sleep(0);
 #else
 	pthread_yield();
@@ -832,7 +832,7 @@ HL_PRIM void hl_thread_yield() {
 HL_PRIM int hl_thread_id() {
 #if !defined(HL_THREADS)
 	return 0;
-#elif defined(HL_WIN)
+#elif defined(HL_VCC)
 	return (int)GetCurrentThreadId();
 #elif defined(HL_MAC)
 	uint64_t tid64;
@@ -877,7 +877,7 @@ HL_PRIM hl_thread *hl_thread_start( void *callback, void *param, bool withGC ) {
 #if !defined(HL_THREADS)
 	hl_error("Threads support is disabled");
 	return NULL;
-#elif defined(HL_WIN)
+#elif defined(HL_VCC)
 	DWORD tid;
 	HANDLE h = CreateThread(NULL,0,callback,param,0,&tid);
 	if( h == NULL )
@@ -918,7 +918,7 @@ HL_PRIM hl_thread *hl_thread_create( vclosure *c ) {
 	return hl_thread_start(hl_run_thread,c,true);
 }
 
-#if defined(HL_WIN) && defined(HL_THREADS)
+#if defined(HL_VCC) && defined(HL_THREADS)
 const DWORD MS_VC_EXCEPTION = 0x406D1388;
 #pragma pack(push,8)
 typedef struct tagTHREADNAME_INFO
@@ -926,7 +926,7 @@ typedef struct tagTHREADNAME_INFO
     DWORD dwType; // Must be 0x1000.
     LPCSTR szName; // Pointer to name (in user addr space).
     DWORD dwThreadID; // Thread ID (-1=caller thread).
-    DWORD dwFlags; // Reserved for future use, must be zero.
+    DWORD dwFlags; // Reserved for future use, must be zero.fix: Fence __try and __except with HL_VCC checks
 } THREADNAME_INFO;
 #pragma pack(pop)
 void SetThreadName(DWORD dwThreadID, const char* threadName) {
@@ -949,7 +949,7 @@ void SetThreadName(DWORD dwThreadID, const char* threadName) {
 HL_PRIM int hl_get_thread_id( hl_thread *t ) {
 #	if !defined(HL_THREADS)
 	return 0;
-#elif defined(HL_WIN)
+#elif defined(HL_VCC)
 	return (DWORD)(int_val)t;
 #elif defined(HL_MAC)
 	uint64_t tid64;
@@ -963,7 +963,7 @@ HL_PRIM int hl_get_thread_id( hl_thread *t ) {
 HL_PRIM void hl_thread_set_name( hl_thread *t, const char *name ) {
 #if !defined(HL_THREADS)
 	// nothing
-#elif defined(HL_WIN)
+#elif defined(HL_VCC)
 	SetThreadName((DWORD)(int_val)t,name);
 #elif defined(HL_MAC) || defined(HL_IOS)
 	// pthread_setname_np only possible for current thread
