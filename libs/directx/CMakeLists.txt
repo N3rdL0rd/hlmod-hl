@@ -30,6 +30,14 @@ endif()
 option(WITH_DX12 "Build dx12.hdll." ON)
 
 if(WITH_DX12)
+    if(MINGW)
+        find_library(DXCOMPILER_LIBRARY
+            NAMES dxcompiler
+            PATHS "C:/Program Files (x86)/Windows Kits/10/Lib"
+            PATH_SUFFIXES "ucrt/x64"
+        )
+    endif()
+
     add_library(dx12.hdll
         dx12.cpp
     )
@@ -45,6 +53,8 @@ if(WITH_DX12)
         target_link_libraries(dx12.hdll
             dxcompiler
         )
+    elseif(MINGW AND DXCOMPILER_LIBRARY)
+        target_link_libraries(dx12.hdll ${DXCOMPILER_LIBRARY})
     endif()
 
     install(
