@@ -174,7 +174,7 @@ set_target_properties(libhl
     PUBLIC_HEADER "${public_headers}"
 )
 
-if(WIN32 AND MSVC)
+if(WIN32)
     set_target_properties(libhl
         PROPERTIES
         OUTPUT_NAME libhl
