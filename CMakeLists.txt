@@ -223,7 +223,7 @@ if (WITH_VM)
     target_include_directories(hl PRIVATE ${Python_INCLUDE_DIRS})
     
     if (WIN32)
-        target_link_libraries(hl user32 shell32)
+        target_link_libraries(hl user32 shell32 dbghelp)
     endif()
 endif()
 

@@ -40,8 +40,12 @@ if(WITH_DX12)
         libhl
         d3d12
         dxgi
-        dxcompiler
     )
+    if(MSVC)
+        target_link_libraries(dx12.hdll
+            dxcompiler
+        )
+    endif()
 
     install(
         TARGETS
