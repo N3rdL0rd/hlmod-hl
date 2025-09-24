@@ -27,13 +27,13 @@ if(WITH_DIRECTX)
     )
 endif()
 
-option(WITH_DX12 "Build dx12.hdll." ON)
+if(MINGW)
+    option(WITH_DX12 "Build dx12.hdll." OFF)
+else()
+    option(WITH_DX12 "Build dx12.hdll." ON)
+endif()
 
 if(WITH_DX12)
-    if(MINGW)
-        find_library(DXCOMPILER_LIBRARY NAMES dxcompiler)
-    endif()
-
     add_library(dx12.hdll
         dx12.cpp
     )
@@ -44,14 +44,8 @@ if(WITH_DX12)
         libhl
         d3d12
         dxgi
+        dxcompiler
     )
-    if(MSVC)
-        target_link_libraries(dx12.hdll
-            dxcompiler
-        )
-    elseif(MINGW AND DXCOMPILER_LIBRARY)
-        target_link_libraries(dx12.hdll ${DXCOMPILER_LIBRARY})
-    endif()
 
     install(
         TARGETS
