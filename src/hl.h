@@ -182,17 +182,15 @@
 #ifdef HL_64
 #	define HL_WSIZE 8
 #	define IS_64	1
-#	ifdef HL_VCC
+#	if defined(HL_VCC) || defined(HL_MINGW)
 #		define _PTR_FMT	L"%IX"
-#   elif defined(HL_MINGW)
-#		define _PTR_FMT	L"%lX"
 #	else
 #		define _PTR_FMT	u"%lX"
 #	endif
 #else
 #	define HL_WSIZE 4
 #	define IS_64	0
-#	ifdef HL_VCC
+#	if defined(HL_VCC) || defined(HL_MINGW)
 #		define _PTR_FMT	L"%IX"
 #	else
 #		define _PTR_FMT	u"%X"
