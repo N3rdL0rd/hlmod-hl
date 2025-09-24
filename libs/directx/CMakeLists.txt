@@ -31,11 +31,7 @@ option(WITH_DX12 "Build dx12.hdll." ON)
 
 if(WITH_DX12)
     if(MINGW)
-        find_library(DXCOMPILER_LIBRARY
-            NAMES dxcompiler
-            PATHS "C:/Program Files (x86)/Windows Kits/10/Lib"
-            PATH_SUFFIXES "ucrt/x64"
-        )
+        find_library(DXCOMPILER_LIBRARY NAMES dxcompiler)
     endif()
 
     add_library(dx12.hdll
