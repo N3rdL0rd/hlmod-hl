@@ -51,6 +51,7 @@ endif()
 
 if (MINGW)
     add_compile_options(-municode)
+    add_link_options(-municode)
 endif()
 
 list(APPEND CMAKE_MODULE_PATH
@@ -174,7 +175,7 @@ set_target_properties(libhl
     PUBLIC_HEADER "${public_headers}"
 )
 
-if(WIN32 AND MSVC)
+if(MSVC)
     set_target_properties(libhl
         PROPERTIES
         OUTPUT_NAME libhl
@@ -239,30 +240,6 @@ else()
     endif()
 endif()
 
-if(MSVC)
-    set(CMAKE_DEBUG_COMPILE_FLAGS "/Zi")
-    set(CMAKE_DEBUG_LINK_FLAGS "/STACK:4194304")
-else()
-    set(CMAKE_DEBUG_COMPILE_FLAGS "-g")
-    set(CMAKE_DEBUG_LINK_FLAGS "-g")
-endif()
-
-target_compile_options(libhl PRIVATE "$<$<CONFIG:Debug,RelWithDebInfo>:${CMAKE_DEBUG_COMPILE_FLAGS}>")
-target_link_options(libhl PRIVATE "$<$<CONFIG:Debug,RelWithDebInfo>:${CMAKE_DEBUG_LINK_FLAGS}>")
-
-target_compile_options(hl PRIVATE "$<$<CONFIG:Debug,RelWithDebInfo>:${CMAKE_DEBUG_COMPILE_FLAGS}>")
-if(NOT MSVC)
-    target_link_options(hl PRIVATE "$<$<CONFIG:Debug,RelWithDebInfo>:-g;-rdynamic>")
-else()
-    target_link_options(hl PRIVATE "$<$<CONFIG:Debug,RelWithDebInfo>:${CMAKE_DEBUG_LINK_FLAGS}>")
-    # set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} /Zi")
-    # set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /Zi")
-
-    # set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} /DEBUG /GenerateDebugInfo /OPT:REF /OPT:ICF")
-
-    # set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE} /DEBUG /GenerateDebugInfo /OPT:REF /OPT:ICF")
-endif()
-
 if(BUILD_TESTING)
 
     find_program(
@@ -274,6 +251,12 @@ if(BUILD_TESTING)
         SET(HAXE_FLAGS -D hl-legacy32)
     else()
         SET(HAXE_FLAGS )
+    endif()
+
+    if(MINGW)
+        set(HLC_LIBRARIES dbghelp)
+    else()
+        set(HLC_LIBRARIES)
     endif()
 
     #####################
@@ -336,6 +319,7 @@ if(BUILD_TESTING)
     )
     target_link_libraries(hello
         libhl
+        ${HLC_LIBRARIES}
     )
 
     #####################
@@ -359,6 +343,7 @@ if(BUILD_TESTING)
     )
     target_link_libraries(threads
         libhl
+        ${HLC_LIBRARIES}
     )
 
     #####################
@@ -383,6 +368,7 @@ if(BUILD_TESTING)
     target_link_libraries(uvsample
         libhl
         uv.hdll
+        ${HLC_LIBRARIES}
     )
 
     #####################
@@ -397,6 +383,7 @@ if(BUILD_TESTING)
     )
     target_link_libraries(header_macro_clashes
         libhl
+        ${HLC_LIBRARIES}
     )
 
     #####################
