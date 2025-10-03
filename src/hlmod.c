@@ -956,6 +956,10 @@ PyObject *hlmod_py_call(PyObject *self, PyObject *args)
 
 int jit_dispatch_hook(int findex, int nargs, void **args)
 {
+    if (!((int)g_is_passthrough_call == 1 || (int)g_is_passthrough_call == 0)) 
+    {
+        printf("[hlmod] Invalid state for g_is_passthrough_call: %i\n", g_is_passthrough_call);
+    }
     if (g_is_passthrough_call)
     {
         g_is_passthrough_call = false;
@@ -974,6 +978,7 @@ int jit_dispatch_hook(int findex, int nargs, void **args)
     }
 
     hl_blocking(true);
+    // printf("Hooking! %i\n", findex); 
     PyGILState_STATE gstate;
     gstate = PyGILState_Ensure();
 
