@@ -47,6 +47,12 @@ endif()
 # force Unicode over Multi-byte
 if(MSVC)
     add_definitions(-DUNICODE -D_UNICODE)
+    add_compile_options(/permissive-)
+endif()
+
+if (MINGW)
+    add_compile_options(-municode)
+    add_link_options(-municode)
 endif()
 
 if (MINGW)
