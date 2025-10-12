@@ -2873,124 +2873,121 @@ static void make_dyn_cast( jit_ctx *ctx, vreg *dst, vreg *v ) {
 }
 
 static void jit_hook_call(jit_ctx *ctx, hl_function *f) {
+	preg p; // Temporary preg for constants and memory access
 
-	int i;
-	preg p; // Temporary preg for constants
-
-	// Python might modify these.
-	// We need to preserve them for the rest of the JIT'd function to work correctly
+	// --- 1. Preserve Callee-Saved Registers ---
+	// This part is correct and important. Python's C extensions can modify these.
 #ifdef HL_64
-	// We save 8 registers = 64 bytes, 16-byte aligned
+	// Save 8 registers = 64 bytes (16-byte aligned)
 	op64(ctx, PUSH, REG_AT(Ebx), UNUSED);
 	op64(ctx, PUSH, REG_AT(Esi), UNUSED);
 	op64(ctx, PUSH, REG_AT(Edi), UNUSED);
-	op64(ctx, PUSH, REG_AT(Ebp), UNUSED); // Technically saved by op_enter, but for good measure...
 	op64(ctx, PUSH, REG_AT(R12), UNUSED);
 	op64(ctx, PUSH, REG_AT(R13), UNUSED);
 	op64(ctx, PUSH, REG_AT(R14), UNUSED);
 	op64(ctx, PUSH, REG_AT(R15), UNUSED);
-	int pushed_regs_size = 8 * HL_WSIZE;
+	// EBP is already saved by op_enter, but we need to save it again because
+	// the hook logic might use it as a general-purpose register temporarily.
+	op64(ctx, PUSH, REG_AT(Ebp), UNUSED);
 #else
-	// We save 3 registers = 12 bytes.
+	// Save 3 registers = 12 bytes
 	op32(ctx, PUSH, REG_AT(Ebx), UNUSED);
 	op32(ctx, PUSH, REG_AT(Esi), UNUSED);
 	op32(ctx, PUSH, REG_AT(Edi), UNUSED);
-	int pushed_regs_size = 3 * HL_WSIZE;
 #endif
 
+	// --- 2. Allocate and Populate the `void** args` Array on the Stack ---
 	int nargs = f->type->fun->nargs;
 	int args_array_size = nargs * HL_WSIZE;
-	// Total stack space needed for our prep work
+	// Ensure the stack space for our array is 16-byte aligned for safety.
 	int temp_stack_size = (args_array_size + 15) & ~15;
 
-	// Allocate space on the stack for the args array
 	if (temp_stack_size > 0) {
 		op64(ctx, SUB, PESP, pconst(&p, temp_stack_size));
 	}
 
-	// Get a pointer to the start of the args array
+	// Get a pointer to the start of our new array into a scratch register.
 	preg* r_args_array = alloc_reg(ctx, RCPU_CALL);
-	op64(ctx, LEA, r_args_array, pmem(&p, Esp, 0));
-	RLOCK(r_args_array); // Keep this register alive during the loop
+	op64(ctx, MOV, r_args_array, PESP);
+	RLOCK(r_args_array); // Keep this register alive.
 
+	// A temporary register to hold the address of each original argument.
 	preg* r_arg_addr = alloc_reg(ctx, RCPU_CALL);
-	for (i = 0; i < nargs; i++) {
+	for (int i = 0; i < nargs; i++) {
 		vreg* arg_vreg = R(i);
-		// Get the address of the original argument [EBP + stackPos] into a temp register
+		// Get address of original argument: LEA tmp, [EBP + stackPos]
 		op64(ctx, LEA, r_arg_addr, pmem(&p, Ebp, arg_vreg->stackPos));
-		// Store that address into our array: array[i] = &original_arg;
+		// Store the address in our array: MOV [args_array + i*8], tmp
 		op64(ctx, MOV, pmem(&p, r_args_array->id, i * HL_WSIZE), r_arg_addr);
 	}
-	RUNLOCK(r_arg_addr); // Done with this temp register
+	RUNLOCK(r_arg_addr); // We're done with this one.
 
-	// Prepare for a native C call with 3 arguments
-	int native_args_stack_size = begin_native_call(ctx, 3);
-	
-	set_native_arg(ctx, r_args_array);								// Arg 3: void** args
-	set_native_arg(ctx, pconst(&p, nargs));							// Arg 2: int nargs
-	set_native_arg(ctx, pconst(&p, f->findex));						// Arg 1: int findex
-	
-	// The total stack space to clean up includes what `begin_native_call` allocated
-	// PLUS the space we manually allocated for our temporary array
-	call_native(ctx, jit_dispatch_hook, native_args_stack_size + temp_stack_size);
 
-    int jcontinue;
-    
-    op64(ctx, CMP, PEAX, pconst(&p, 1));
-    XJump(JNeq, jcontinue);
-    
+	// --- 3. Call the Native Hook Function using JIT Abstractions ---
+	int native_call_stack_size = begin_native_call(ctx, 3);
+
+	set_native_arg(ctx, r_args_array);               // Arg 3: void** args (the array we just built)
+	set_native_arg(ctx, pconst(&p, nargs));          // Arg 2: int nargs
+	set_native_arg(ctx, pconst(&p, f->findex));      // Arg 1: int findex
+
+	// The total stack space to clean up is the space for our args array
+	// PLUS the space allocated by begin_native_call (for shadow space etc.).
+	call_native(ctx, jit_dispatch_hook, native_call_stack_size + temp_stack_size);
+
+
+	// --- 4. Check Hook's Return Value and Handle Override ---
+	int jcontinue;
+	// if (EAX != 1) jump to continue
+	op64(ctx, CMP, PEAX, pconst(&p, 1));
+	XJump(JNeq, jcontinue);
+
+	// ---- OVERRIDE PATH (Hook returned 1) ----
+	// The function body is being replaced. We need to get the return value,
+	// clean up the stack properly, and return.
+
 	if (f->type->fun->ret->kind == HF32 || f->type->fun->ret->kind == HF64) {
-	#ifdef HL_64
-		preg* tmp = alloc_reg(ctx, RCPU);
-		op64(ctx, MOV, tmp, pconst64(&p, (int_val)&g_return_value_double));
-		op64(ctx, MOVSD, PXMM(0), pmem(&p, tmp->id, 0));
-		RUNLOCK(tmp);
-	#else
-		op64(ctx, MOVSD, PXMM(0), paddr(&p, &g_return_value_double));
-	#endif
+		int cleanup_size = begin_native_call(ctx, 0);
+		call_native(ctx, hlmod_get_return_double, cleanup_size);
+		// Return value is now in XMM0
 	} else {
-	#ifdef HL_64
-		preg* tmp = alloc_reg(ctx, RCPU);
-		op64(ctx, MOV, tmp, pconst64(&p, (int_val)&g_return_value_int));
-		op64(ctx, MOV, PEAX, pmem(&p, tmp->id, 0));
-		RUNLOCK(tmp);
-	#else
-		op64(ctx, MOV, PEAX, paddr(&p, &g_return_value_int));
-	#endif
+		int cleanup_size = begin_native_call(ctx, 0);
+		call_native(ctx, hlmod_get_return_int, cleanup_size);
+		// Return value is now in EAX/RAX
 	}
 
-	#ifdef HL_64
-		op64(ctx, POP, REG_AT(R15), UNUSED);
-		op64(ctx, POP, REG_AT(R14), UNUSED);
-		op64(ctx, POP, REG_AT(R13), UNUSED);
-		op64(ctx, POP, REG_AT(R12), UNUSED);
-		op64(ctx, POP, REG_AT(Ebp), UNUSED);
-		op64(ctx, POP, REG_AT(Edi), UNUSED);
-		op64(ctx, POP, REG_AT(Esi), UNUSED);
-		op64(ctx, POP, REG_AT(Ebx), UNUSED);
-	#else
-		op32(ctx, POP, REG_AT(Edi), UNUSED);
-		op32(ctx, POP, REG_AT(Esi), UNUSED);
-		op32(ctx, POP, REG_AT(Ebx), UNUSED);
-	#endif
-
-	// NOTE: We do NOT pop EBP here because the PUSH EBP was part of the original op_enter,
-	// and we are effectively replacing the entire function body.
-	// Instead, we just restore the stack pointer to what it was before our locals.
-	op64(ctx, MOV, PESP, PEBP);
-	op64(ctx, POP, PEBP, UNUSED);
-
-	op64(ctx, RET, UNUSED, UNUSED);
-
-	// --------------------
-	patch_jump(ctx, jcontinue);
-
+	// We are returning early, so we must perform the full function epilogue here.
+	// First, restore the callee-saved registers we pushed at the start.
 #ifdef HL_64
+	op64(ctx, POP, REG_AT(Ebp), UNUSED);
 	op64(ctx, POP, REG_AT(R15), UNUSED);
 	op64(ctx, POP, REG_AT(R14), UNUSED);
 	op64(ctx, POP, REG_AT(R13), UNUSED);
 	op64(ctx, POP, REG_AT(R12), UNUSED);
+	op64(ctx, POP, REG_AT(Edi), UNUSED);
+	op64(ctx, POP, REG_AT(Esi), UNUSED);
+	op64(ctx, POP, REG_AT(Ebx), UNUSED);
+#else
+	op32(ctx, POP, REG_AT(Edi), UNUSED);
+	op32(ctx, POP, REG_AT(Esi), UNUSED);
+	op32(ctx, POP, REG_AT(Ebx), UNUSED);
+#endif
+
+	// Now, perform the standard function epilogue that op_ret would do.
+	// This unwinds the stack frame created by op_enter.
+	if( ctx->totalRegsSize ) op64(ctx, ADD, PESP, pconst(&p, ctx->totalRegsSize));
+	op64(ctx, POP, PEBP, UNUSED);
+	op64(ctx, RET, UNUSED, UNUSED);
+
+	// ---- CONTINUE PATH (Hook returned something else) ----
+	patch_jump(ctx, jcontinue);
+
+	// Restore the callee-saved registers and continue to the original function body.
+#ifdef HL_64
 	op64(ctx, POP, REG_AT(Ebp), UNUSED);
+	op64(ctx, POP, REG_AT(R15), UNUSED);
+	op64(ctx, POP, REG_AT(R14), UNUSED);
+	op64(ctx, POP, REG_AT(R13), UNUSED);
+	op64(ctx, POP, REG_AT(R12), UNUSED);
 	op64(ctx, POP, REG_AT(Edi), UNUSED);
 	op64(ctx, POP, REG_AT(Esi), UNUSED);
 	op64(ctx, POP, REG_AT(Ebx), UNUSED);

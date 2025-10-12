@@ -8,8 +8,8 @@
 
 #define HL_MAX_ARGS 64
 #define HLMOD_MAX_INHERITANCE 128
-
 #define HLMOD_VERSION "0.0.1a"
+#define HLMOD_DEBUG
 
 typedef struct {
     PyObject_HEAD
@@ -24,6 +24,9 @@ typedef struct {
     PyObject_HEAD
     int findex;
 } HlHook;
+
+EXPORT int64_t hlmod_get_return_int();
+EXPORT double hlmod_get_return_double();
 
 extern PyTypeObject HlHookType;
 
@@ -43,7 +46,6 @@ PyObject *hlmod_py_findex_for_name(PyObject *self, PyObject *args);
 
 extern THREAD_LOCAL int64 g_return_value_int;
 extern THREAD_LOCAL double g_return_value_double;
-extern THREAD_LOCAL bool g_is_passthrough_call;
 
 int jit_dispatch_hook(int findex, int nargs, void** args);
 void* hlmod_cast_to_hl(PyObject* obj, hl_type* type);

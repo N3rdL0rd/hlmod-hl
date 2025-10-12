@@ -853,6 +853,7 @@ typedef struct {
 
 #ifdef HL_THREADS
 static void gc_thread_entry( thread_start *_s ) {
+	// printf("[hlmod DEBUG] Thread exiting!\n");
 	thread_start s = *_s;
 	hl_register_thread(&s);
 	hl_lock_release(_s->wait);
@@ -864,6 +865,7 @@ static void gc_thread_entry( thread_start *_s ) {
 #endif
 
 HL_PRIM hl_thread *hl_thread_start( void *callback, void *param, bool withGC ) {
+	// printf("[hlmod DEBUG] Thread created! gc: %d\n", withGC);
 #ifdef HL_THREADS
 	if( withGC ) {
 		thread_start *s = (thread_start*)hl_gc_alloc_raw(sizeof(thread_start));

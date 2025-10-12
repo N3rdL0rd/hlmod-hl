@@ -19,9 +19,17 @@ bool uchar_eq(const uchar *s1, const uchar *s2)
     return *s1 == *s2;
 }
 
-THREAD_LOCAL int64 g_return_value_int = 0;
+THREAD_LOCAL int64_t g_return_value_int = 0;
 THREAD_LOCAL double g_return_value_double = 0.0;
-THREAD_LOCAL bool g_is_passthrough_call = false;
+THREAD_LOCAL int g_is_passthrough_call = 0;
+
+EXPORT int64_t hlmod_get_return_int() {
+    return g_return_value_int;
+}
+
+EXPORT double hlmod_get_return_double() {
+    return g_return_value_double;
+}
 
 static PyObject **g_hlobjs = NULL;
 static int g_hlobjs_l = 0;
@@ -155,10 +163,10 @@ static PyObject *HlHook_call_original(HlHook *self, PyObject *py_args)
     cl.fun = g_module->functions_ptrs[self->findex];
     cl.hasValue = 0;
 
-    g_is_passthrough_call = true;
+    g_is_passthrough_call++;
     bool is_exc;
     vdynamic *hl_result = hl_dyn_call_safe(&cl, nargs > 0 ? vargs : NULL, nargs, &is_exc);
-    g_is_passthrough_call = false;
+    g_is_passthrough_call--;
 
     if (is_exc)
     {
@@ -173,7 +181,18 @@ static PyObject *HlHook_call_original(HlHook *self, PyObject *py_args)
         Py_RETURN_NONE;
     }
 
-    PyObject *py_result = hlmod_cast_to_py(fun_type->ret, &hl_result->v);
+    PyObject *py_result = NULL;
+
+    if (!hl_is_dynamic(fun_type->ret)) {
+        py_result = hlmod_cast_to_py(fun_type->ret, &hl_result->v);
+    } else {
+        py_result = hlmod_cast_to_py(fun_type->ret, &hl_result);
+    }
+
+    if (py_result == NULL)
+    {
+        return NULL;
+    }
 
     return py_result;
 }
@@ -184,7 +203,7 @@ static PyMethodDef HlHook_methods[] = {
 
 PyTypeObject HlHookType = {
     PyVarObject_HEAD_INIT(NULL, 0)
-        .tp_name = "hlmod.Hook",
+    .tp_name = "hlmod.Hook",
     .tp_doc = "Hook context object",
     .tp_basicsize = sizeof(HlHook),
     .tp_itemsize = 0,
@@ -925,16 +944,18 @@ PyObject *hlmod_py_call(PyObject *self, PyObject *args)
         Py_RETURN_NONE;
     }
 
-    void* result_val_ptr;
-    if (hl_is_ptr(fun_type->ret)) {
-        // for pointer types, hl_dyn_call_safe returns the pointer directly. really???
-        result_val_ptr = &hl_result;
+    PyObject *py_result = NULL;
+    if (!hl_is_dynamic(fun_type->ret)) {
+        py_result = hlmod_cast_to_py(fun_type->ret, &hl_result->v);
     } else {
-        // for primitive types, it returns a vdynamic* box.
-        result_val_ptr = &hl_result->v;
+        py_result = hlmod_cast_to_py(fun_type->ret, &hl_result);
     }
-    PyObject *py_result = hlmod_cast_to_py(fun_type->ret, result_val_ptr);
     
+    if (py_result == NULL)
+    {
+        return NULL;
+    }
+
     return py_result;
 }
 
@@ -956,29 +977,26 @@ PyObject *hlmod_py_call(PyObject *self, PyObject *args)
 
 int jit_dispatch_hook(int findex, int nargs, void **args)
 {
-    if (!((int)g_is_passthrough_call == 1 || (int)g_is_passthrough_call == 0)) 
+    if (g_is_passthrough_call > 0)
     {
-        printf("[hlmod] Invalid state for g_is_passthrough_call: %i\n", g_is_passthrough_call);
-    }
-    if (g_is_passthrough_call)
-    {
-        g_is_passthrough_call = false;
         return 0;
     }
 
     HookRegistryEntry *entry;
     HASH_FIND_INT(g_hook_registry, &findex, entry);
 
-    g_return_value_int = 0;
-    g_return_value_double = 0.0;
-
     if (entry == NULL)
     {
         return 0;
     }
 
+    g_return_value_int = 0;
+    g_return_value_double = 0.0;
+
     hl_blocking(true);
-    // printf("Hooking! %i\n", findex); 
+#   ifdef HLMOD_DEBUG
+    printf("[hlmod DEBUG] Hooking! %i\n", findex); 
+#   endif
     PyGILState_STATE gstate;
     gstate = PyGILState_Ensure();
 
@@ -1050,10 +1068,19 @@ int jit_dispatch_hook(int findex, int nargs, void **args)
             }
             else
             {
-                void **temp_ptr = (void **)hlmod_cast_to_hl(pResult, fun_type->ret);
-                if (temp_ptr != NULL)
+                void *hl_val = hlmod_cast_to_hl(pResult, fun_type->ret);
+                if (hl_val != NULL)
                 {
-                    g_return_value_int = (int64)(*temp_ptr);
+                    if (hl_is_ptr(fun_type->ret))
+                    {
+                        // For pointer types, hl_val is a pointer to the pointer (e.g., vobj**)
+                        g_return_value_int = (int64_t)(*(void **)hl_val);
+                    }
+                    else
+                    {
+                        // For primitive types, hl_val is a pointer to the value itself (e.g., int*)
+                        g_return_value_int = (int64_t)hl_val;
+                    }
                 }
             }
             res = 1;
