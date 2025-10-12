@@ -210,6 +210,10 @@ if (WITH_VM)
         src/cJSON.c
         src/sha256.c
     )
+
+    file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/src/hlmod_codegen.c CURRENT_SOURCE_HASH)
+    target_compile_definitions(hl PRIVATE SOURCE_FILE_SHA256_HASH="${CURRENT_SOURCE_HASH}")
+
     if(APPLE)
         set_target_properties(hl PROPERTIES
             INSTALL_RPATH "@executable_path;@executable_path/../${CMAKE_INSTALL_LIBDIR}"

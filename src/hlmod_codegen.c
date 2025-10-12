@@ -765,7 +765,7 @@ static void print_absolute_import_for_type(FILE *f, hl_type *importer_type, hl_t
     fprintf(f, "%sfrom %s import %s\n", indent, full_module_path, dep_class_name);
 }
 
-void hlmod_generate_stubs(hl_code *code)
+void hlmod_do_generate_stubs(hl_code *code)
 {
     const char *base_dir = "./mods/stubs";
     clock_t start_time = clock();
@@ -1004,4 +1004,58 @@ void hlmod_generate_stubs(hl_code *code)
     clock_t end_time = clock();
     double elapsed_ms = ((double)(end_time - start_time) / CLOCKS_PER_SEC) * 1000.0;
     printf("[hlmod] Finished generating class stubs in %.2fms.\n", elapsed_ms);
+}
+
+static void write_signature_file(const char *path, const char *hash)
+{
+    mkdir_p("./mods/stubs");
+
+    FILE *f = fopen(path, "w");
+    if (!f)
+    {
+        fprintf(stderr, "[hlmod] Error: Could not open signature file for writing: %s\n", path);
+        return;
+    }
+    fprintf(f, "%s", hash);
+    fclose(f);
+}
+
+void hlmod_generate_stubs(hl_code *code) {
+#   ifndef SOURCE_FILE_SHA256_HASH
+    printf("[hlmod] WARNING: CMake seems to be configured incorrectly! Generating stubs anyway...\n");
+    hlmod_do_generate_stubs(code);
+#   else
+    const char *base_dir = "./mods/stubs";
+    char signature_path[1024];
+    snprintf(signature_path, sizeof(signature_path), "%s/.source_hash", base_dir);
+
+    const char *current_hash = SOURCE_FILE_SHA256_HASH;
+    char *saved_hash = read_file_to_buffer(signature_path);
+
+    bool should_regenerate = false;
+    if (saved_hash == NULL)
+    {
+        printf("[hlmod] Signature file not found. Stubs will be regenerated.\n");
+        should_regenerate = true;
+    }
+    else
+    {
+        if (strcmp(saved_hash, current_hash) != 0)
+        {
+            printf("[hlmod] Source signature has changed. Stubs will be regenerated.\n");
+            should_regenerate = true;
+        }
+        else
+        {
+            printf("[hlmod] Source signature matches. Skipping stub generation.\n");
+        }
+        free(saved_hash);
+    }
+
+    if (should_regenerate)
+    {
+        hlmod_do_generate_stubs(code);
+        write_signature_file(signature_path, current_hash);
+    }
+#   endif
 }
