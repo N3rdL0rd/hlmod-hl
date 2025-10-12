@@ -977,6 +977,10 @@ PyObject *hlmod_py_call(PyObject *self, PyObject *args)
 
 int jit_dispatch_hook(int findex, int nargs, void **args)
 {
+    if (findex == 5937) {
+        printf("how did we get here....\n");
+    }
+
     if (g_is_passthrough_call > 0)
     {
         return 0;
