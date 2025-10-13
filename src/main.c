@@ -473,24 +473,22 @@ int main(int argc, pchar *argv[]) {
         return 1;
     }
 
-#   ifdef HLMOD_STDERR_HACK
+// #define HLMOD_STDOUT_HACK
+#   ifdef HLMOD_STDOUT_HACK
     FILE* stderr_log_file = fopen("hlmod_pyerr.log", "w");
     FILE* stdout_log_file = fopen("hlmod_pyout.log", "w");
-    if (stderr_log_file) {
-        printf("[hlmod DEBUG] Python stderr redirected to hlmod_pyerr.log\n");
-        printf("[hlmod DEBUG] Python stdout redirected to hlmod_pyout.log\n");
-        PyObject* sys_module 
-        = PyImport_ImportModule("sys");
+    if (stderr_log_file && stdout_log_file) {
+        printf("[hlmod DEBUG] Python stderr/stdout redirecting to disk\n");
+        PyObject* sys_module = PyImport_ImportModule("sys");
         if (sys_module) {
-            PyObject* py_stderr_file = PyFile_FromFd(fileno(stderr_log_file), "hlmod_python_errors.log", "w", -1, NULL, NULL, NULL, 0);
-            PyObject* py_stdout_file = PyFile_FromFd(fileno(stdout_log_file), "hlmod_python_out.log", "w", -1, NULL, NULL, NULL, 0);
-            if (py_stderr_file) {
+            PyObject* py_stderr_file = PyFile_FromFd(fileno(stderr_log_file), "hlmod_pyerr.log", "w", -1, NULL, NULL, NULL, 0);
+            PyObject* py_stdout_file = PyFile_FromFd(fileno(stdout_log_file), "hlmod_pyout.log", "w", -1, NULL, NULL, NULL, 0);
+            if (py_stderr_file && py_stdout_file) {
                 PyObject_SetAttrString(sys_module, "stderr", py_stderr_file);
-                Py_DECREF(py_stderr_file);
-            }
-            if (py_stdout_file) {
                 PyObject_SetAttrString(sys_module, "stdout", py_stdout_file);
-                Py_DECREF(py_stdout_file);
+                Py_DECREF(py_stderr_file);
+            } else {
+                printf("[hlmod DEBUG] Something got messed up!\n");
             }
             Py_DECREF(sys_module);
         }
