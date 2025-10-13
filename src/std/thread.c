@@ -853,13 +853,11 @@ typedef struct {
 
 #ifdef HL_THREADS
 static void gc_thread_entry( thread_start *_s ) {
-	// printf("[hlmod DEBUG] Thread exiting!\n");
-	thread_start s = *_s;
-	hl_register_thread(&s);
+	hl_register_thread(_s);
 	hl_lock_release(_s->wait);
-	s.wait = _s->wait = NULL;
-	_s = NULL;
-	s.callb(s.param);
+	void (*callb)(void*) = _s->callb;
+	void *param = _s->param;
+	callb(param);
 	hl_unregister_thread();
 }
 #endif

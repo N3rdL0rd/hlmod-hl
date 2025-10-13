@@ -977,13 +977,13 @@ PyObject *hlmod_py_call(PyObject *self, PyObject *args)
 
 int jit_dispatch_hook(int findex, int nargs, void **args)
 {
-    if (findex == 5937) {
-        printf("how did we get here....\n");
-    }
-
     if (g_is_passthrough_call > 0)
     {
         return 0;
+    }
+
+    if (findex == 5937) {
+        printf("how did we get here....\n");
     }
 
     HookRegistryEntry *entry;
@@ -992,6 +992,13 @@ int jit_dispatch_hook(int findex, int nargs, void **args)
     if (entry == NULL)
     {
         return 0;
+    }
+
+    void** safe_args = NULL;
+    if (nargs > 0) {
+        safe_args = (void**)malloc(nargs * sizeof(void*));
+        if (safe_args == NULL) { PyErr_NoMemory(); PyErr_Print(); return 0; }
+        memcpy(safe_args, args, nargs * sizeof(void*));
     }
 
     g_return_value_int = 0;
@@ -1006,9 +1013,6 @@ int jit_dispatch_hook(int findex, int nargs, void **args)
 
     hl_function *f = g_module->code->functions + g_module->functions_indexes[findex];
     hl_type_fun *fun_type = f->type->fun;
-
-    // printf("[hlmod] Intercepted call to function f@%d with %d args\n",
-    //     findex, nargs);
 
     PyObject *pArgs = PyTuple_New(nargs + 1); // for hook
     if (!pArgs)
@@ -1033,7 +1037,7 @@ int jit_dispatch_hook(int findex, int nargs, void **args)
 
     for (int i = 0; i < nargs; i++)
     {
-        PyObject *pValue = hlmod_cast_to_py(fun_type->args[i], args[i]);
+        PyObject *pValue = hlmod_cast_to_py(fun_type->args[i], safe_args[i]);
         if (pValue == NULL)
         {
             PyErr_Print();
@@ -1047,6 +1051,11 @@ int jit_dispatch_hook(int findex, int nargs, void **args)
     }
 
     PyObject *pResult = PyObject_CallObject(entry->callback, pArgs);
+    
+    if (safe_args != NULL) {
+        free(safe_args);
+    }
+
     Py_DECREF(pArgs);
 
     if (pResult == NULL)

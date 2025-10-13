@@ -473,6 +473,32 @@ int main(int argc, pchar *argv[]) {
         return 1;
     }
 
+#   ifdef HLMOD_STDERR_HACK
+    FILE* stderr_log_file = fopen("hlmod_pyerr.log", "w");
+    FILE* stdout_log_file = fopen("hlmod_pyout.log", "w");
+    if (stderr_log_file) {
+        printf("[hlmod DEBUG] Python stderr redirected to hlmod_pyerr.log\n");
+        printf("[hlmod DEBUG] Python stdout redirected to hlmod_pyout.log\n");
+        PyObject* sys_module 
+        = PyImport_ImportModule("sys");
+        if (sys_module) {
+            PyObject* py_stderr_file = PyFile_FromFd(fileno(stderr_log_file), "hlmod_python_errors.log", "w", -1, NULL, NULL, NULL, 0);
+            PyObject* py_stdout_file = PyFile_FromFd(fileno(stdout_log_file), "hlmod_python_out.log", "w", -1, NULL, NULL, NULL, 0);
+            if (py_stderr_file) {
+                PyObject_SetAttrString(sys_module, "stderr", py_stderr_file);
+                Py_DECREF(py_stderr_file);
+            }
+            if (py_stdout_file) {
+                PyObject_SetAttrString(sys_module, "stdout", py_stdout_file);
+                Py_DECREF(py_stdout_file);
+            }
+            Py_DECREF(sys_module);
+        }
+    }
+#   endif
+
+    PyEval_InitThreads();
+
 	static vclosure cl;
 	pchar *file = NULL;
 	char *error_msg = NULL;
@@ -601,6 +627,9 @@ int main(int argc, pchar *argv[]) {
 	cl.fun = ctx.m->functions_ptrs[ctx.m->code->entrypoint];
 	cl.hasValue = 0;
 	hl_profile_setup(profile_count);
+
+    // Release the GIL before calling into Haxe code, which might be blocking.
+    PyThreadState* _save = PyEval_SaveThread();
 	ctx.ret = hl_dyn_call_safe(&cl,NULL,0,&isExc);
 
     hl_code_free(ctx.code);
@@ -612,6 +641,9 @@ int main(int argc, pchar *argv[]) {
 		hl_global_free();
 		return 1;
 	}
+
+    // Re-acquire the GIL before finalizing Python.
+    PyEval_RestoreThread(_save);
 	hl_module_free(ctx.m);
 	hl_free(&ctx.code->alloc);
 	// do not call hl_unregister_thread() or hl_global_free will display error
@@ -620,4 +652,3 @@ int main(int argc, pchar *argv[]) {
     printf("[hlmod] Bye!\n");
 	return 0;
 }
-
