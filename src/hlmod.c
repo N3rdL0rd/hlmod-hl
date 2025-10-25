@@ -982,10 +982,6 @@ int jit_dispatch_hook(int findex, int nargs, void **args)
         return 0;
     }
 
-    if (findex == 5937) {
-        printf("how did we get here....\n");
-    }
-
     HookRegistryEntry *entry;
     HASH_FIND_INT(g_hook_registry, &findex, entry);
 
