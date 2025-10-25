@@ -29,6 +29,7 @@
 #include <Python.h>
 #include <hlmod.h>
 #include <hlmod_codegen.h>
+#include <io.h>
 
 #include "sha256.h"
 char g_code_sha256[65] = {0};
@@ -49,6 +50,9 @@ typedef uchar pchar;
 #define pcompare wcscmp
 #define ptoi(s)	wcstol(s,NULL,10)
 #define PSTR(x) USTR(x)
+#include <windows.h> // For GetStdHandle
+#include <fcntl.h>   // For _O_TEXT
+#include <stdio.h>   // For sprintf
 #else
 #	include <sys/stat.h>
 #	include <errno.h>
@@ -254,43 +258,27 @@ const char *g_sorter_script =
     "            filepath = os.path.join(mods_dir, filename)\n"
     "            info = get_mod_info(filepath)\n"
     "            if info and 'id' in info and 'dependencies' in info:\n"
-    "                # Check for 'enabled' field\n"
-    "                if 'enabled' in info and info['enabled'] is False:\n"
+    "                if info.get('enabled', True) is False:\n"
     "                    print(f\"    -> Skipping disabled mod: '{info['id']}'\")\n"
-    "                    continue # Skip this mod if it's explicitly disabled\n"
-    "                mods[info['id']] = {\n"
-    "                    'info': info,\n"
-    "                    'filepath': filepath,\n"
-    "                    'dependencies': set(info['dependencies'])\n"
-    "                }\n"
-    "\n"
-    "    reverse_graph = {mod_id: set() for mod_id in mods}\n"
-    "    in_degree = {}\n"
-    "\n"
+    "                    continue\n"
+    "                mods[info['id']] = {'info': info, 'filepath': filepath, 'dependencies': set(info['dependencies'])}\n"
+    "    adj = {mod_id: [] for mod_id in mods}\n"
+    "    in_degree = {mod_id: 0 for mod_id in mods}\n"
     "    for mod_id, data in mods.items():\n"
-    "        # The in-degree is simply the number of dependencies a mod has.\n"
-    "        in_degree[mod_id] = len(data['dependencies'])\n"
     "        for dep_id in data['dependencies']:\n"
     "            if dep_id not in mods:\n"
     "                return {'status': 'error', 'message': f'Mod \\'{mod_id}\\' has an unmet dependency: \\'{dep_id}\\' '}\n"
-    "            # Add an edge from the dependency to the current mod\n"
-    "            reverse_graph[dep_id].add(mod_id)\n"
-    "\n"
-    "    # Queue of all nodes with no dependencies (in-degree of 0)\n"
-    "    queue = deque([mod_id for mod_id, degree in in_degree.items() if degree == 0])\n"
-    "    \n"
+    "            adj[dep_id].append(mod_id)\n"
+    "            in_degree[mod_id] += 1\n"
+    "    queue = deque([mod_id for mod_id in mods if in_degree[mod_id] == 0])\n"
     "    sorted_order = []\n"
     "    while queue:\n"
     "        mod_id = queue.popleft()\n"
     "        sorted_order.append({'id': mod_id, 'filepath': mods[mod_id]['filepath']})\n"
-    "        \n"
-    "        # For each mod that depended on the one we just processed...\n"
-    "        for dependent_mod_id in reverse_graph[mod_id]:\n"
-    "            # ...decrement its in-degree.\n"
-    "            in_degree[dependent_mod_id] -= 1\n"
-    "            if in_degree[dependent_mod_id] == 0:\n"
-    "                queue.append(dependent_mod_id)\n"
-    "\n"
+    "        for neighbor in adj[mod_id]:\n"
+    "            in_degree[neighbor] -= 1\n"
+    "            if in_degree[neighbor] == 0:\n"
+    "                queue.append(neighbor)\n"
     "    if len(sorted_order) == len(mods):\n"
     "        return {'status': 'ok', 'order': sorted_order}\n"
     "    else:\n"
@@ -452,6 +440,109 @@ bool fileExists(const char *path)
     return true;
 }
 
+typedef struct {
+    PyObject_HEAD
+    // No instance-specific data is needed for this simple proxy.
+} ConsoleProxyObject;
+
+// C implementation of the "write" method for our object.
+static PyObject* ConsoleProxy_write(ConsoleProxyObject *self, PyObject *args) {
+    PyObject* p_string;
+    if (!PyArg_ParseTuple(args, "O", &p_string)) {
+        return NULL;
+    }
+
+    if (!PyUnicode_Check(p_string)) {
+        PyErr_SetString(PyExc_TypeError, "write() argument must be a string");
+        return NULL;
+    }
+
+    Py_ssize_t size;
+    const char *c_str = PyUnicode_AsUTF8AndSize(p_string, &size);
+    if (c_str == NULL) {
+        return NULL;
+    }
+
+    fwrite(c_str, 1, size, stdout);
+    fflush(stdout);
+
+    Py_ssize_t char_count = PyUnicode_GET_LENGTH(p_string);
+    return PyLong_FromSsize_t(char_count);
+}
+
+static PyObject* ConsoleProxy_flush(ConsoleProxyObject *self, PyObject *args) {
+    fflush(stdout);
+    Py_RETURN_NONE;
+}
+
+static PyObject* ConsoleProxy_isatty(ConsoleProxyObject *self, PyObject *args) {
+#ifdef HL_WIN
+    if (_isatty(_fileno(stdout))) {
+        Py_RETURN_TRUE;
+    }
+#else
+    if (isatty(fileno(stdout))) {
+        Py_RETURN_TRUE;
+    }
+#endif
+    Py_RETURN_FALSE;
+}
+
+// Table of methods that our object will have.
+static PyMethodDef ConsoleProxy_methods[] = {
+    {"write",  (PyCFunction)ConsoleProxy_write,  METH_VARARGS, "Writes text to the C stdout."},
+    {"flush",  (PyCFunction)ConsoleProxy_flush,  METH_NOARGS,  "Flushes the C stdout buffer."},
+    {"isatty", (PyCFunction)ConsoleProxy_isatty, METH_NOARGS,  "Returns True if this is a TTY."},
+    {NULL, NULL, 0, NULL} // Sentinel value
+};
+
+// The main type definition struct for our ConsoleProxyType.
+static PyTypeObject ConsoleProxyType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "hlmod._ConsoleProxy",
+    .tp_basicsize = sizeof(ConsoleProxyObject),
+    .tp_itemsize = 0,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_new = PyType_GenericNew,
+    .tp_doc = "A proxy object to forward Python I/O to the C stdout.",
+    .tp_methods = ConsoleProxy_methods,
+};
+
+void hlmod_setup_pyio() {
+#ifdef HL_WIN
+    if (PyType_Ready(&ConsoleProxyType) < 0) {
+        fprintf(stderr, "[hlmod] FATAL: Could not ready ConsoleProxyType.\n");
+        PyErr_Print();
+        return;
+    }
+
+    PyObject* proxy_instance = PyObject_CallObject((PyObject *)&ConsoleProxyType, NULL);
+    if (proxy_instance == NULL) {
+        fprintf(stderr, "[hlmod] FATAL: Could not create ConsoleProxy instance.\n");
+        PyErr_Print();
+        Py_DECREF(&ConsoleProxyType);
+        return;
+    }
+
+    PyObject* sys_module = PyImport_ImportModule("sys");
+    if (sys_module) {
+        PyObject_SetAttrString(sys_module, "stdout", proxy_instance);
+        PyObject_SetAttrString(sys_module, "stderr", proxy_instance);
+        Py_DECREF(sys_module);
+    } else {
+        fprintf(stderr, "[hlmod] FATAL: Could not import sys module.\n");
+        PyErr_Print();
+    }
+
+    Py_DECREF(proxy_instance);
+
+    #ifdef HLMOD_DEBUG
+    printf("[hlmod DEBUG] Python I/O redirected via C-side proxy object.\n");
+    PyRun_SimpleString("import sys; print('This is a test print from Python going through the C proxy.')");
+    #endif
+#endif
+}
+
 #ifdef HL_WIN
 #if defined(HL_WIN_DESKTOP) && defined(HL_MINGW)
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PSTR lpCmdLine, INT nCmdShow) {
@@ -473,7 +564,9 @@ int main(int argc, pchar *argv[]) {
         return 1;
     }
 
-// #define HLMOD_STDOUT_HACK
+    hlmod_setup_pyio();
+
+// #   define HLMOD_STDOUT_HACK
 #   ifdef HLMOD_STDOUT_HACK
     FILE* stderr_log_file = fopen("hlmod_pyerr.log", "w");
     FILE* stdout_log_file = fopen("hlmod_pyout.log", "w");
