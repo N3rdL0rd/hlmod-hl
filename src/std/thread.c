@@ -862,6 +862,27 @@ static void gc_thread_entry( thread_start *_s ) {
 }
 #endif
 
+#ifdef HL_WIN
+
+typedef struct {
+    void *(*callback)(void *);
+    void *param;
+} hl_thread_adapter_params;
+
+static unsigned __stdcall hl_thread_adapter(void *p) {
+    hl_thread_adapter_params *params = (hl_thread_adapter_params *)p;
+    
+    void *(*callback)(void *) = params->callback;
+    void *param = params->param;
+    
+    free(params);
+    callback(param);
+    
+    return 0;
+}
+
+#endif
+
 HL_PRIM hl_thread *hl_thread_start( void *callback, void *param, bool withGC ) {
 	// printf("[hlmod DEBUG] Thread created! gc: %d\n", withGC);
 #ifdef HL_THREADS
@@ -878,11 +899,30 @@ HL_PRIM hl_thread *hl_thread_start( void *callback, void *param, bool withGC ) {
 	hl_error("Threads support is disabled");
 	return NULL;
 #elif defined(HL_WIN)
-	DWORD tid;
-	HANDLE h = CreateThread(NULL,0,callback,param,0,&tid);
-	if( h == NULL )
+
+    hl_thread_adapter_params *adapter_params = (hl_thread_adapter_params *)malloc(sizeof(hl_thread_adapter_params));
+    if (adapter_params == NULL) {
+        return NULL; // oom
+    }
+    adapter_params->callback = callback;
+    adapter_params->param = param;
+
+	unsigned tid;
+	HANDLE h = (HANDLE)_beginthreadex(
+        NULL,
+        0,
+        hl_thread_adapter,
+        adapter_params,
+        0,
+        &tid
+    );
+
+	if( h == 0 ) {
+        free(adapter_params);
 		return NULL;
+    }
 	CloseHandle(h);
+    
 	if( withGC ) {
 		hl_lock *l = ((thread_start*)param)->wait;
 		if( l ) hl_lock_wait(l, NULL);
