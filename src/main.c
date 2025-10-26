@@ -30,6 +30,12 @@
 #include <hlmod.h>
 #include <hlmod_codegen.h>
 
+#ifndef HL_WIN
+#   include <unistd.h>
+#   include <libgen.h>
+#   include <string.h>
+#endif
+
 #include "sha256.h"
 char g_code_sha256[65] = {0};
 
@@ -43,28 +49,28 @@ hl_code *g_code = NULL;
 #	include <locale.h>
 #	include <direct.h>
 #	define MKDIR(path) _mkdir(path)
+#   define pprintf(str,file)	uprintf(USTR(str),file)
+#   define pfopen(file,ext) _wfopen(file,USTR(ext))
+#   define pcompare wcscmp
+#   define ptoi(s)	wcstol(s,NULL,10)
+#   define PSTR(x) USTR(x)
+#   include <windows.h>
+#   include <fcntl.h>
+#   include <stdio.h>
+#   include <io.h>
 typedef uchar pchar;
-#define pprintf(str,file)	uprintf(USTR(str),file)
-#define pfopen(file,ext) _wfopen(file,USTR(ext))
-#define pcompare wcscmp
-#define ptoi(s)	wcstol(s,NULL,10)
-#define PSTR(x) USTR(x)
-#include <windows.h>
-#include <fcntl.h>
-#include <stdio.h>
-#include <io.h>
 #else
 #	include <sys/stat.h>
 #	include <errno.h>
 #	define MKDIR(path) mkdir(path, 0755)
+#   define pprintf printf
+#   define pfopen fopen
+#   define pcompare strcmp
+#   define ptoi atoi
+#   define PSTR(x) x
 typedef char pchar;
-#define pprintf printf
-#define pfopen fopen
-#define pcompare strcmp
-#define ptoi atoi
-#define PSTR(x) x
-
 #endif
+
 typedef struct {
 	pchar *file;
 	hl_code *code;
@@ -123,6 +129,66 @@ static hl_code *load_code( const pchar *file, char **error_msg, bool print_error
 	code = hl_code_read((unsigned char*)fdata, size, error_msg);
 	free(fdata);
 	return code;
+}
+
+static void get_exe_dir(pchar* buffer, int buffer_size) {
+#ifdef HL_WIN
+    if (GetModuleFileNameW(NULL, buffer, buffer_size) == 0) {
+        buffer[0] = L'\0';
+        return;
+    }
+    pchar* last_slash = wcsrchr(buffer, L'\\');
+    if (last_slash) {
+        *(last_slash + 1) = L'\0';
+    }
+#else
+    char exe_path[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (len == -1) {
+        buffer[0] = '\0';
+        return;
+    }
+    exe_path[len] = '\0';
+
+    char* dir = dirname(exe_path);
+    strncpy(buffer, dir, buffer_size - 2);
+    buffer[buffer_size - 2] = '\0';
+
+    strcat(buffer, "/");
+#endif
+}
+
+static void check_deadcells() {
+    const char* deadcells_hashes[] = {
+        "696aaec83db7a21e76c828449167880f001ef056c230350dca6fddccc34cc9c7",
+        "376564ab2173ddcbadf53d73baf2fc335793e4d14a637fc1829569c314f39667",
+        "d5d17575f4bec6ab674a9cac56fba5fd696576f23fc1b22e32629bcafba92ad3",
+        "45ebaecbedeff7c9b4b7d8b2faaf91ecd47c1f74dd7642938444ec9c83b488f5",
+        NULL
+    };
+
+    for (int i = 0; deadcells_hashes[i] != NULL; i++) {
+        if (strcmp(g_code_sha256, deadcells_hashes[i]) == 0) {
+            printf("[hlmod] Dead Cells detected...\n");
+#ifdef HL_WIN
+            pchar exe_dir[MAX_PATH];
+            get_exe_dir(exe_dir, MAX_PATH);
+
+            pchar appid_path[MAX_PATH];
+            swprintf(appid_path, MAX_PATH, L"%ssteam_appid.txt", exe_dir);
+
+            if (_waccess(appid_path, 0) == -1) {
+                printf("[hlmod] steam_appid.txt not found. Creating it for Dead Cells (588650).\n");
+                FILE* f = _wfopen(appid_path, L"w");
+                if (f) {
+                    fprintf(f, "588650");
+                    fclose(f);
+                }
+            }
+#endif
+            return;
+        }
+    }
 }
 
 static bool check_reload( main_context *m ) {
@@ -655,6 +721,8 @@ int main(int argc, pchar *argv[]) {
 		if( error_msg ) printf("%s\n", error_msg);
 		return 1;
 	}
+
+    check_deadcells();
 
 #ifdef USE_HLMOD_CRASH
 	hlmod_setup_handler();
