@@ -29,7 +29,6 @@
 #include <Python.h>
 #include <hlmod.h>
 #include <hlmod_codegen.h>
-#include <io.h>
 
 #include "sha256.h"
 char g_code_sha256[65] = {0};
@@ -50,9 +49,10 @@ typedef uchar pchar;
 #define pcompare wcscmp
 #define ptoi(s)	wcstol(s,NULL,10)
 #define PSTR(x) USTR(x)
-#include <windows.h> // For GetStdHandle
-#include <fcntl.h>   // For _O_TEXT
-#include <stdio.h>   // For sprintf
+#include <windows.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <io.h>
 #else
 #	include <sys/stat.h>
 #	include <errno.h>
@@ -63,6 +63,7 @@ typedef char pchar;
 #define pcompare strcmp
 #define ptoi atoi
 #define PSTR(x) x
+
 #endif
 typedef struct {
 	pchar *file;
