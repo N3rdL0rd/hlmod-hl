@@ -536,11 +536,6 @@ void hlmod_setup_pyio() {
     }
 
     Py_DECREF(proxy_instance);
-
-    #ifdef HLMOD_DEBUG
-    printf("[hlmod DEBUG] Python I/O redirected via C-side proxy object.\n");
-    PyRun_SimpleString("import sys; print('This is a test print from Python going through the C proxy.')");
-    #endif
 #endif
 }
 
