@@ -126,7 +126,7 @@ uchar *hl_module_resolve_symbol_full( void *addr, uchar *out, int *outSize, int 
 	else
 		pos += usprintf(out,size - pos,USTR("fun$%d("),fdebug->findex);
 	pos += hl_from_utf8(out + pos,size - pos,m->code->debugfiles[file&0x7FFFFFFF]);
-	pos += usprintf(out + pos, size - pos, USTR(":%d)"), line);
+	pos += usprintf(out + pos, size - pos, USTR(":%d) [f@%d@op%d]"), line, fidx, fpos);
 	*outSize = pos;
 	return out;
 }
