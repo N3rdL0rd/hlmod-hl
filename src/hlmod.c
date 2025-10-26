@@ -1001,9 +1001,6 @@ int jit_dispatch_hook(int findex, int nargs, void **args)
     g_return_value_double = 0.0;
 
     hl_blocking(true);
-#   ifdef HLMOD_DEBUG
-    printf("[hlmod DEBUG] Hooking! %i\n", findex); 
-#   endif
     PyGILState_STATE gstate;
     gstate = PyGILState_Ensure();
 
