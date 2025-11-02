@@ -309,26 +309,42 @@ const char *g_sorter_script =
     "\n"
     "def get_mod_info(filepath):\n"
     "    '''Safely parses a Python file to get its MOD_INFO dict without executing it.'''\n"
-    "    with open(filepath, 'r', encoding='utf-8') as f:\n"
-    "        tree = ast.parse(f.read(), filename=filepath)\n"
-    "    for node in tree.body:\n"
-    "        if isinstance(node, ast.Assign):\n"
-    "            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id == 'MOD_INFO':\n"
-    "                return ast.literal_eval(node.value)\n"
+    "    try:\n"
+    "        with open(filepath, 'r', encoding='utf-8') as f:\n"
+    "            tree = ast.parse(f.read(), filename=filepath)\n"
+    "        for node in tree.body:\n"
+    "            if isinstance(node, ast.Assign):\n"
+    "                if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id == 'MOD_INFO':\n"
+    "                    return ast.literal_eval(node.value)\n"
+    "    except (FileNotFoundError, SyntaxError):\n"
+    "        return None\n"
     "    return None\n"
+    "\n"
+    "def find_mods(mods_dir):\n"
+    "    '''Finds all valid mods in the mods directory, including single files and directories.'''\n"
+    "    found_mods = []\n"
+    "    for name in os.listdir(mods_dir):\n"
+    "        path = os.path.join(mods_dir, name)\n"
+    "        if name == 'stubs': continue\n"
+    "        if os.path.isdir(path):\n"
+    "            init_path = os.path.join(path, '__init__.py')\n"
+    "            info = get_mod_info(init_path)\n"
+    "            if info: found_mods.append({'info': info, 'name': name, 'is_dir': True})\n"
+    "        elif name.endswith('.py') and not name.startswith('__'):\n"
+    "            info = get_mod_info(path)\n"
+    "            if info: found_mods.append({'info': info, 'name': name.rsplit('.', 1)[0], 'is_dir': False})\n"
+    "    return found_mods\n"
     "\n"
     "def resolve_mod_order(mods_dir):\n"
     "    '''Discovers mods, builds a dependency graph, and performs a topological sort.'''\n"
+    "    discovered_mods = find_mods(mods_dir)\n"
     "    mods = {}\n"
-    "    for filename in os.listdir(mods_dir):\n"
-    "        if filename.endswith('.py') and not filename.startswith('__'):\n"
-    "            filepath = os.path.join(mods_dir, filename)\n"
-    "            info = get_mod_info(filepath)\n"
-    "            if info and 'id' in info and 'dependencies' in info:\n"
-    "                if info.get('enabled', True) is False:\n"
-    "                    print(f\"    -> Skipping disabled mod: '{info['id']}'\")\n"
-    "                    continue\n"
-    "                mods[info['id']] = {'info': info, 'filepath': filepath, 'dependencies': set(info['dependencies'])}\n"
+    "    for mod_data in discovered_mods:\n"
+    "        info = mod_data['info']\n"
+    "        if info.get('enabled', True) is False:\n"
+    "            print(f\"    -> Skipping disabled mod: '{info['id']}'\")\n"
+    "            continue\n"
+    "        mods[info['id']] = {'info': info, 'name': mod_data['name'], 'dependencies': set(info['dependencies'])}\n"
     "    adj = {mod_id: [] for mod_id in mods}\n"
     "    in_degree = {mod_id: 0 for mod_id in mods}\n"
     "    for mod_id, data in mods.items():\n"
@@ -341,7 +357,7 @@ const char *g_sorter_script =
     "    sorted_order = []\n"
     "    while queue:\n"
     "        mod_id = queue.popleft()\n"
-    "        sorted_order.append({'id': mod_id, 'filepath': mods[mod_id]['filepath']})\n"
+    "        sorted_order.append({'id': mod_id, 'name': mods[mod_id]['name']})\n"
     "        for neighbor in adj[mod_id]:\n"
     "            in_degree[neighbor] -= 1\n"
     "            if in_degree[neighbor] == 0:\n"
@@ -438,30 +454,13 @@ int get_mod_load_order(const char *mods_dir, PyObject **load_order_list) {
  * @param module_name The name of the module to import (e.g., "modcore").
  */
 void load_mod(const char* module_name) {
-    PyObject *pName, *pModule, *pFunc, *pValue;
+    PyObject *pName, *pModule;
     printf("    -> Loading `%s`\n", module_name);
 
     pName = PyUnicode_FromString(module_name);
     pModule = PyImport_Import(pName);
     Py_DECREF(pName);
-
-    if (pModule != NULL) {
-        pFunc = PyObject_GetAttrString(pModule, "initialize");
-        if (pFunc) {
-            if (PyCallable_Check(pFunc)) {
-                pValue = PyObject_CallObject(pFunc, NULL);
-                if (pValue == NULL) {
-                    fprintf(stderr, "      [!] Error calling initialize() in mod '%s'\n", module_name);
-                    PyErr_Print();
-                }
-                Py_XDECREF(pValue);
-            }
-            Py_XDECREF(pFunc);
-        } else {
-            PyErr_Clear();
-        }
-        Py_DECREF(pModule);
-    } else {
+    if (pModule == NULL) {
         PyErr_Print();
         fprintf(stderr, "      [!] Error: Failed to load mod '%s'\n", module_name);
     }
@@ -626,7 +625,7 @@ int main(int argc, pchar *argv[]) {
         return 1;
     }
 
-    hlmod_setup_pyio();
+
 
 // #   define HLMOD_STDOUT_HACK
 #   ifdef HLMOD_STDOUT_HACK
@@ -648,6 +647,8 @@ int main(int argc, pchar *argv[]) {
             Py_DECREF(sys_module);
         }
     }
+#   else
+    hlmod_setup_pyio();
 #   endif
 
     PyEval_InitThreads();
@@ -759,11 +760,8 @@ int main(int argc, pchar *argv[]) {
         printf("[hlmod] Loading mods:\n");
         for (Py_ssize_t i = 0; i < mod_count; i++) {
             PyObject* mod_info_dict = PyList_GetItem(load_order_list, i);
-            PyObject* filepath_obj = PyDict_GetItemString(mod_info_dict, "filepath");
-            const char* filepath_str = PyUnicode_AsUTF8(filepath_obj);
-            
-            char module_name[256];
-            get_module_name_from_path(filepath_str, module_name, sizeof(module_name));
+            PyObject* name_obj = PyDict_GetItemString(mod_info_dict, "name");
+            const char* module_name = PyUnicode_AsUTF8(name_obj);
             
             load_mod(module_name);
         }
