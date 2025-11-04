@@ -765,6 +765,91 @@ static void print_absolute_import_for_type(FILE *f, hl_type *importer_type, hl_t
     fprintf(f, "%sfrom %s import %s\n", indent, full_module_path, dep_class_name);
 }
 
+static bool is_static_type(hl_type *t)
+{
+    if (!t || (t->kind != HOBJ && t->kind != HSTRUCT))
+        return false;
+
+    if (!t->obj || !t->obj->name || t->obj->name[0] == 0)
+        return false;
+
+    char *name_utf8 = (char *)hl_to_utf8(t->obj->name);
+    if (!name_utf8)
+        return false;
+
+    if (name_utf8[0] == '$')
+        return true;
+
+    char *last_dot = strrchr(name_utf8, '.');
+    if (last_dot && *(last_dot + 1) == '$')
+        return true;
+
+    return false;
+}
+
+static hl_type *find_static_pair(hl_code *code, hl_type *instance_type)
+{
+    if (!instance_type || !instance_type->obj || !instance_type->obj->name || instance_type->obj->name[0] == 0)
+        return NULL;
+
+    char *instance_name_utf8 = (char *)hl_to_utf8(instance_type->obj->name);
+    char static_name_buffer[1024];
+
+    char *last_dot = strrchr(instance_name_utf8, '.');
+    if (last_dot) {
+        int package_len = last_dot - instance_name_utf8 + 1;
+        snprintf(static_name_buffer, sizeof(static_name_buffer), "%.*s$%s",
+                 package_len, instance_name_utf8, last_dot + 1);
+    } else {
+        snprintf(static_name_buffer, sizeof(static_name_buffer), "$%s", instance_name_utf8);
+    }
+
+    uchar static_name_u[1024];
+    hl_from_utf8(static_name_u, sizeof(static_name_u) / sizeof(uchar), static_name_buffer);
+
+    for (int i = 0; i < code->ntypes; i++) {
+        hl_type *iter_type = &code->types[i];
+        
+        if (is_static_type(iter_type) && ucmp(iter_type->obj->name, static_name_u) == 0) {
+            return iter_type;
+        }
+    }
+
+    return NULL;
+}
+
+static hl_type *find_instance_pair(hl_code *code, hl_type *static_type)
+{
+    char *static_name_utf8 = (char *)hl_to_utf8(static_type->obj->name);
+    char instance_name_buffer[1024];
+
+    char *last_dot = strrchr(static_name_utf8, '.');
+    if (last_dot && *(last_dot + 1) == '$') {
+        int package_len = last_dot - static_name_utf8 + 1;
+        snprintf(instance_name_buffer, sizeof(instance_name_buffer), "%.*s%s",
+                 package_len, static_name_utf8, last_dot + 2);
+    } else if (static_name_utf8[0] == '$') {
+        snprintf(instance_name_buffer, sizeof(instance_name_buffer), "%s", static_name_utf8 + 1);
+    } else {
+        return NULL;
+    }
+
+    uchar instance_name_u[1024];
+    hl_from_utf8(instance_name_u, sizeof(instance_name_u) / sizeof(uchar), instance_name_buffer);
+
+    for (int i = 0; i < code->ntypes; i++) {
+        hl_type *iter_type = &code->types[i];
+
+        if ((iter_type->kind == HOBJ || iter_type->kind == HSTRUCT) && !is_static_type(iter_type)) {
+            if (iter_type->obj && iter_type->obj->name && ucmp(iter_type->obj->name, instance_name_u) == 0) {
+                return iter_type;
+            }
+        }
+    }
+
+    return NULL;
+}
+
 void hlmod_do_generate_stubs(hl_code *code)
 {
     const char *base_dir = "./mods/stubs";
@@ -799,6 +884,34 @@ void hlmod_do_generate_stubs(hl_code *code)
             continue;
         if (t->kind == HOBJ && t->obj && t->obj->name && ucmp(t->obj->name, USTR("String")) == 0)
             continue;
+
+        hl_type *static_pair_for_comment = NULL;
+
+        if (is_static_type(t))
+        {
+            hl_type *instance_pair = find_instance_pair(code, t);
+            if (instance_pair != NULL)
+            {
+                printf("[hlmod] Deferring static type '%s' (will be handled by '%s')\n",
+                       (char *)hl_to_utf8(t->obj->name),
+                       (char *)hl_to_utf8(instance_pair->obj->name));
+                continue;
+            }
+            else
+            {
+                printf("[hlmod] Processing standalone static type '%s'\n", (char *)hl_to_utf8(t->obj->name));
+            }
+        }
+        else
+        {
+            static_pair_for_comment = find_static_pair(code, t);
+            if (static_pair_for_comment)
+            {
+                printf("[hlmod] Paired instance type '%s' with static type '%s'\n",
+                       (char *)hl_to_utf8(t->obj->name),
+                       (char *)hl_to_utf8(static_pair_for_comment->obj->name));
+            }
+        }
 
         char dir_path[1024], class_name_only[512];
         get_python_path_for_type(t, base_dir, dir_path, sizeof(dir_path), class_name_only, sizeof(class_name_only));
