@@ -21,7 +21,33 @@ bool uchar_eq(const uchar *s1, const uchar *s2)
 
 THREAD_LOCAL int64_t g_return_value_int = 0;
 THREAD_LOCAL double g_return_value_double = 0.0;
-THREAD_LOCAL int g_is_passthrough_call = 0;
+static THREAD_LOCAL int* g_passthrough_stack = NULL;
+static THREAD_LOCAL int g_passthrough_stack_size = 0;
+static THREAD_LOCAL int g_passthrough_stack_capacity = 0;
+
+static void push_passthrough(int findex) {
+    if (g_passthrough_stack_size >= g_passthrough_stack_capacity) {
+        int new_capacity = g_passthrough_stack_capacity == 0 ? 8 : g_passthrough_stack_capacity * 2;
+        g_passthrough_stack = (int*)realloc(g_passthrough_stack, new_capacity * sizeof(int));
+        g_passthrough_stack_capacity = new_capacity;
+    }
+    g_passthrough_stack[g_passthrough_stack_size++] = findex;
+}
+
+static void pop_passthrough() {
+    if (g_passthrough_stack_size > 0) {
+        g_passthrough_stack_size--;
+    }
+}
+
+static bool is_passthrough(int findex) {
+    for (int i = 0; i < g_passthrough_stack_size; i++) {
+        if (g_passthrough_stack[i] == findex) {
+            return true;
+        }
+    }
+    return false;
+}
 
 EXPORT int64_t hlmod_get_return_int() {
     return g_return_value_int;
@@ -163,10 +189,10 @@ static PyObject *HlHook_call_original(HlHook *self, PyObject *py_args)
     cl.fun = g_module->functions_ptrs[self->findex];
     cl.hasValue = 0;
 
-    g_is_passthrough_call++;
+    push_passthrough(self->findex);
     bool is_exc;
     vdynamic *hl_result = hl_dyn_call_safe(&cl, nargs > 0 ? vargs : NULL, nargs, &is_exc);
-    g_is_passthrough_call--;
+    pop_passthrough();
 
     if (is_exc)
     {
@@ -961,6 +987,12 @@ PyObject *hlmod_py_call(PyObject *self, PyObject *args)
 
 #pragma endregion
 
+#pragma region HL-side closures
+
+
+
+#pragma endregion
+
 #pragma region JIT hook
 /**
  * @brief The C hook that will be called from the JIT-compiled code.
@@ -977,8 +1009,7 @@ PyObject *hlmod_py_call(PyObject *self, PyObject *args)
 
 int jit_dispatch_hook(int findex, int nargs, void **args)
 {
-    if (g_is_passthrough_call > 0)
-    {
+    if (is_passthrough(findex)) {
         return 0;
     }
 
