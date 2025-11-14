@@ -275,6 +275,82 @@ PyObject *hlmod_py_register_hlobj(PyObject *self, PyObject *args)
     Py_RETURN_NONE;
 }
 
+/**
+ * @brief Performs a reverse lookup to find the Haxe type for a given Python object.
+ * 
+ * This function iterates through all registered Python classes (subclasses of HlObject)
+ * and checks if the given 'obj' is an instance of any of them.
+ * 
+ * @param obj The Python object instance to look up.
+ * @return The corresponding hl_type* if a match is found, otherwise NULL.
+ */
+static hl_type* hlmod_py_find_hlobject(PyObject *obj)
+{
+    for (int i = 0; i < g_hlobjs_l; i++)
+    {
+        PyObject *registered_class = g_hlobjs[i];
+
+        if (registered_class == NULL) {
+            continue;
+        }
+
+        int is_instance = PyObject_IsInstance(obj, registered_class);
+
+        if (is_instance == -1) {
+            fprintf(stderr, "[hlmod] [WARN] PyObject_IsInstance failed during reverse lookup.\n");
+            PyErr_Clear();
+            return NULL;
+        }
+
+        if (is_instance) {
+            return &g_code->types[i];
+        }
+    }
+
+    return NULL;
+}
+
+static PyObject *g_hlobj_module = NULL;
+static PyObject *g_hlobj_base_class = NULL;
+static PyObject *g_hlcallable_class = NULL;
+
+/**
+ * @brief Checks if a Python object is an instance of the HlObject base class
+ *        from the 'hlobj' Python module. Caches the module and class for efficiency.
+ *
+ * @param obj The Python object to check.
+ * @return true if it's an instance of hlobj.HlObject, false otherwise.
+ */
+bool hlmod_py_is_hlobject(PyObject *obj)
+{
+    if (g_hlobj_base_class == NULL)
+    {
+        g_hlobj_module = PyImport_ImportModule("hlobj");
+        if (g_hlobj_module == NULL)
+        {
+            PyErr_Print();
+            return false;
+        }
+        g_hlobj_base_class = PyObject_GetAttrString(g_hlobj_module, "HlObject");
+        if (g_hlobj_base_class == NULL)
+        {
+            Py_DECREF(g_hlobj_module);
+            g_hlobj_module = NULL;
+            PyErr_Clear();
+            return false;
+        }
+    }
+
+    int is_instance = PyObject_IsInstance(obj, g_hlobj_base_class);
+
+    if (is_instance == -1) {
+        PyErr_Clear();
+        return false;
+    }
+
+    return is_instance == 1;
+}
+
 #pragma region Casting
 
 /**
@@ -398,7 +474,55 @@ PyObject *hlmod_cast_to_py(hl_type *type, void *ptr)
         }
         return py_list;
     }
+    case HDYN:
+    {
+        vdynamic *dyn = *(vdynamic **)ptr;
+        // printf("unwrapping dyn with type ");
+        // printf("%s...\n", kind2str(dyn->t->kind));
+        return hlmod_cast_to_py(dyn->t, &dyn->v);
+    }
+    case HFUN:
+    {
+        vclosure *cl = (vclosure *)ptr;
+        if (cl == NULL)
+        {
+            Py_RETURN_NONE;
+        }
+
+        if (g_hlcallable_class == NULL)
+        {
+            if (g_hlobj_module == NULL) {
+                g_hlobj_module = PyImport_ImportModule("hlobj");
+                if (g_hlobj_module == NULL) {
+                    PyErr_SetString(PyExc_ImportError, "Failed to import the 'hlobj' module. Is it in `mods/`?");
+                    return NULL;
+                }
+            }
+            g_hlcallable_class = PyObject_GetAttrString(g_hlobj_module, "HlCallable");
+            if (g_hlcallable_class == NULL) {
+                PyErr_SetString(PyExc_AttributeError, "Could not find 'HlCallable' class in 'hlobj' module.");
+                return NULL;
+            }
+        }
+        
+        PyObject *py_ptr = HlPtr_New(cl, HFUN);
+        if (py_ptr == NULL) {
+            return NULL;
+        }
+
+        PyObject *py_args = PyTuple_Pack(1, py_ptr);
+        Py_DECREF(py_ptr);
+        if (py_args == NULL) {
+            return NULL;
+        }
+
+        PyObject *py_instance = PyObject_CallObject(g_hlcallable_class, py_args);
+        Py_DECREF(py_args);
+
+        return py_instance;
+    }
     default:
+        printf("Falling through with %s\n", kind2str(type->kind));
         break;
     }
 
@@ -422,6 +546,79 @@ void *hlmod_cast_to_hl(PyObject *obj, hl_type *type)
     {
         fprintf(stderr, "[hlmod] [ERROR] [py->hl] Received NULL type.\n");
         return NULL;
+    }
+
+    if (type->kind == HDYN)
+    {
+        if (obj == Py_None) {
+            void **ret_ptr = (void **)hl_gc_alloc_raw(sizeof(void *));
+            *ret_ptr = NULL;
+            return ret_ptr;
+        }
+
+        hl_type *inner_type = NULL;
+        if (PyBool_Check(obj)) {
+            inner_type = &hlt_bool;
+        } else if (PyLong_Check(obj)) {
+            inner_type = &hlt_i32; // HACK: safe guess for types with overlap is to just take the most common. if someone decides to use a `hl.I64`, then this will die!
+        } else if (PyFloat_Check(obj)) {
+            inner_type = &hlt_f64;
+        } else if (PyUnicode_Check(obj)) {
+            // HACK: is this fucked? should this be different? or even cached? yes! does it work? also yes!
+            for (int i = 0; i < g_code->ntypes; i++) {
+                hl_type *t = &g_code->types[i];
+                if (t->kind == HOBJ && t->obj->name && uchar_eq(t->obj->name, u"String")) {
+                    inner_type = t;
+                    break;
+                }
+            }
+        } else if (hlmod_py_is_hlobject(obj)) {
+            inner_type = hlmod_py_find_hlobject(obj);
+        } else if (g_hlcallable_class != NULL && PyObject_IsInstance(obj, g_hlcallable_class))
+        {
+            PyObject *py_hlptr = PyObject_GetAttrString(obj, "_hlmod_ptr");
+            if (py_hlptr == NULL || !Py_IS_TYPE(py_hlptr, &HlPtrType)) {
+                PyErr_SetString(PyExc_TypeError, "HlCallable must have a valid _hlmod_ptr attribute.");
+                if (py_hlptr) Py_DECREF(py_hlptr);
+                return NULL;
+            }
+
+            vclosure* cl = (vclosure*)((HlPtr*)py_hlptr)->ptr;
+            Py_DECREF(py_hlptr);
+
+            if (cl == NULL) {
+                PyErr_SetString(PyExc_ValueError, "HlCallable's _hlmod_ptr contains a null Haxe closure.");
+                return NULL;
+            }
+
+            inner_type = cl->t;
+        } else if (PyObject_IsInstance(obj, (PyObject *)&HlPtrType)) {
+            PyErr_Format(PyExc_TypeError, "HlPtr is an ambiguous type and cannot be directly cast back to a Dynamic, which is what you're trying to do. Try wrapping this HlPtr in another type from `modcore.hlobj` to get it to cast cleanly. If you're confused as to why you're getting a HlPtr where you definitely shouldn't, then you should open an issue on Github.");
+            return NULL;
+        }
+        // TODO: more types back and forth in a HDYN
+            
+        if (inner_type == NULL) {
+            PyErr_Format(PyExc_TypeError, "Cannot wrap ambiguous type '%s' back into a Dynamic. Whoops!", Py_TYPE(obj)->tp_name);
+            return NULL;
+        }
+
+        vdynamic *dyn_box = hl_alloc_dynamic(inner_type);
+        if (dyn_box == NULL) {
+            PyErr_SetString(PyExc_MemoryError, "Failed to allocate vdynamic for re-wrapping.");
+            return NULL;
+        }
+
+        void *inner_hl_val_ptr = hlmod_cast_to_hl(obj, inner_type);
+        if (inner_hl_val_ptr == NULL) {
+            return NULL;
+        }
+
+        memcpy(&dyn_box->v, inner_hl_val_ptr, hl_type_size(inner_type));
+
+        void **ret_ptr = (void **)hl_gc_alloc_raw(sizeof(void *));
+        *ret_ptr = dyn_box;
+        return ret_ptr;
     }
 
     if (type->kind == HNULL)
@@ -1121,7 +1318,6 @@ int jit_dispatch_hook(int findex, int nargs, void **args)
                 }
             }
             res = 1;
-            // printf("[hlmod] Patching return!\n");
         }
         Py_DECREF(pResult);
         PyGILState_Release(gstate);
