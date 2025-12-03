@@ -522,7 +522,9 @@ PyObject *hlmod_cast_to_py(hl_type *type, void *ptr)
         return py_instance;
     }
     default:
-        printf("Falling through with %s\n", kind2str(type->kind));
+#       ifdef HLMOD_DEBUG
+        printf("[hlmod] [DEBUG] Falling through with %s\n", kind2str(type->kind));
+#       endif
         break;
     }
 
