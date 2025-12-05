@@ -691,8 +691,10 @@ int main(int argc, pchar *argv[]) {
 		FILE *fchk;
         if (fileExists("hlboot.dat")) {
 		    file = PSTR("hlboot.dat");
+        } else if (fileExists("deadcells_gl.exe")) {
+            file = PSTR("deadcells_gl.exe"); // deadcells (and ONLY deadcells) bundles hlboot.dat with the main executable since it's MT's inhouse fork
         } else if (fileExists("deadcells.exe")) {
-            file = PSTR("deadcells.exe"); // deadcells (and ONLY deadcells) bundles the hlboot with the main executable
+            file = PSTR("deadcells.exe"); // deadcells_gl.exe is the platform-neutral version of the game that hlmod has an easier time loading (directx is still fucked, somehow)
         } else {
             COPOUT
         }
