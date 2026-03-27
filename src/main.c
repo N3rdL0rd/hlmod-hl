@@ -251,6 +251,7 @@ static PyMethodDef HlmodMethods[] = {
     {"assert_code_sha", hlmod_py_assert_code_sha, METH_VARARGS, "Asserts the bytecode SHA256, exiting if it mismatches."},
     {"get_global", hlmod_py_get_global, METH_VARARGS, "Gets the global instance of a type by index. Useful for static types."},
     {"call", hlmod_py_call, METH_VARARGS, "Calls an HL function by findex."},
+    {"call_closure", hlmod_py_call_closure, METH_VARARGS, "Calls an HL closure by pointer."},
     {"dump_stack", hlmod_py_dump_stack, METH_NOARGS, "Dumps the current HL stack."},
     {"findex_for_name", hlmod_py_findex_for_name, METH_VARARGS, "Gets the findex for a specific function by its name"},
     {NULL, NULL, 0, NULL}

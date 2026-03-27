@@ -40,6 +40,7 @@ PyObject* hlmod_py_get_fixed_prng(PyObject *self, PyObject *args);
 PyObject *hlmod_py_assert_code_sha(PyObject* self, PyObject* args);
 
 PyObject *hlmod_py_call(PyObject *self, PyObject *args);
+PyObject *hlmod_py_call_closure(PyObject *self, PyObject *args);
 PyObject *hlmod_py_get_global(PyObject* self, PyObject* args);
 PyObject *hlmod_py_dump_stack(PyObject *self, PyObject *args);
 PyObject *hlmod_py_findex_for_name(PyObject *self, PyObject *args);

@@ -59,6 +59,9 @@ EXPORT double hlmod_get_return_double() {
 
 static PyObject **g_hlobjs = NULL;
 static int g_hlobjs_l = 0;
+static PyObject *g_hlobj_module = NULL;
+static PyObject *g_hlobj_base_class = NULL;
+static PyObject *g_hlcallable_class = NULL;
 
 #pragma region HlPtr
 static PyObject *HlPtr_New(void *ptr, int kind);
@@ -66,6 +69,9 @@ static PyObject *HlPtr_get_ptr(HlPtr *self, void *closure);
 static PyObject *HlPtr_get_kind(HlPtr *self, void *closure);
 static int HlPtr_init(HlPtr *self, PyObject *args, PyObject *kwds);
 static void HlPtr_dealloc(HlPtr *self);
+static PyObject *hlmod_py_make_hlcallable(vclosure *cl);
+static PyObject *HlHook_get_findex(HlHook *self, void *closure);
+static PyObject *HlHook_as_closure(HlHook *self, PyObject *Py_UNUSED(ignored));
 
 
 static PyGetSetDef HlPtr_getsetters[] = {
@@ -125,7 +131,7 @@ static int HlPtr_init(HlPtr *self, PyObject *args, PyObject *kwds)
     self->kind = kind;
     self->root = NULL;
 
-    if (self->ptr != NULL)
+    if (self->ptr != NULL && hl_is_gc_ptr(self->ptr))
     {
         self->root = (void **)hl_gc_alloc_raw(sizeof(void *));
         if (self->root == NULL) {
@@ -151,6 +157,50 @@ static PyObject *HlPtr_get_kind(HlPtr *self, void *closure)
 }
 
 #pragma region HlHook
+static PyObject *hlmod_py_make_hlcallable(vclosure *cl)
+{
+    if (cl == NULL)
+    {
+        Py_RETURN_NONE;
+    }
+
+    if (g_hlcallable_class == NULL)
+    {
+        if (g_hlobj_module == NULL) {
+            g_hlobj_module = PyImport_ImportModule("hlobj");
+            if (g_hlobj_module == NULL) {
+                PyErr_SetString(PyExc_ImportError, "Failed to import the 'hlobj' module. Is it in `mods/`?");
+                return NULL;
+            }
+        }
+        g_hlcallable_class = PyObject_GetAttrString(g_hlobj_module, "HlCallable");
+        if (g_hlcallable_class == NULL) {
+            PyErr_SetString(PyExc_AttributeError, "Could not find 'HlCallable' class in 'hlobj' module.");
+            return NULL;
+        }
+    }
+
+    PyObject *py_ptr = HlPtr_New(cl, HFUN);
+    if (py_ptr == NULL) {
+        return NULL;
+    }
+
+    PyObject *py_args = PyTuple_Pack(1, py_ptr);
+    Py_DECREF(py_ptr);
+    if (py_args == NULL) {
+        return NULL;
+    }
+
+    PyObject *py_instance = PyObject_CallObject(g_hlcallable_class, py_args);
+    Py_DECREF(py_args);
+    return py_instance;
+}
+
+static PyObject *HlHook_get_findex(HlHook *self, void *closure)
+{
+    return PyLong_FromLong(self->findex);
+}
+
 static PyObject *HlHook_call_original(HlHook *self, PyObject *py_args)
 {
     hl_function *f = g_module->code->functions + g_module->functions_indexes[self->findex];
@@ -223,8 +273,38 @@ static PyObject *HlHook_call_original(HlHook *self, PyObject *py_args)
     return py_result;
 }
 
+static PyObject *HlHook_as_closure(HlHook *self, PyObject *Py_UNUSED(ignored))
+{
+    if (g_module == NULL || g_module->code == NULL)
+    {
+        PyErr_SetString(PyExc_RuntimeError, "hlmod is not initialized.");
+        return NULL;
+    }
+
+    if (self->findex < 0 || self->findex >= g_module->code->nfunctions)
+    {
+        PyErr_Format(PyExc_IndexError, "Function index %d is out of bounds.", self->findex);
+        return NULL;
+    }
+
+    hl_function *f = g_module->code->functions + g_module->functions_indexes[self->findex];
+    vclosure *cl = hl_alloc_closure_void(f->type, g_module->functions_ptrs[self->findex]);
+    if (cl == NULL)
+    {
+        PyErr_SetString(PyExc_MemoryError, "Failed to allocate closure wrapper.");
+        return NULL;
+    }
+
+    return hlmod_py_make_hlcallable(cl);
+}
+
+static PyGetSetDef HlHook_getsetters[] = {
+    {"findex", (getter)HlHook_get_findex, NULL, "The function index this hook was invoked for.", NULL},
+    {NULL}};
+
 static PyMethodDef HlHook_methods[] = {
     {"call_original", (PyCFunction)HlHook_call_original, METH_VARARGS, "Calls the original Haxe function."},
+    {"as_closure", (PyCFunction)HlHook_as_closure, METH_NOARGS, "Returns the original hooked function as an HlCallable."},
     {NULL}};
 
 PyTypeObject HlHookType = {
@@ -235,6 +315,7 @@ PyTypeObject HlHookType = {
     .tp_itemsize = 0,
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_new = PyType_GenericNew,
+    .tp_getset = HlHook_getsetters,
     .tp_methods = HlHook_methods,
 };
 
@@ -309,10 +390,6 @@ static hl_type* hlmod_py_find_hlobject(PyObject *obj)
 
     return NULL;
 }
-
-static PyObject *g_hlobj_module = NULL;
-static PyObject *g_hlobj_base_class = NULL;
-static PyObject *g_hlcallable_class = NULL;
 
 /**
  * @brief Checks if a Python object is an instance of the HlObject base class
@@ -477,49 +554,26 @@ PyObject *hlmod_cast_to_py(hl_type *type, void *ptr)
     case HDYN:
     {
         vdynamic *dyn = *(vdynamic **)ptr;
+        if (dyn == NULL)
+        {
+            Py_RETURN_NONE;
+        }
         // printf("unwrapping dyn with type ");
         // printf("%s...\n", kind2str(dyn->t->kind));
+        if (dyn->t->kind == HFUN)
+        {
+            // Function values carried in Dynamic are already closure objects,
+            // not boxed payloads in `dyn->v`.
+            return hlmod_cast_to_py(dyn->t, &dyn);
+        }
         return hlmod_cast_to_py(dyn->t, &dyn->v);
     }
     case HFUN:
     {
-        vclosure *cl = (vclosure *)ptr;
-        if (cl == NULL)
-        {
-            Py_RETURN_NONE;
-        }
-
-        if (g_hlcallable_class == NULL)
-        {
-            if (g_hlobj_module == NULL) {
-                g_hlobj_module = PyImport_ImportModule("hlobj");
-                if (g_hlobj_module == NULL) {
-                    PyErr_SetString(PyExc_ImportError, "Failed to import the 'hlobj' module. Is it in `mods/`?");
-                    return NULL;
-                }
-            }
-            g_hlcallable_class = PyObject_GetAttrString(g_hlobj_module, "HlCallable");
-            if (g_hlcallable_class == NULL) {
-                PyErr_SetString(PyExc_AttributeError, "Could not find 'HlCallable' class in 'hlobj' module.");
-                return NULL;
-            }
-        }
-        
-        PyObject *py_ptr = HlPtr_New(cl, HFUN);
-        if (py_ptr == NULL) {
-            return NULL;
-        }
-
-        PyObject *py_args = PyTuple_Pack(1, py_ptr);
-        Py_DECREF(py_ptr);
-        if (py_args == NULL) {
-            return NULL;
-        }
-
-        PyObject *py_instance = PyObject_CallObject(g_hlcallable_class, py_args);
-        Py_DECREF(py_args);
-
-        return py_instance;
+        // Function values are stored in pointer slots, so `ptr` points to a
+        // `vclosure*`, not the closure object itself.
+        vclosure *cl = *(vclosure **)ptr;
+        return hlmod_py_make_hlcallable(cl);
     }
     default:
 #       ifdef HLMOD_DEBUG
@@ -605,19 +659,22 @@ void *hlmod_cast_to_hl(PyObject *obj, hl_type *type)
             return NULL;
         }
 
+        void *inner_hl_val_ptr = hlmod_cast_to_hl(obj, inner_type);
+        if (inner_hl_val_ptr == NULL) {
+            return NULL;
+        }
+
+        if (hl_is_dynamic(inner_type)) {
+            return inner_hl_val_ptr;
+        }
+
         vdynamic *dyn_box = hl_alloc_dynamic(inner_type);
         if (dyn_box == NULL) {
             PyErr_SetString(PyExc_MemoryError, "Failed to allocate vdynamic for re-wrapping.");
             return NULL;
         }
 
-        void *inner_hl_val_ptr = hlmod_cast_to_hl(obj, inner_type);
-        if (inner_hl_val_ptr == NULL) {
-            return NULL;
-        }
-
         memcpy(&dyn_box->v, inner_hl_val_ptr, hl_type_size(inner_type));
-
         void **ret_ptr = (void **)hl_gc_alloc_raw(sizeof(void *));
         *ret_ptr = dyn_box;
         return ret_ptr;
@@ -1188,6 +1245,84 @@ PyObject *hlmod_py_call(PyObject *self, PyObject *args)
 
 #pragma region HL-side closures
 
+PyObject *hlmod_py_call_closure(PyObject *self, PyObject *args)
+{
+    PyObject *py_closure;
+    PyObject *py_args_tuple;
+
+    if (!PyArg_ParseTuple(args, "O!O!", &HlPtrType, &py_closure, &PyTuple_Type, &py_args_tuple))
+    {
+        PyErr_SetString(PyExc_TypeError, "Usage: call_closure(vclosure: HlPtr, args: tuple)");
+        return NULL;
+    }
+
+    HlPtr *hlptr = (HlPtr *)py_closure;
+    if (hlptr->ptr == NULL)
+    {
+        PyErr_SetString(PyExc_ValueError, "call_closure() received a null closure pointer.");
+        return NULL;
+    }
+
+    vclosure *cl = (vclosure *)hlptr->ptr;
+    if (cl->t == NULL || cl->t->kind != HFUN)
+    {
+        PyErr_SetString(PyExc_TypeError, "call_closure() expected an HlPtr pointing to a Haxe closure.");
+        return NULL;
+    }
+
+    hl_type_fun *fun_type = cl->t->fun;
+    int nargs = fun_type->nargs;
+
+    if (PyTuple_Size(py_args_tuple) != nargs)
+    {
+        PyErr_Format(PyExc_TypeError, "Haxe closure expected %d arguments, but got %zd", nargs, PyTuple_Size(py_args_tuple));
+        return NULL;
+    }
+
+    if (nargs > HL_MAX_ARGS)
+    {
+        PyErr_SetString(PyExc_ValueError, "Cannot call Haxe closure with more than HL_MAX_ARGS arguments.");
+        return NULL;
+    }
+
+    vdynamic *vargs[HL_MAX_ARGS];
+    for (int i = 0; i < nargs; i++)
+    {
+        PyObject *py_arg = PyTuple_GetItem(py_args_tuple, i);
+        hl_type *hl_arg_type = fun_type->args[i];
+
+        void *hl_val_ptr = hlmod_cast_to_hl(py_arg, hl_arg_type);
+        if (hl_val_ptr == NULL)
+        {
+            return NULL;
+        }
+
+        vargs[i] = hl_make_dyn(hl_val_ptr, hl_arg_type);
+    }
+
+    bool is_exc;
+    vdynamic *hl_result = hl_dyn_call_safe(cl, nargs > 0 ? vargs : NULL, nargs, &is_exc);
+
+    if (is_exc)
+    {
+        uchar *u_exc_str = hl_to_string(hl_result);
+        char *exc_str_utf8 = hl_to_utf8(u_exc_str);
+        PyErr_Format(PyExc_RuntimeError, "An exception occurred in the Haxe closure: %s", exc_str_utf8);
+        return NULL;
+    }
+
+    if (fun_type->ret->kind == HVOID)
+    {
+        Py_RETURN_NONE;
+    }
+
+    if (!hl_is_dynamic(fun_type->ret))
+    {
+        return hlmod_cast_to_py(fun_type->ret, &hl_result->v);
+    }
+
+    return hlmod_cast_to_py(fun_type->ret, &hl_result);
+}
 
 
 #pragma endregion
