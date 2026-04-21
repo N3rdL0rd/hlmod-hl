@@ -34,6 +34,7 @@ static cJSON *g_docs_root = NULL;
 const uchar *python_type_str(hl_type *t);
 static void mkdir_p(const char *path);
 static hl_function *find_function_by_findex(hl_code *code, int findex);
+static hl_function *find_function_by_obj_and_name(hl_code *code, hl_type_obj *obj, const uchar *name);
 static void sanitize_name_for_python(const char *input_name, char *buffer, size_t buffer_size);
 static void to_python_safe_name(const uchar *u_name, char *buffer, size_t buffer_size);
 static void print_method_stub_from_func(FILE *f, const char *name, hl_function *func, int findex, hl_code *code, const char *docstring);
@@ -44,6 +45,10 @@ static void type_set_free(hl_type_set *set);
 static void collect_type_dependencies(hl_type *t, hl_type_set *deps);
 static void get_python_path_for_type(hl_type *t, const char *base_dir, char *dir_path_out, size_t dir_path_size, char *class_name_out, size_t class_name_size);
 static void print_absolute_import_for_type(FILE *f, hl_type *importer_type, hl_type *dependency_type, const char *base_dir, bool is_indented);
+static void print_absolute_import_for_named_class(FILE *f, hl_type *dependency_type, const char *base_dir, const char *class_name, bool is_indented);
+static void write_class_stub(FILE *f, hl_code *code, hl_type *t, int type_index, const char *class_name, const char *parent_class_arg, int static_tindex);
+static void write_static_annotations(FILE *f, hl_code *code, hl_type *static_type, const char *static_class_name);
+static void write_static_method_map(FILE *f, hl_code *code, hl_type *static_type);
 static void _python_type_str_rec(hl_type *t, uchar *buf, int *pos, int buf_size);
 static void load_documentation();
 static void free_documentation();
@@ -212,6 +217,22 @@ static hl_function *find_function_by_findex(hl_code *code, int findex)
     {
         if (code->functions[i].findex == findex)
             return &code->functions[i];
+    }
+    return NULL;
+}
+
+static hl_function *find_function_by_obj_and_name(hl_code *code, hl_type_obj *obj, const uchar *name)
+{
+    if (!code || !obj || !name)
+        return NULL;
+
+    for (int i = 0; i < code->nfunctions; i++)
+    {
+        hl_function *func = &code->functions[i];
+        hl_type_obj *func_obj = fun_obj(func);
+        const uchar *func_name = fun_field_name(func);
+        if (func_obj == obj && func_name != NULL && ucmp(func_name, name) == 0)
+            return func;
     }
     return NULL;
 }
@@ -765,6 +786,77 @@ static void print_absolute_import_for_type(FILE *f, hl_type *importer_type, hl_t
     fprintf(f, "%sfrom %s import %s\n", indent, full_module_path, dep_class_name);
 }
 
+static void print_absolute_import_for_named_class(FILE *f, hl_type *dependency_type, const char *base_dir, const char *class_name, bool is_indented)
+{
+    if (!class_name || class_name[0] == '\0')
+    {
+        return;
+    }
+
+    char dep_module_dir[1024], dep_module_name[512];
+    get_python_path_for_type(dependency_type, base_dir, dep_module_dir, sizeof(dep_module_dir), dep_module_name, sizeof(dep_module_name));
+    if (dep_module_dir[0] == '\0' || dep_module_name[0] == '\0')
+    {
+        return;
+    }
+
+    const char *top_level_pkg = strrchr(base_dir, '/');
+    if (top_level_pkg)
+    {
+        top_level_pkg++;
+    }
+    else
+    {
+        const char *alt_top_level_pkg = strrchr(base_dir, '\\');
+        top_level_pkg = alt_top_level_pkg ? alt_top_level_pkg + 1 : base_dir;
+    }
+
+    const char *module_path_rel = dep_module_dir + strlen(base_dir);
+    if (*module_path_rel == '/' || *module_path_rel == '\\')
+    {
+        module_path_rel++;
+    }
+
+    char full_module_path[2048];
+    int pos = 0;
+    int remaining_size = sizeof(full_module_path);
+    int written_chars = snprintf(full_module_path + pos, remaining_size, "%s", top_level_pkg);
+    if (written_chars < 0 || written_chars >= remaining_size)
+    {
+        return;
+    }
+    pos += written_chars;
+    remaining_size -= written_chars;
+
+    if (strlen(module_path_rel) > 0)
+    {
+        written_chars = snprintf(full_module_path + pos, remaining_size, ".%s", module_path_rel);
+        if (written_chars < 0 || written_chars >= remaining_size)
+        {
+            return;
+        }
+        pos += written_chars;
+        remaining_size -= written_chars;
+    }
+
+    written_chars = snprintf(full_module_path + pos, remaining_size, ".%s", dep_module_name);
+    if (written_chars < 0 || written_chars >= remaining_size)
+    {
+        return;
+    }
+
+    for (char *p = full_module_path; *p; ++p)
+    {
+        if (*p == '/' || *p == '\\')
+        {
+            *p = '.';
+        }
+    }
+
+    const char *indent = is_indented ? "    " : "";
+    fprintf(f, "%sfrom %s import %s\n", indent, full_module_path, class_name);
+}
+
 static bool is_static_type(hl_type *t)
 {
     if (!t || (t->kind != HOBJ && t->kind != HSTRUCT))
@@ -850,6 +942,216 @@ static hl_type *find_instance_pair(hl_code *code, hl_type *static_type)
     return NULL;
 }
 
+static void write_class_stub(FILE *f, hl_code *code, hl_type *t, int type_index, const char *class_name, const char *parent_class_arg, int static_tindex)
+{
+    char type_name_full[1024];
+    get_full_type_name(t, type_name_full, sizeof(type_name_full));
+
+    fprintf(f, "\n@hltype(%i)\nclass %s(%s):\n", type_index, class_name, parent_class_arg);
+    const char *class_doc = get_doc_for_type(t);
+    print_docstring(f, class_doc, "    ");
+    if (class_doc && class_doc[0] != '\0')
+    {
+        fprintf(f, "\n");
+    }
+
+    if (static_tindex >= 0)
+    {
+        fprintf(f, "    _hl_static_tindex = %d\n\n", static_tindex);
+    }
+
+    fprintf(f, "    _hl_fields = {\n");
+
+    hl_type *inheritance_chain[HLMOD_MAX_INHERITANCE];
+    int chain_depth = 0;
+    hl_type *current_type = t;
+    while (current_type && chain_depth < HLMOD_MAX_INHERITANCE)
+    {
+        inheritance_chain[chain_depth++] = current_type;
+        current_type = current_type->obj ? current_type->obj->super : NULL;
+    }
+
+    int absolute_field_index = 0;
+    for (int depth = chain_depth - 1; depth >= 0; depth--)
+    {
+        hl_type *type_in_chain = inheritance_chain[depth];
+        if (type_in_chain->obj)
+        {
+            for (int j = 0; j < type_in_chain->obj->nfields; j++)
+            {
+                hl_obj_field *field = &type_in_chain->obj->fields[j];
+                char safe_name[512];
+                to_python_safe_name(field->name, safe_name, sizeof(safe_name));
+                if (safe_name[0] != '\0')
+                {
+                    fprintf(f, "        \"%s\": %d,\n", safe_name, absolute_field_index);
+                }
+                absolute_field_index++;
+            }
+        }
+    }
+    fprintf(f, "    }\n\n");
+
+    int *binding_map = NULL;
+    if (t->obj->nfields > 0)
+    {
+        binding_map = calloc(t->obj->nfields, sizeof(int));
+        for (int j = 0; j < t->obj->nfields; j++)
+            binding_map[j] = -1;
+        for (int j = 0; j < t->obj->nbindings; j++)
+        {
+            int ffield = t->obj->bindings[j * 2 + 1];
+            int findex = t->obj->bindings[j * 2];
+            if (ffield >= 0 && ffield < t->obj->nfields)
+                binding_map[ffield] = findex;
+        }
+    }
+
+    bool has_content = false;
+    if (t->obj->nfields > 0)
+    {
+        fprintf(f, "    # --- Fields ---\n");
+        for (int j = 0; j < t->obj->nfields; j++)
+        {
+            hl_obj_field *field = &t->obj->fields[j];
+            char safe_field_name[512];
+            to_python_safe_name(field->name, safe_field_name, sizeof(safe_field_name));
+            if (safe_field_name[0] == '\0')
+            {
+                continue;
+            }
+
+            const char *field_doc = get_doc_for_member(type_name_full, "fields", safe_field_name);
+
+            if (binding_map && binding_map[j] != -1)
+            {
+                hl_function *func = find_function_by_findex(code, binding_map[j]);
+                if (func)
+                    print_method_stub_from_func(f, safe_field_name, func, binding_map[j], code, field_doc);
+            }
+            else if (field->t->kind == HFUN || field->t->kind == HMETHOD)
+            {
+                fprintf(f, "    %s: %s\n", safe_field_name, (char *)hl_to_utf8(python_type_str(field->t)));
+                print_docstring(f, field_doc, "    ");
+            }
+            else
+            {
+                fprintf(f, "    %s: %s\n", safe_field_name, (char *)hl_to_utf8(python_type_str(field->t)));
+                print_docstring(f, field_doc, "    ");
+            }
+            fprintf(f, "\n");
+            has_content = true;
+        }
+    }
+    if (binding_map)
+        free(binding_map);
+
+    if (t->obj->nproto > 0)
+    {
+        fprintf(f, "    # --- Methods ---\n");
+        for (int j = 0; j < t->obj->nproto; j++)
+        {
+            hl_obj_proto *proto = &t->obj->proto[j];
+            char safe_proto_name[512];
+            to_python_safe_name(proto->name, safe_proto_name, sizeof(safe_proto_name));
+            const char *method_doc = get_doc_for_member(type_name_full, "functions", safe_proto_name);
+            hl_function *func = find_function_by_findex(code, proto->findex);
+            if (func)
+                print_method_stub_from_func(f, safe_proto_name, func, proto->findex, code, method_doc);
+            fprintf(f, "\n");
+            has_content = true;
+        }
+    }
+
+    if (!has_content)
+        fprintf(f, "    pass\n");
+}
+
+static void write_static_annotations(FILE *f, hl_code *code, hl_type *static_type, const char *static_class_name)
+{
+    if (!static_type || !static_type->obj)
+    {
+        return;
+    }
+
+    fprintf(f, "    # --- Static ---\n");
+    fprintf(f, "    STATIC: \"%s\"\n", static_class_name);
+
+    for (int j = 0; j < static_type->obj->nfields; j++)
+    {
+        hl_obj_field *field = &static_type->obj->fields[j];
+        char safe_field_name[512];
+        to_python_safe_name(field->name, safe_field_name, sizeof(safe_field_name));
+        if (safe_field_name[0] == '\0')
+        {
+            continue;
+        }
+        fprintf(f, "    %s: %s\n", safe_field_name, (char *)hl_to_utf8(python_type_str(field->t)));
+    }
+
+    for (int j = 0; j < static_type->obj->nproto; j++)
+    {
+        hl_obj_proto *proto = &static_type->obj->proto[j];
+        char safe_proto_name[512];
+        to_python_safe_name(proto->name, safe_proto_name, sizeof(safe_proto_name));
+        if (safe_proto_name[0] == '\0')
+        {
+            continue;
+        }
+        hl_function *func = find_function_by_findex(code, proto->findex);
+        if (func && func->type)
+        {
+            fprintf(f, "    %s: %s\n", safe_proto_name, (char *)hl_to_utf8(python_type_str(func->type)));
+        }
+    }
+    fprintf(f, "\n");
+}
+
+static void write_static_method_map(FILE *f, hl_code *code, hl_type *static_type)
+{
+    fprintf(f, "    _hl_static_methods = {\n");
+    if (!static_type || !static_type->obj)
+    {
+        fprintf(f, "    }\n\n");
+        return;
+    }
+
+    const char *type_name_utf8 = (const char *)hl_to_utf8(static_type->obj->name);
+
+    for (int j = 0; j < static_type->obj->nfields; j++)
+    {
+        hl_obj_field *field = &static_type->obj->fields[j];
+        if (field->t->kind != HFUN && field->t->kind != HMETHOD)
+        {
+            continue;
+        }
+
+        char safe_field_name[512];
+        char raw_field_name[512];
+        to_python_safe_name(field->name, safe_field_name, sizeof(safe_field_name));
+        snprintf(raw_field_name, sizeof(raw_field_name), "%s", (const char *)hl_to_utf8(field->name));
+        if (safe_field_name[0] != '\0')
+        {
+            fprintf(f, "        \"%s\": \"%s.%s\",\n", safe_field_name, type_name_utf8, raw_field_name);
+        }
+    }
+
+    for (int j = 0; j < static_type->obj->nproto; j++)
+    {
+        hl_obj_proto *proto = &static_type->obj->proto[j];
+        char safe_proto_name[512];
+        char raw_proto_name[512];
+        to_python_safe_name(proto->name, safe_proto_name, sizeof(safe_proto_name));
+        snprintf(raw_proto_name, sizeof(raw_proto_name), "%s", (const char *)hl_to_utf8(proto->name));
+        if (safe_proto_name[0] != '\0')
+        {
+            fprintf(f, "        \"%s\": \"%s.%s\",\n", safe_proto_name, type_name_utf8, raw_proto_name);
+        }
+    }
+
+    fprintf(f, "    }\n\n");
+}
+
 void hlmod_do_generate_stubs(hl_code *code)
 {
     const char *base_dir = "./mods/stubs";
@@ -885,7 +1187,7 @@ void hlmod_do_generate_stubs(hl_code *code)
         if (t->kind == HOBJ && t->obj && t->obj->name && ucmp(t->obj->name, USTR("String")) == 0)
             continue;
 
-        hl_type *static_pair_for_comment = NULL;
+        hl_type *static_pair = NULL;
 
         if (is_static_type(t))
         {
@@ -904,12 +1206,12 @@ void hlmod_do_generate_stubs(hl_code *code)
         }
         else
         {
-            static_pair_for_comment = find_static_pair(code, t);
-            if (static_pair_for_comment)
+            static_pair = find_static_pair(code, t);
+            if (static_pair)
             {
                 printf("[hlmod] Paired instance type '%s' with static type '%s'\n",
                        (char *)hl_to_utf8(t->obj->name),
-                       (char *)hl_to_utf8(static_pair_for_comment->obj->name));
+                       (char *)hl_to_utf8(static_pair->obj->name));
             }
         }
 
@@ -917,9 +1219,6 @@ void hlmod_do_generate_stubs(hl_code *code)
         get_python_path_for_type(t, base_dir, dir_path, sizeof(dir_path), class_name_only, sizeof(class_name_only));
         if (class_name_only[0] == '\0')
             continue;
-
-        char type_name_full[1024];
-        get_full_type_name(t, type_name_full, sizeof(type_name_full));
 
         char file_path[1024];
         snprintf(file_path, sizeof(file_path), "%s/%s.py", dir_path, class_name_only);
@@ -951,7 +1250,6 @@ void hlmod_do_generate_stubs(hl_code *code)
         hl_type_set deps;
         type_set_init(&deps);
 
-        // TODO: Add proper HENUM support
         if (t->obj->super)
         {
             print_absolute_import_for_type(f, t, t->obj->super, base_dir, false);
@@ -964,6 +1262,26 @@ void hlmod_do_generate_stubs(hl_code *code)
             if (func)
                 collect_type_dependencies(func->type, &deps);
         }
+        if (static_pair)
+        {
+            hl_type *static_super = t->obj->super ? find_static_pair(code, t->obj->super) : NULL;
+            if (static_super)
+            {
+                char static_super_class_name[512];
+                char super_class_name[512];
+                get_python_path_for_type(t->obj->super, base_dir, NULL, 0, super_class_name, sizeof(super_class_name));
+                snprintf(static_super_class_name, sizeof(static_super_class_name), "_%sStatic", super_class_name);
+                print_absolute_import_for_named_class(f, t->obj->super, base_dir, static_super_class_name, false);
+            }
+            for (int j = 0; j < static_pair->obj->nfields; j++)
+                collect_type_dependencies(static_pair->obj->fields[j].t, &deps);
+            for (int j = 0; j < static_pair->obj->nproto; j++)
+            {
+                hl_function *func = find_function_by_findex(code, static_pair->obj->proto[j].findex);
+                if (func)
+                    collect_type_dependencies(func->type, &deps);
+            }
+        }
 
         bool has_type_deps = false;
         for (int j = 0; j < deps.count; j++)
@@ -971,6 +1289,8 @@ void hlmod_do_generate_stubs(hl_code *code)
             if (deps.items[j] == t)
                 continue;
             if ((t->kind == HOBJ || t->kind == HSTRUCT) && deps.items[j] == t->obj->super)
+                continue;
+            if (static_pair && deps.items[j] == static_pair)
                 continue;
             has_type_deps = true;
             break;
@@ -985,130 +1305,48 @@ void hlmod_do_generate_stubs(hl_code *code)
                     continue;
                 if ((t->kind == HOBJ || t->kind == HSTRUCT) && deps.items[j] == t->obj->super)
                     continue;
+                if (static_pair && deps.items[j] == static_pair)
+                    continue;
                 print_absolute_import_for_type(f, t, deps.items[j], base_dir, true);
             }
         }
 
         type_set_free(&deps);
 
-        // TODO: Add proper HENUM support
         char parent_class_arg[512] = "HlObject";
         if (t->obj->super)
         {
             get_python_path_for_type(t->obj->super, base_dir, NULL, 0, parent_class_arg, sizeof(parent_class_arg));
         }
-        fprintf(f, "\n@hltype(%i)\nclass %s(%s):\n", i, class_name_only, parent_class_arg);
-        const char *class_doc = get_doc_for_type(t);
-        print_docstring(f, class_doc, "    ");
-        if (class_doc && class_doc[0] != '\0')
+        if (static_pair)
         {
+            char static_class_name[512];
+            snprintf(static_class_name, sizeof(static_class_name), "_%sStatic", class_name_only);
+
+            char static_parent_class_arg[512] = "HlObject";
+            if (t->obj->super)
+            {
+                hl_type *static_super = find_static_pair(code, t->obj->super);
+                if (static_super)
+                {
+                    char super_class_name[512];
+                    get_python_path_for_type(t->obj->super, base_dir, NULL, 0, super_class_name, sizeof(super_class_name));
+                    snprintf(static_parent_class_arg, sizeof(static_parent_class_arg), "_%sStatic", super_class_name);
+                }
+            }
+
+            write_class_stub(f, code, static_pair, (int)(static_pair - code->types), static_class_name, static_parent_class_arg, -1);
             fprintf(f, "\n");
         }
 
-        fprintf(f, "    _hl_fields = {\n");
-
-        hl_type *inheritance_chain[HLMOD_MAX_INHERITANCE];
-        int chain_depth = 0;
-        hl_type *current_type = t;
-        while (current_type && chain_depth < HLMOD_MAX_INHERITANCE)
+        write_class_stub(f, code, t, i, class_name_only, parent_class_arg, static_pair ? (int)(static_pair - code->types) : -1);
+        if (static_pair)
         {
-            inheritance_chain[chain_depth++] = current_type;
-            current_type = current_type->obj ? current_type->obj->super : NULL;
+            char static_class_name[512];
+            snprintf(static_class_name, sizeof(static_class_name), "_%sStatic", class_name_only);
+            write_static_method_map(f, code, static_pair);
+            write_static_annotations(f, code, static_pair, static_class_name);
         }
-
-        int absolute_field_index = 0;
-        for (int depth = chain_depth - 1; depth >= 0; depth--)
-        {
-            hl_type *type_in_chain = inheritance_chain[depth];
-            if (type_in_chain->obj)
-            {
-                for (int j = 0; j < type_in_chain->obj->nfields; j++)
-                {
-                    hl_obj_field *field = &type_in_chain->obj->fields[j];
-                    char safe_name[512];
-                    to_python_safe_name(field->name, safe_name, sizeof(safe_name));
-                    if (safe_name[0] != '\0')
-                    {
-                        fprintf(f, "        \"%s\": %d,\n", safe_name, absolute_field_index);
-                    }
-                    absolute_field_index++;
-                }
-            }
-        }
-        fprintf(f, "    }\n\n");
-
-        int *binding_map = NULL;
-        if (t->obj->nfields > 0)
-        {
-            binding_map = calloc(t->obj->nfields, sizeof(int));
-            for (int j = 0; j < t->obj->nfields; j++)
-                binding_map[j] = -1;
-            for (int j = 0; j < t->obj->nbindings; j++)
-            {
-                int ffield = t->obj->bindings[j * 2 + 1];
-                int findex = t->obj->bindings[j * 2];
-                if (ffield >= 0 && ffield < t->obj->nfields)
-                    binding_map[ffield] = findex;
-            }
-        }
-
-        bool has_content = false;
-        if (t->obj->nfields > 0)
-        {
-            fprintf(f, "    # --- Fields ---\n");
-            for (int j = 0; j < t->obj->nfields; j++)
-            {
-                hl_obj_field *field = &t->obj->fields[j];
-                char safe_field_name[512];
-                to_python_safe_name(field->name, safe_field_name, sizeof(safe_field_name));
-                if (safe_field_name[0] == '\0')
-                {
-                    continue;
-                }
-
-                const char *field_doc = get_doc_for_member(type_name_full, "fields", safe_field_name);
-
-                if (binding_map && binding_map[j] != -1)
-                {
-                    hl_function *func = find_function_by_findex(code, binding_map[j]);
-                    if (func)
-                        print_method_stub_from_func(f, safe_field_name, func, binding_map[j], code, field_doc);
-                }
-                else if (field->t->kind == HFUN || field->t->kind == HMETHOD)
-                {
-                    print_method_stub_from_type(f, safe_field_name, field->t->fun, field_doc);
-                }
-                else
-                {
-                    fprintf(f, "    %s: %s\n", safe_field_name, (char *)hl_to_utf8(python_type_str(field->t)));
-                    print_docstring(f, field_doc, "    ");
-                }
-                fprintf(f, "\n");
-                has_content = true;
-            }
-        }
-        if (binding_map)
-            free(binding_map);
-
-        if (t->obj->nproto > 0)
-        {
-            fprintf(f, "    # --- Methods ---\n");
-            for (int j = 0; j < t->obj->nproto; j++)
-            {
-                hl_obj_proto *proto = &t->obj->proto[j];
-                char safe_proto_name[512];
-                to_python_safe_name(proto->name, safe_proto_name, sizeof(safe_proto_name));
-                const char *method_doc = get_doc_for_member(type_name_full, "functions", safe_proto_name);
-                hl_function *func = find_function_by_findex(code, proto->findex);
-                if (func)
-                    print_method_stub_from_func(f, safe_proto_name, func, proto->findex, code, method_doc);
-                fprintf(f, "\n");
-                has_content = true;
-            }
-        }
-
-        if (!has_content)
-            fprintf(f, "    pass\n");
         fclose(f);
     }
 

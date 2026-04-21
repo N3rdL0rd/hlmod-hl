@@ -1099,12 +1099,17 @@ PyObject *hlmod_py_get_global(PyObject* self, PyObject* args)
     }
 
     hl_type *target_type = &g_module->code->types[type_index];
+    if ((target_type->kind == HOBJ || target_type->kind == HSTRUCT) &&
+        target_type->obj != NULL && target_type->obj->global_value != NULL)
+    {
+        return hlmod_cast_to_py(target_type, target_type->obj->global_value);
+    }
 
     for (int i = 0; i < g_module->code->nglobals; i++)
     {
         hl_type *current_global_type = g_module->code->globals[i];
 
-        if (current_global_type == target_type)
+        if (current_global_type == target_type || hl_same_type(current_global_type, target_type))
         {
             // printf("Found global g@%i\n", i);
             void *addr = g_module->globals_data + g_module->globals_indexes[i];
