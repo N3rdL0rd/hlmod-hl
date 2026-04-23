@@ -254,6 +254,8 @@ static PyMethodDef HlmodMethods[] = {
     {"call_closure", hlmod_py_call_closure, METH_VARARGS, "Calls an HL closure by pointer."},
     {"dump_stack", hlmod_py_dump_stack, METH_NOARGS, "Dumps the current HL stack."},
     {"findex_for_name", hlmod_py_findex_for_name, METH_VARARGS, "Gets the findex for a specific function by its name"},
+    {"profile_start", hlmod_py_profile_start, METH_VARARGS, "Starts the HL sampling profiler at the given samples/sec (default 1000)."},
+    {"profile_end", hlmod_py_profile_end, METH_NOARGS, "Stops the profiler and writes hlprofile.dump."},
     {NULL, NULL, 0, NULL}
 };
 static struct PyModuleDef hlmod_module_def = {

@@ -1131,6 +1131,32 @@ PyObject *hlmod_py_dump_stack(PyObject *self, PyObject *args)
     Py_RETURN_NONE;
 }
 
+PyObject *hlmod_py_profile_start(PyObject *self, PyObject *args)
+{
+    int sample_count = 1000;
+    if (!PyArg_ParseTuple(args, "|i", &sample_count))
+        return NULL;
+    if (sample_count <= 0) {
+        PyErr_SetString(PyExc_ValueError, "sample_count must be positive");
+        return NULL;
+    }
+    Py_BEGIN_ALLOW_THREADS
+    hl_profile_setup(sample_count);
+    Py_END_ALLOW_THREADS
+    Py_RETURN_NONE;
+}
+
+PyObject *hlmod_py_profile_end(PyObject *self, PyObject *args)
+{
+    const char *path = NULL;
+    if (!PyArg_ParseTuple(args, "|z", &path))
+        return NULL;
+    Py_BEGIN_ALLOW_THREADS
+    hl_profile_end();
+    Py_END_ALLOW_THREADS
+    Py_RETURN_NONE;
+}
+
 PyObject *hlmod_py_findex_for_name(PyObject *self, PyObject *args)
 {
     const char *name;
