@@ -33,6 +33,10 @@ extern PyTypeObject HlHookType;
 PyObject* hlmod_py_register_hlobj(PyObject *self, PyObject *args);
 PyObject* hlmod_py_get_obj_field(PyObject *self, PyObject *args);
 PyObject* hlmod_py_set_obj_field(PyObject *self, PyObject *args);
+PyObject* hlmod_py_get_virtual_field(PyObject *self, PyObject *args);
+PyObject* hlmod_py_set_virtual_field(PyObject *self, PyObject *args);
+PyObject* hlmod_py_get_virtual_field_count(PyObject *self, PyObject *args);
+PyObject* hlmod_py_get_virtual_field_name(PyObject *self, PyObject *args);
 
 PyObject* hlmod_py_set_fixed_prng(PyObject *self, PyObject *args);
 PyObject* hlmod_py_get_fixed_prng(PyObject *self, PyObject *args);

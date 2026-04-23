@@ -62,6 +62,7 @@ static int g_hlobjs_l = 0;
 static PyObject *g_hlobj_module = NULL;
 static PyObject *g_hlobj_base_class = NULL;
 static PyObject *g_hlcallable_class = NULL;
+static PyObject *g_hlvirtual_class = NULL;
 
 #pragma region HlPtr
 static PyObject *HlPtr_New(void *ptr, int kind);
@@ -192,6 +193,65 @@ static PyObject *hlmod_py_make_hlcallable(vclosure *cl)
     }
 
     PyObject *py_instance = PyObject_CallObject(g_hlcallable_class, py_args);
+    Py_DECREF(py_args);
+    return py_instance;
+}
+
+static PyObject *hlmod_py_make_hlvirtual(void *ptr, hl_type *type)
+{
+    if (ptr == NULL)
+    {
+        Py_RETURN_NONE;
+    }
+
+    if (g_hlobj_module == NULL) {
+        g_hlobj_module = PyImport_ImportModule("hlobj");
+        if (g_hlobj_module == NULL) {
+            PyErr_SetString(PyExc_ImportError, "Failed to import the 'hlobj' module. Is it in `mods/`?");
+            return NULL;
+        }
+    }
+
+    if (g_hlvirtual_class == NULL)
+    {
+        g_hlvirtual_class = PyObject_GetAttrString(g_hlobj_module, "HlVirtual");
+        if (g_hlvirtual_class == NULL) {
+            PyErr_SetString(PyExc_AttributeError, "Could not find 'HlVirtual' class in 'hlobj' module.");
+            return NULL;
+        }
+    }
+
+    if (g_code == NULL)
+    {
+        PyErr_SetString(PyExc_RuntimeError, "hlmod code metadata is unavailable.");
+        return NULL;
+    }
+
+    int type_idx = (int)(type - g_code->types);
+    PyObject *py_class = NULL;
+    if (type_idx >= 0 && type_idx < g_hlobjs_l)
+    {
+        py_class = g_hlobjs[type_idx];
+    }
+    if (py_class == NULL)
+    {
+        py_class = g_hlvirtual_class;
+    }
+
+    PyObject *py_arg_ptr = HlPtr_New(ptr, HVIRTUAL);
+    if (py_arg_ptr == NULL)
+    {
+        return NULL;
+    }
+
+    PyObject *py_args = PyTuple_Pack(1, py_arg_ptr);
+    Py_DECREF(py_arg_ptr);
+    if (py_args == NULL)
+    {
+        return NULL;
+    }
+
+    PyObject *py_instance = PyObject_CallObject(py_class, py_args);
     Py_DECREF(py_args);
     return py_instance;
 }
@@ -499,6 +559,15 @@ PyObject *hlmod_cast_to_py(hl_type *type, void *ptr)
             }
         }
         break;
+    }
+    case HVIRTUAL:
+    {
+        void *obj_ptr = *(void **)ptr;
+        if (obj_ptr == NULL)
+        {
+            Py_RETURN_NONE;
+        }
+        return hlmod_py_make_hlvirtual(obj_ptr, type);
     }
     case HNULL:
     {
@@ -1014,6 +1083,179 @@ PyObject *hlmod_py_set_obj_field(PyObject *self, PyObject *args)
     }
 
     Py_RETURN_NONE;
+}
+
+PyObject *hlmod_py_get_virtual_field(PyObject *self, PyObject *args)
+{
+    PyObject *hlvirt_ptr;
+    int field_index;
+
+    if (!PyArg_ParseTuple(args, "O!i", &HlPtrType, &hlvirt_ptr, &field_index))
+    {
+        return NULL;
+    }
+
+    vvirtual *virt = (vvirtual *)((HlPtr *)hlvirt_ptr)->ptr;
+    if (virt == NULL)
+    {
+        PyErr_SetString(PyExc_ValueError, "Cannot get field from a null HlPtr.");
+        return NULL;
+    }
+    if (virt->t == NULL || virt->t->kind != HVIRTUAL || virt->t->virt == NULL)
+    {
+        PyErr_SetString(PyExc_TypeError, "HlPtr does not point to a valid Haxe virtual object.");
+        return NULL;
+    }
+    if (field_index < 0 || field_index >= virt->t->virt->nfields)
+    {
+        PyErr_Format(PyExc_IndexError, "Virtual field index %d is out of bounds (0 to %d).",
+                     field_index, virt->t->virt->nfields - 1);
+        return NULL;
+    }
+
+    hl_obj_field *field_info = &virt->t->virt->fields[field_index];
+    if (field_info->t->kind == HFUN || field_info->t->kind == HMETHOD)
+    {
+        PyErr_SetString(PyExc_TypeError, "Virtual function fields are not exposed to Python yet.");
+        return NULL;
+    }
+
+    void *field_ptr = hl_vfields(virt)[field_index];
+    if (field_ptr == NULL)
+    {
+        Py_RETURN_NONE;
+    }
+
+    return hlmod_cast_to_py(field_info->t, field_ptr);
+}
+
+PyObject *hlmod_py_set_virtual_field(PyObject *self, PyObject *args)
+{
+    PyObject *hlvirt_ptr;
+    int field_index;
+    PyObject *py_value;
+
+    if (!PyArg_ParseTuple(args, "O!iO", &HlPtrType, &hlvirt_ptr, &field_index, &py_value))
+    {
+        return NULL;
+    }
+
+    vvirtual *virt = (vvirtual *)((HlPtr *)hlvirt_ptr)->ptr;
+    if (virt == NULL)
+    {
+        PyErr_SetString(PyExc_ValueError, "Cannot set field on a null HlPtr.");
+        return NULL;
+    }
+    if (virt->t == NULL || virt->t->kind != HVIRTUAL || virt->t->virt == NULL)
+    {
+        PyErr_SetString(PyExc_TypeError, "HlPtr does not point to a valid Haxe virtual object.");
+        return NULL;
+    }
+    if (field_index < 0 || field_index >= virt->t->virt->nfields)
+    {
+        PyErr_Format(PyExc_IndexError, "Virtual field index %d is out of bounds (0 to %d).",
+                     field_index, virt->t->virt->nfields - 1);
+        return NULL;
+    }
+
+    hl_obj_field *field_info = &virt->t->virt->fields[field_index];
+    if (field_info->t->kind == HFUN || field_info->t->kind == HMETHOD)
+    {
+        PyErr_SetString(PyExc_TypeError, "Virtual function fields are not writable from Python.");
+        return NULL;
+    }
+
+    void *field_ptr = hl_vfields(virt)[field_index];
+    if (field_ptr == NULL)
+    {
+        PyErr_SetString(PyExc_ValueError, "Virtual field is currently unavailable on this value.");
+        return NULL;
+    }
+
+    void *hl_value_ptr = hlmod_cast_to_hl(py_value, field_info->t);
+    if (hl_value_ptr == NULL && PyErr_Occurred())
+    {
+        return NULL;
+    }
+
+    switch (field_info->t->kind)
+    {
+    case HI32:
+    case HUI16:
+    case HUI8:
+    case HBOOL:
+        *(int *)field_ptr = hl_value_ptr ? *(int *)hl_value_ptr : 0;
+        break;
+    case HI64:
+        *(int64 *)field_ptr = hl_value_ptr ? *(int64 *)hl_value_ptr : 0;
+        break;
+    case HF64:
+        *(double *)field_ptr = hl_value_ptr ? *(double *)hl_value_ptr : 0.0;
+        break;
+    case HF32:
+        *(float *)field_ptr = hl_value_ptr ? *(float *)hl_value_ptr : 0.0f;
+        break;
+    default:
+        *(void **)field_ptr = hl_value_ptr ? *(void **)hl_value_ptr : NULL;
+        break;
+    }
+
+    Py_RETURN_NONE;
+}
+
+PyObject *hlmod_py_get_virtual_field_count(PyObject *self, PyObject *args)
+{
+    PyObject *hlvirt_ptr;
+
+    if (!PyArg_ParseTuple(args, "O!", &HlPtrType, &hlvirt_ptr))
+    {
+        return NULL;
+    }
+
+    vvirtual *virt = (vvirtual *)((HlPtr *)hlvirt_ptr)->ptr;
+    if (virt == NULL)
+    {
+        PyErr_SetString(PyExc_ValueError, "Cannot inspect a null HlPtr.");
+        return NULL;
+    }
+    if (virt->t == NULL || virt->t->kind != HVIRTUAL || virt->t->virt == NULL)
+    {
+        PyErr_SetString(PyExc_TypeError, "HlPtr does not point to a valid Haxe virtual object.");
+        return NULL;
+    }
+
+    return PyLong_FromLong(virt->t->virt->nfields);
+}
+
+PyObject *hlmod_py_get_virtual_field_name(PyObject *self, PyObject *args)
+{
+    PyObject *hlvirt_ptr;
+    int field_index;
+
+    if (!PyArg_ParseTuple(args, "O!i", &HlPtrType, &hlvirt_ptr, &field_index))
+    {
+        return NULL;
+    }
+
+    vvirtual *virt = (vvirtual *)((HlPtr *)hlvirt_ptr)->ptr;
+    if (virt == NULL)
+    {
+        PyErr_SetString(PyExc_ValueError, "Cannot inspect a null HlPtr.");
+        return NULL;
+    }
+    if (virt->t == NULL || virt->t->kind != HVIRTUAL || virt->t->virt == NULL)
+    {
+        PyErr_SetString(PyExc_TypeError, "HlPtr does not point to a valid Haxe virtual object.");
+        return NULL;
+    }
+    if (field_index < 0 || field_index >= virt->t->virt->nfields)
+    {
+        PyErr_Format(PyExc_IndexError, "Virtual field index %d is out of bounds (0 to %d).",
+                     field_index, virt->t->virt->nfields - 1);
+        return NULL;
+    }
+
+    return PyUnicode_FromString((const char *)hl_to_utf8(virt->t->virt->fields[field_index].name));
 }
 #pragma endregion
 

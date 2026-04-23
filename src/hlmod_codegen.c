@@ -47,6 +47,7 @@ static void get_python_path_for_type(hl_type *t, const char *base_dir, char *dir
 static void print_absolute_import_for_type(FILE *f, hl_type *importer_type, hl_type *dependency_type, const char *base_dir, bool is_indented);
 static void print_absolute_import_for_named_class(FILE *f, hl_type *dependency_type, const char *base_dir, const char *class_name, bool is_indented);
 static void write_class_stub(FILE *f, hl_code *code, hl_type *t, int type_index, const char *class_name, const char *parent_class_arg, int static_tindex);
+static void write_virtual_stub(FILE *f, hl_type *t, int type_index, const char *class_name);
 static void write_static_annotations(FILE *f, hl_code *code, hl_type *static_type, const char *static_class_name);
 static void write_static_method_map(FILE *f, hl_code *code, hl_type *static_type);
 static void _python_type_str_rec(hl_type *t, uchar *buf, int *pos, int buf_size);
@@ -56,6 +57,8 @@ static const char *get_doc_for_type(hl_type *t);
 static const char *get_doc_for_member(const char *type_name_full, const char *member_type, const char *member_name);
 static void print_docstring(FILE *f, const char *doc, const char *indent);
 static bool is_python_keyword(const char *s);
+static int get_type_index(hl_type *t);
+static void get_virtual_stub_name(hl_type *t, char *buffer, size_t buffer_size);
 
 static const char *PYTHON_KEYWORDS[] = {
     "False", "None", "True", "and", "as", "assert", "async", "await",
@@ -76,6 +79,28 @@ static bool is_python_keyword(const char *s)
         }
     }
     return false;
+}
+
+static int get_type_index(hl_type *t)
+{
+    if (!g_code || !t)
+    {
+        return -1;
+    }
+    return (int)(t - g_code->types);
+}
+
+static void get_virtual_stub_name(hl_type *t, char *buffer, size_t buffer_size)
+{
+    int type_index = get_type_index(t);
+    if (type_index >= 0)
+    {
+        snprintf(buffer, buffer_size, "VirtualT%d", type_index);
+    }
+    else
+    {
+        snprintf(buffer, buffer_size, "VirtualTUnknown");
+    }
 }
 
 static void _str_append(uchar *buf, int *pos, int buf_size, const uchar *str)
@@ -130,6 +155,17 @@ static void _python_type_str_rec(hl_type *t, uchar *buf, int *pos, int buf_size)
     case HDYNOBJ:
         _str_append(buf, pos, buf_size, USTR("dict[str, Any]"));
         break;
+    case HVIRTUAL:
+    {
+        char virtual_name[128];
+        uchar u_virtual_name[128];
+        get_virtual_stub_name(t, virtual_name, sizeof(virtual_name));
+        _str_append(buf, pos, buf_size, USTR("\""));
+        hl_from_utf8(u_virtual_name, sizeof(u_virtual_name) / sizeof(uchar), virtual_name);
+        _str_append(buf, pos, buf_size, u_virtual_name);
+        _str_append(buf, pos, buf_size, USTR("\""));
+        break;
+    }
     case HARRAY:
         _str_append(buf, pos, buf_size, USTR("list["));
         _python_type_str_rec(t->tparam, buf, pos, buf_size);
@@ -591,7 +627,7 @@ static void type_set_free(hl_type_set *set)
 
 static void type_set_add(hl_type_set *set, hl_type *t)
 {
-    if (!t || (t->kind != HOBJ && t->kind != HSTRUCT)) // TODO: Add proper HENUM support
+    if (!t || (t->kind != HOBJ && t->kind != HSTRUCT && t->kind != HVIRTUAL)) // TODO: Add proper HENUM support
         return;
     for (int i = 0; i < set->count; i++)
     {
@@ -622,6 +658,14 @@ static void collect_type_dependencies(hl_type *t, hl_type_set *deps)
     case HSTRUCT:
         type_set_add(deps, t);
         break;
+    case HVIRTUAL:
+        type_set_add(deps, t);
+        if (t->virt)
+        {
+            for (int i = 0; i < t->virt->nfields; i++)
+                collect_type_dependencies(t->virt->fields[i].t, deps);
+        }
+        break;
     case HARRAY:
     case HNULL:
     case HREF:
@@ -647,6 +691,20 @@ static void get_python_path_for_type(hl_type *t, const char *base_dir, char *dir
     if ((t->kind == HOBJ || t->kind == HSTRUCT) && t->obj)
     {
         type_name = t->obj->name;
+    }
+    else if (t->kind == HVIRTUAL)
+    {
+        char virtual_name[128];
+        get_virtual_stub_name(t, virtual_name, sizeof(virtual_name));
+        if (class_name_out && class_name_size > 0)
+        {
+            snprintf(class_name_out, class_name_size, "%s", virtual_name);
+        }
+        if (dir_path_out && dir_path_size > 0)
+        {
+            snprintf(dir_path_out, dir_path_size, "%s/hl/virtuals", base_dir);
+        }
+        return;
     }
     else
     {
@@ -1067,6 +1125,39 @@ static void write_class_stub(FILE *f, hl_code *code, hl_type *t, int type_index,
         fprintf(f, "    pass\n");
 }
 
+static void write_virtual_stub(FILE *f, hl_type *t, int type_index, const char *class_name)
+{
+    fprintf(f, "\n@hltype(%i)\nclass %s(HlVirtual):\n", type_index, class_name);
+    fprintf(f, "    _hl_fields = {\n");
+    for (int i = 0; i < t->virt->nfields; i++)
+    {
+        char safe_name[512];
+        to_python_safe_name(t->virt->fields[i].name, safe_name, sizeof(safe_name));
+        if (safe_name[0] != '\0')
+        {
+            fprintf(f, "        \"%s\": %d,\n", safe_name, i);
+        }
+    }
+    fprintf(f, "    }\n\n");
+
+    if (t->virt->nfields == 0)
+    {
+        fprintf(f, "    pass\n");
+        return;
+    }
+
+    fprintf(f, "    # --- Fields ---\n");
+    for (int i = 0; i < t->virt->nfields; i++)
+    {
+        char safe_name[512];
+        to_python_safe_name(t->virt->fields[i].name, safe_name, sizeof(safe_name));
+        if (safe_name[0] != '\0')
+        {
+            fprintf(f, "    %s: %s\n\n", safe_name, (char *)hl_to_utf8(python_type_str(t->virt->fields[i].t)));
+        }
+    }
+}
+
 static void write_static_annotations(FILE *f, hl_code *code, hl_type *static_type, const char *static_class_name)
 {
     if (!static_type || !static_type->obj)
@@ -1165,7 +1256,7 @@ void hlmod_do_generate_stubs(hl_code *code)
     for (int i = 0; i < code->ntypes; i++)
     {
         hl_type *t = &code->types[i];
-        if (t->kind != HOBJ && t->kind != HSTRUCT) // TODO: Add proper HENUM support
+        if (t->kind != HOBJ && t->kind != HSTRUCT && t->kind != HVIRTUAL) // TODO: Add proper HENUM support
             continue;
         char dir_path[1024];
         get_python_path_for_type(t, base_dir, dir_path, sizeof(dir_path), NULL, 0);
@@ -1182,36 +1273,39 @@ void hlmod_do_generate_stubs(hl_code *code)
     for (int i = 0; i < code->ntypes; i++)
     {
         hl_type *t = &code->types[i];
-        if (t->kind != HOBJ && t->kind != HSTRUCT) // TODO: Add proper HENUM support
+        if (t->kind != HOBJ && t->kind != HSTRUCT && t->kind != HVIRTUAL) // TODO: Add proper HENUM support
             continue;
         if (t->kind == HOBJ && t->obj && t->obj->name && ucmp(t->obj->name, USTR("String")) == 0)
             continue;
 
         hl_type *static_pair = NULL;
 
-        if (is_static_type(t))
+        if (t->kind == HOBJ || t->kind == HSTRUCT)
         {
-            hl_type *instance_pair = find_instance_pair(code, t);
-            if (instance_pair != NULL)
+            if (is_static_type(t))
             {
-                printf("[hlmod] Deferring static type '%s' (will be handled by '%s')\n",
-                       (char *)hl_to_utf8(t->obj->name),
-                       (char *)hl_to_utf8(instance_pair->obj->name));
-                continue;
+                hl_type *instance_pair = find_instance_pair(code, t);
+                if (instance_pair != NULL)
+                {
+                    printf("[hlmod] Deferring static type '%s' (will be handled by '%s')\n",
+                           (char *)hl_to_utf8(t->obj->name),
+                           (char *)hl_to_utf8(instance_pair->obj->name));
+                    continue;
+                }
+                else
+                {
+                    printf("[hlmod] Processing standalone static type '%s'\n", (char *)hl_to_utf8(t->obj->name));
+                }
             }
             else
             {
-                printf("[hlmod] Processing standalone static type '%s'\n", (char *)hl_to_utf8(t->obj->name));
-            }
-        }
-        else
-        {
-            static_pair = find_static_pair(code, t);
-            if (static_pair)
-            {
-                printf("[hlmod] Paired instance type '%s' with static type '%s'\n",
-                       (char *)hl_to_utf8(t->obj->name),
-                       (char *)hl_to_utf8(static_pair->obj->name));
+                static_pair = find_static_pair(code, t);
+                if (static_pair)
+                {
+                    printf("[hlmod] Paired instance type '%s' with static type '%s'\n",
+                           (char *)hl_to_utf8(t->obj->name),
+                           (char *)hl_to_utf8(static_pair->obj->name));
+                }
             }
         }
 
@@ -1245,22 +1339,30 @@ void hlmod_do_generate_stubs(hl_code *code)
         fprintf(f, "from typing import Any, Callable, Optional, List, TYPE_CHECKING\n");
 
         // TODO: Add proper HENUM support
-        fprintf(f, "from hlobj import HlObject, hltype\n\n");
+        fprintf(f, "from hlobj import HlObject, HlVirtual, hltype\n\n");
 
         hl_type_set deps;
         type_set_init(&deps);
 
-        if (t->obj->super)
+        if ((t->kind == HOBJ || t->kind == HSTRUCT) && t->obj->super)
         {
             print_absolute_import_for_type(f, t, t->obj->super, base_dir, false);
         }
-        for (int j = 0; j < t->obj->nfields; j++)
-            collect_type_dependencies(t->obj->fields[j].t, &deps);
-        for (int j = 0; j < t->obj->nproto; j++)
+        if (t->kind == HVIRTUAL)
         {
-            hl_function *func = find_function_by_findex(code, t->obj->proto[j].findex);
-            if (func)
-                collect_type_dependencies(func->type, &deps);
+            for (int j = 0; j < t->virt->nfields; j++)
+                collect_type_dependencies(t->virt->fields[j].t, &deps);
+        }
+        else
+        {
+            for (int j = 0; j < t->obj->nfields; j++)
+                collect_type_dependencies(t->obj->fields[j].t, &deps);
+            for (int j = 0; j < t->obj->nproto; j++)
+            {
+                hl_function *func = find_function_by_findex(code, t->obj->proto[j].findex);
+                if (func)
+                    collect_type_dependencies(func->type, &deps);
+            }
         }
         if (static_pair)
         {
@@ -1314,7 +1416,7 @@ void hlmod_do_generate_stubs(hl_code *code)
         type_set_free(&deps);
 
         char parent_class_arg[512] = "HlObject";
-        if (t->obj->super)
+        if ((t->kind == HOBJ || t->kind == HSTRUCT) && t->obj->super)
         {
             get_python_path_for_type(t->obj->super, base_dir, NULL, 0, parent_class_arg, sizeof(parent_class_arg));
         }
@@ -1339,7 +1441,14 @@ void hlmod_do_generate_stubs(hl_code *code)
             fprintf(f, "\n");
         }
 
-        write_class_stub(f, code, t, i, class_name_only, parent_class_arg, static_pair ? (int)(static_pair - code->types) : -1);
+        if (t->kind == HVIRTUAL)
+        {
+            write_virtual_stub(f, t, i, class_name_only);
+        }
+        else
+        {
+            write_class_stub(f, code, t, i, class_name_only, parent_class_arg, static_pair ? (int)(static_pair - code->types) : -1);
+        }
         if (static_pair)
         {
             char static_class_name[512];
