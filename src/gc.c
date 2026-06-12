@@ -436,10 +436,12 @@ static gc_pheader *gc_alloc_page( int size, int kind, int block_count ) {
 #	ifdef HL_64
 	void *ptr = gc_will_collide(p->base,size);
 	if( ptr ) {
-#		ifdef HL_VCC
-		printf("GC Page HASH collide %IX %IX\n",(int_val)GC_GET_PAGE(ptr),(int_val)ptr);
-#		else
-		printf("GC Page HASH collide %lX %lX\n",(int_val)GC_GET_PAGE(ptr),(int_val)ptr);
+#		ifdef GC_DEBUG
+#			ifdef HL_VCC
+			printf("GC Page HASH collide %IX %IX\n",(int_val)GC_GET_PAGE(ptr),(int_val)ptr);
+#			else
+			printf("GC Page HASH collide %lX %lX\n",(int_val)GC_GET_PAGE(ptr),(int_val)ptr);
+#			endif
 #		endif
 		return gc_alloc_page(size, kind, block_count);
 	}

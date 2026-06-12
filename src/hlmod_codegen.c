@@ -29,6 +29,8 @@ typedef struct hl_type_set
     int capacity;
 } hl_type_set;
 
+typedef struct hl_type_ptr_set hl_type_ptr_set;
+
 static cJSON *g_docs_root = NULL;
 
 const uchar *python_type_str(hl_type *t);
@@ -42,7 +44,7 @@ static void print_method_stub_from_type(FILE *f, const char *name, hl_type_fun *
 static void type_set_init(hl_type_set *set);
 static void type_set_add(hl_type_set *set, hl_type *t);
 static void type_set_free(hl_type_set *set);
-static void collect_type_dependencies(hl_type *t, hl_type_set *deps);
+static void collect_type_dependencies(hl_type *t, hl_type_set *deps, hl_type_ptr_set *visited);
 static void get_python_path_for_type(hl_type *t, const char *base_dir, char *dir_path_out, size_t dir_path_size, char *class_name_out, size_t class_name_size);
 static void print_absolute_import_for_type(FILE *f, hl_type *importer_type, hl_type *dependency_type, const char *base_dir, bool is_indented);
 static void print_absolute_import_for_named_class(FILE *f, hl_type *dependency_type, const char *base_dir, const char *class_name, bool is_indented);
@@ -625,6 +627,57 @@ static void type_set_free(hl_type_set *set)
     set->capacity = 0;
 }
 
+typedef struct hl_type_ptr_set
+{
+    hl_type **items;
+    int count;
+    int capacity;
+} hl_type_ptr_set;
+
+static void ptr_set_init(hl_type_ptr_set *set)
+{
+    set->items = NULL;
+    set->count = 0;
+    set->capacity = 0;
+}
+
+static void ptr_set_free(hl_type_ptr_set *set)
+{
+    if (set->items)
+        free(set->items);
+    set->items = NULL;
+    set->count = 0;
+    set->capacity = 0;
+}
+
+static bool ptr_set_contains(hl_type_ptr_set *set, hl_type *t)
+{
+    for (int i = 0; i < set->count; i++)
+    {
+        if (set->items[i] == t)
+            return true;
+    }
+    return false;
+}
+
+static void ptr_set_add(hl_type_ptr_set *set, hl_type *t)
+{
+    if (!t || ptr_set_contains(set, t))
+        return;
+    if (set->count >= set->capacity)
+    {
+        set->capacity = set->capacity == 0 ? 16 : set->capacity * 2;
+        set->items = realloc(set->items, set->capacity * sizeof(hl_type *));
+        if (!set->items)
+        {
+            fprintf(stderr, "[hlmod] FATAL: realloc failed.\n");
+            fflush(stderr);
+            exit(1);
+        }
+    }
+    set->items[set->count++] = t;
+}
+
 static void type_set_add(hl_type_set *set, hl_type *t)
 {
     if (!t || (t->kind != HOBJ && t->kind != HSTRUCT && t->kind != HVIRTUAL)) // TODO: Add proper HENUM support
@@ -648,10 +701,13 @@ static void type_set_add(hl_type_set *set, hl_type *t)
     set->items[set->count++] = t;
 }
 
-static void collect_type_dependencies(hl_type *t, hl_type_set *deps)
+static void collect_type_dependencies(hl_type *t, hl_type_set *deps, hl_type_ptr_set *visited)
 {
     if (!t)
         return;
+    if (ptr_set_contains(visited, t))
+        return;
+    ptr_set_add(visited, t);
     switch (t->kind)
     {
     case HOBJ:
@@ -663,21 +719,21 @@ static void collect_type_dependencies(hl_type *t, hl_type_set *deps)
         if (t->virt)
         {
             for (int i = 0; i < t->virt->nfields; i++)
-                collect_type_dependencies(t->virt->fields[i].t, deps);
+                collect_type_dependencies(t->virt->fields[i].t, deps, visited);
         }
         break;
     case HARRAY:
     case HNULL:
     case HREF:
-        collect_type_dependencies(t->tparam, deps);
+        collect_type_dependencies(t->tparam, deps, visited);
         break;
     case HFUN:
     case HMETHOD:
         if (t->fun)
         {
             for (int i = 0; i < t->fun->nargs; i++)
-                collect_type_dependencies(t->fun->args[i], deps);
-            collect_type_dependencies(t->fun->ret, deps);
+                collect_type_dependencies(t->fun->args[i], deps, visited);
+            collect_type_dependencies(t->fun->ret, deps, visited);
         }
         break;
     default:
@@ -1343,6 +1399,8 @@ void hlmod_do_generate_stubs(hl_code *code)
 
         hl_type_set deps;
         type_set_init(&deps);
+        hl_type_ptr_set visited;
+        ptr_set_init(&visited);
 
         if ((t->kind == HOBJ || t->kind == HSTRUCT) && t->obj->super)
         {
@@ -1351,17 +1409,17 @@ void hlmod_do_generate_stubs(hl_code *code)
         if (t->kind == HVIRTUAL)
         {
             for (int j = 0; j < t->virt->nfields; j++)
-                collect_type_dependencies(t->virt->fields[j].t, &deps);
+                collect_type_dependencies(t->virt->fields[j].t, &deps, &visited);
         }
         else
         {
             for (int j = 0; j < t->obj->nfields; j++)
-                collect_type_dependencies(t->obj->fields[j].t, &deps);
+                collect_type_dependencies(t->obj->fields[j].t, &deps, &visited);
             for (int j = 0; j < t->obj->nproto; j++)
             {
                 hl_function *func = find_function_by_findex(code, t->obj->proto[j].findex);
                 if (func)
-                    collect_type_dependencies(func->type, &deps);
+                    collect_type_dependencies(func->type, &deps, &visited);
             }
         }
         if (static_pair)
@@ -1376,12 +1434,12 @@ void hlmod_do_generate_stubs(hl_code *code)
                 print_absolute_import_for_named_class(f, t->obj->super, base_dir, static_super_class_name, false);
             }
             for (int j = 0; j < static_pair->obj->nfields; j++)
-                collect_type_dependencies(static_pair->obj->fields[j].t, &deps);
+                collect_type_dependencies(static_pair->obj->fields[j].t, &deps, &visited);
             for (int j = 0; j < static_pair->obj->nproto; j++)
             {
                 hl_function *func = find_function_by_findex(code, static_pair->obj->proto[j].findex);
                 if (func)
-                    collect_type_dependencies(func->type, &deps);
+                    collect_type_dependencies(func->type, &deps, &visited);
             }
         }
 
@@ -1414,6 +1472,7 @@ void hlmod_do_generate_stubs(hl_code *code)
         }
 
         type_set_free(&deps);
+        ptr_set_free(&visited);
 
         char parent_class_arg[512] = "HlObject";
         if ((t->kind == HOBJ || t->kind == HSTRUCT) && t->obj->super)
