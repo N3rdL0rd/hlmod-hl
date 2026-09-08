@@ -1109,7 +1109,7 @@ void hl_module_free( hl_module *m ) {
 			hl_remove_root(m->globals_data+m->globals_indexes[i]);
 	}
 	hl_free(&m->ctx.alloc);
-	hl_free_executable_memory(m->code, m->codesize);
+	hl_free_executable_memory(m->jit_code, m->codesize);
 	if( m->hash ) hl_code_hash_free(m->hash);
 	free(m->functions_indexes);
 	free(m->functions_ptrs);

@@ -36,6 +36,7 @@
 
 #include <Python.h>
 #include <hlmod.h>
+#include "hlmod_python.h"
 
 hl_module *g_module = NULL;
 
@@ -2615,6 +2616,90 @@ static void jit_hl2c( jit_ctx *ctx ) {
 	op64(ctx,RET,UNUSED,UNUSED);
 }
 
+/* Use the JIT's argument classifier, not the host C ABI (HL has fewer XMM
+   argument registers and pointer-sized stack slots for small primitives). */
+static vdynamic jit_python_call(void *context, hl_type *signature, char *stack, void **regs) {
+	void *slots[HL_MAX_ARGS];
+	call_regs cregs = {0};
+	vdynamic result = {0};
+	int i;
+	if( !context ) {
+		if( IS_64 ) {
+			context = regs[0];
+			cregs.nextCpu++;
+		} else {
+			context = *(void**)stack;
+			stack += HL_WSIZE;
+		}
+	}
+	for(i=0;i<signature->fun->nargs;i++) {
+		hl_type *t = signature->fun->args[i];
+		int reg = select_call_reg(&cregs,t,i);
+		if( reg < 0 ) {
+			slots[i] = stack;
+			stack += stack_size(t);
+		} else if( REG_IS_FPU(reg) )
+			slots[i] = regs + CALL_NREGS + reg - XMM(0);
+		else
+			slots[i] = regs + call_reg_index(reg);
+	}
+	hlmod_python_invoke(context,slots,&result);
+	return result;
+}
+
+static int64 jit_python_int(void *c, hl_type *t, char *stack, void **regs) {
+	vdynamic r = jit_python_call(c,t,stack,regs);
+	return r.v.i64;
+}
+
+static float jit_python_float(void *c, hl_type *t, char *stack, void **regs) {
+	vdynamic r = jit_python_call(c,t,stack,regs);
+	return r.v.f;
+}
+
+static double jit_python_double(void *c, hl_type *t, char *stack, void **regs) {
+	vdynamic r = jit_python_call(c,t,stack,regs);
+	return r.v.d;
+}
+
+void *hl_jit_python_adapter(hl_type *signature, void *context, bool closure, int *codesize) {
+	jit_ctx *ctx = hl_jit_alloc();
+	preg p;
+	void *code;
+	int i, size;
+	if( !ctx ) return NULL;
+	ctx->m = g_module;
+	jit_buf(ctx);
+	op64(ctx,PUSH,PEBP,UNUSED);
+	op64(ctx,MOV,PEBP,PESP);
+#ifdef HL_64
+	op64(ctx,SUB,PESP,pconst(&p,CALL_NREGS*8));
+	for(i=0;i<CALL_NREGS;i++)
+		op64(ctx,MOVSD,pmem(&p,Esp,i*8),REG_AT(XMM(i)));
+	for(i=0;i<CALL_NREGS;i++)
+		op64(ctx,PUSH,REG_AT(CALL_REGS[CALL_NREGS-1-i]),UNUSED);
+#endif
+	size = begin_native_call(ctx,4);
+	op64(ctx,LEA,PEAX,pmem(&p,Ebp,-HL_WSIZE*CALL_NREGS*2));
+	set_native_arg(ctx,PEAX);
+	op64(ctx,LEA,PEAX,pmem(&p,Ebp,HL_WSIZE*2+(IS_WINCALL64?32:0)));
+	set_native_arg(ctx,PEAX);
+	op64(ctx,MOV,PEAX,pconst64(&p,(int_val)signature));
+	set_native_arg(ctx,PEAX);
+	op64(ctx,MOV,PEAX,pconst64(&p,(int_val)(closure ? NULL : context)));
+	set_native_arg(ctx,PEAX);
+	call_native(ctx,signature->fun->ret->kind == HF32 ? (void*)jit_python_float :
+		signature->fun->ret->kind == HF64 ? (void*)jit_python_double : (void*)jit_python_int,size);
+	op64(ctx,MOV,PESP,PEBP);
+	op64(ctx,POP,PEBP,UNUSED);
+	op64(ctx,RET,UNUSED,UNUSED);
+	*codesize = (BUF_POS()+4095)&~4095;
+	code = hl_alloc_executable_memory(*codesize);
+	if( code ) memcpy(code,ctx->startBuf,BUF_POS());
+	hl_jit_free(ctx,false);
+	return code;
+}
+
 #ifdef JIT_CUSTOM_LONGJUMP
 // Win64 debug CRT performs a Rtl stack check in debug mode, preventing from
 // using longjump. This in an alternate implementation that follows the native
@@ -2948,6 +3033,10 @@ static void jit_hook_call(jit_ctx *ctx, hl_function *f) {
 	if (f->type->fun->ret->kind == HF32 || f->type->fun->ret->kind == HF64) {
 		int cleanup_size = begin_native_call(ctx, 0);
 		call_native(ctx, hlmod_get_return_double, cleanup_size);
+#ifdef HL_64
+		if(f->type->fun->ret->kind == HF32)
+			op64(ctx,CVTSD2SS,REG_AT(XMM(0)),REG_AT(XMM(0)));
+#endif
 		// Return value is now in XMM0
 	} else {
 		int cleanup_size = begin_native_call(ctx, 0);
@@ -3438,7 +3527,7 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f ) {
 				switch( dst->t->kind ) {
 				case HOBJ:
 				case HSTRUCT:
-					allocFun = hl_alloc_obj;
+					allocFun = hlmod_python_alloc_obj;
 					break;
 				case HDYNOBJ:
 					allocFun = hl_alloc_dynobj;

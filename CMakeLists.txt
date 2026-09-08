@@ -203,6 +203,18 @@ set_target_properties(libhl
 if (WITH_VM)
     find_package(Python COMPONENTS Interpreter Development REQUIRED)
 
+    set(HLMOD_EMBEDDED_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/hlmod_embedded.h)
+    add_custom_command(
+        OUTPUT ${HLMOD_EMBEDDED_HEADER}
+        COMMAND Python::Interpreter ${CMAKE_CURRENT_SOURCE_DIR}/python/embed.py
+            ${HLMOD_EMBEDDED_HEADER}
+            --module hlmod_mod_sorter_source ${CMAKE_CURRENT_SOURCE_DIR}/python/mod_sorter.py
+            --module hlmod_stub_renderer_source ${CMAKE_CURRENT_SOURCE_DIR}/python/stub_renderer.py
+            --hash-file ${CMAKE_CURRENT_SOURCE_DIR}/src/hlmod_codegen.c
+        DEPENDS python/embed.py python/mod_sorter.py python/stub_renderer.py src/hlmod_codegen.c
+        VERBATIM
+    )
+
     add_executable(hl
         src/code.c
         src/jit.c
@@ -215,10 +227,10 @@ if (WITH_VM)
         src/hlmod_crash.c
         src/cJSON.c
         src/sha256.c
+        ${HLMOD_EMBEDDED_HEADER}
+        src/hlmod_python.c
     )
 
-    file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/src/hlmod_codegen.c CURRENT_SOURCE_HASH)
-    target_compile_definitions(hl PRIVATE SOURCE_FILE_SHA256_HASH="${CURRENT_SOURCE_HASH}")
 
     if(APPLE)
         set_target_properties(hl PROPERTIES
@@ -231,7 +243,7 @@ if (WITH_VM)
     endif()
           
     target_link_libraries(hl libhl Python::Python)  
-    target_include_directories(hl PRIVATE ${Python_INCLUDE_DIRS})
+    target_include_directories(hl PRIVATE ${Python_INCLUDE_DIRS} ${CMAKE_CURRENT_BINARY_DIR}/generated)
     
     if (WIN32)
         target_link_libraries(hl user32 shell32 dbghelp)

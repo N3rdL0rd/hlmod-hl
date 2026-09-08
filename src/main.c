@@ -29,6 +29,8 @@
 #include <Python.h>
 #include <hlmod.h>
 #include <hlmod_codegen.h>
+#include <hlmod_embedded.h>
+#include <hlmod_python.h>
 
 #ifndef HL_WIN
 #   include <unistd.h>
@@ -209,17 +211,39 @@ static bool check_reload( main_context *m ) {
 HookRegistryEntry* g_hook_registry = NULL;
 
 void hlmod_register_hook(int findex, PyObject* callback) {
+    if (g_module == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "HL module is not initialized");
+        return;
+    }
+    if (findex < 0 || findex >= g_module->code->nfunctions + g_module->code->nnatives) {
+        PyErr_SetString(PyExc_IndexError, "Function index is out of bounds");
+        return;
+    }
+    int index = g_module->functions_indexes[findex];
+    if (index < 0 || index >= g_module->code->nfunctions) {
+        PyErr_SetString(PyExc_ValueError, "Only JIT functions can be hooked");
+        return;
+    }
+    if (!PyCallable_Check(callback)) {
+        PyErr_SetString(PyExc_TypeError, "Hook callback must be callable");
+        return;
+    }
     HookRegistryEntry* entry;
     HASH_FIND_INT(g_hook_registry, &findex, entry);
+    PyObject *previous = NULL;
     if (entry == NULL) {
-        entry = (HookRegistryEntry*)malloc(sizeof(HookRegistryEntry));
+        entry = malloc(sizeof(*entry));
+        if (entry == NULL) {
+            PyErr_NoMemory();
+            return;
+        }
         entry->findex = findex;
         HASH_ADD_INT(g_hook_registry, findex, entry);
     } else {
-        Py_DECREF(entry->callback);
+        previous = entry->callback;
     }
-    Py_INCREF(callback);
-    entry->callback = callback;
+    entry->callback = Py_NewRef(callback);
+    Py_XDECREF(previous);
 }
 
 static PyObject* hlmod_py_register_hook(PyObject *self, PyObject *args) {
@@ -237,6 +261,7 @@ static PyObject* hlmod_py_register_hook(PyObject *self, PyObject *args) {
     }
 
     hlmod_register_hook(findex, callback);
+    if (PyErr_Occurred()) return NULL;
 
     Py_RETURN_NONE;
 }
@@ -244,6 +269,16 @@ static PyObject* hlmod_py_register_hook(PyObject *self, PyObject *args) {
 static PyMethodDef HlmodMethods[] = {
     {"register_hook", hlmod_py_register_hook, METH_VARARGS, "Hooks a function by its findex."},
     {"register_hlobj", hlmod_py_register_hlobj, METH_VARARGS, "Registers a Python class for a given Haxe type index."},
+    {"create_subclass", hlmod_py_create_subclass, METH_VARARGS, "Register a native HL subtype backed by a Python class."},
+    {"alloc_obj", hlmod_py_alloc_obj, METH_VARARGS, "Allocate an instance of an HL object type."},
+    {"init_obj", hlmod_py_init_obj, METH_VARARGS, "Initialize a preallocated instance with its native constructor."},
+    {"bind_instance", hlmod_py_bind_instance, METH_VARARGS, "Bind native object identity to its Python instance."},
+    {"make_callback", hlmod_py_make_callback, METH_VARARGS, "Create an HL closure from a Python callable and signature."},
+    {"array_new", hlmod_py_array_new, METH_VARARGS, "Create a typed HL native array from element type index and iterable."},
+    {"array_length", hlmod_py_array_length, METH_VARARGS, "Return a native array's length."},
+    {"array_get", hlmod_py_array_get, METH_VARARGS, "Read a native array element."},
+    {"array_set", hlmod_py_array_set, METH_VARARGS, "Write a native array element."},
+    {"array_element_type", hlmod_py_array_element_type, METH_VARARGS, "Return the element type index or None."},
     {"get_obj_field", hlmod_py_get_obj_field, METH_VARARGS, "Gets a field value from a Haxe object."},
     {"set_obj_field", hlmod_py_set_obj_field, METH_VARARGS, "Sets a field value on a Haxe object."},
     {"get_virtual_field", hlmod_py_get_virtual_field, METH_VARARGS, "Gets a field value from a Haxe virtual object."},
@@ -254,6 +289,7 @@ static PyMethodDef HlmodMethods[] = {
     {"get_fixed_prng", hlmod_py_get_fixed_prng, METH_NOARGS, "Gets whether the PRNG is in a fixed state."},
     {"assert_code_sha", hlmod_py_assert_code_sha, METH_VARARGS, "Asserts the bytecode SHA256, exiting if it mismatches."},
     {"get_global", hlmod_py_get_global, METH_VARARGS, "Gets the global instance of a type by index. Useful for static types."},
+    {"ensure_global", hlmod_py_ensure_global, METH_VARARGS, "Ensures the global instance of a type by index is allocated, returning it."},
     {"call", hlmod_py_call, METH_VARARGS, "Calls an HL function by findex."},
     {"call_closure", hlmod_py_call_closure, METH_VARARGS, "Calls an HL closure by pointer."},
     {"dump_stack", hlmod_py_dump_stack, METH_NOARGS, "Dumps the current HL stack."},
@@ -279,101 +315,17 @@ PyMODINIT_FUNC PyInit_hlmod(void) {
     if (m == NULL)
         return NULL;
     
-    Py_INCREF(&HlPtrType);
-    if (PyModule_AddObject(m, "HlPtr", (PyObject*)&HlPtrType) < 0) {
-        Py_DECREF(&HlPtrType);
+    if (PyModule_AddObjectRef(m, "HlPtr", (PyObject *)&HlPtrType) < 0 ||
+        PyModule_AddObjectRef(m, "Hook", (PyObject *)&HlHookType) < 0 ||
+        PyModule_AddStringConstant(m, "version", HLMOD_VERSION) < 0) {
         Py_DECREF(m);
         return NULL;
     }
-
-    Py_INCREF(&HlHookType);
-    if (PyModule_AddObject(m, "Hook", (PyObject*)&HlHookType) < 0) {
-        Py_DECREF(&HlHookType);
-        Py_DECREF(&HlPtrType);
-        Py_DECREF(m);
-        return NULL;
-    }
-
-    PyObject* version_str = PyUnicode_FromString(HLMOD_VERSION);
-    if (version_str == NULL) {
-        Py_DECREF(&HlHookType);
-        Py_DECREF(&HlPtrType);
-        Py_DECREF(m);
-        return NULL;
-    }
-    PyModule_AddObject(m, "version", version_str);
 
     return m;
 }
 
 
-// TODO: make this better please god please looking at this makes me regret all my life choices leading up to this moment
-// time wasted here: 1 hour
-const char *g_sorter_script =
-    "import os\n"
-    "import ast\n"
-    "from collections import deque\n"
-    "\n"
-    "def get_mod_info(filepath):\n"
-    "    '''Safely parses a Python file to get its MOD_INFO dict without executing it.'''\n"
-    "    try:\n"
-    "        with open(filepath, 'r', encoding='utf-8') as f:\n"
-    "            tree = ast.parse(f.read(), filename=filepath)\n"
-    "        for node in tree.body:\n"
-    "            if isinstance(node, ast.Assign):\n"
-    "                if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id == 'MOD_INFO':\n"
-    "                    return ast.literal_eval(node.value)\n"
-    "    except (FileNotFoundError, SyntaxError):\n"
-    "        return None\n"
-    "    return None\n"
-    "\n"
-    "def find_mods(mods_dir):\n"
-    "    '''Finds all valid mods in the mods directory, including single files and directories.'''\n"
-    "    found_mods = []\n"
-    "    for name in os.listdir(mods_dir):\n"
-    "        path = os.path.join(mods_dir, name)\n"
-    "        if name == 'stubs': continue\n"
-    "        if os.path.isdir(path):\n"
-    "            init_path = os.path.join(path, '__init__.py')\n"
-    "            info = get_mod_info(init_path)\n"
-    "            if info: found_mods.append({'info': info, 'name': name, 'is_dir': True})\n"
-    "        elif name.endswith('.py') and not name.startswith('__'):\n"
-    "            info = get_mod_info(path)\n"
-    "            if info: found_mods.append({'info': info, 'name': name.rsplit('.', 1)[0], 'is_dir': False})\n"
-    "    return found_mods\n"
-    "\n"
-    "def resolve_mod_order(mods_dir):\n"
-    "    '''Discovers mods, builds a dependency graph, and performs a topological sort.'''\n"
-    "    discovered_mods = find_mods(mods_dir)\n"
-    "    mods = {}\n"
-    "    for mod_data in discovered_mods:\n"
-    "        info = mod_data['info']\n"
-    "        if info.get('enabled', True) is False:\n"
-    "            print(f\"    -> Skipping disabled mod: '{info['id']}'\")\n"
-    "            continue\n"
-    "        mods[info['id']] = {'info': info, 'name': mod_data['name'], 'dependencies': set(info['dependencies'])}\n"
-    "    adj = {mod_id: [] for mod_id in mods}\n"
-    "    in_degree = {mod_id: 0 for mod_id in mods}\n"
-    "    for mod_id, data in mods.items():\n"
-    "        for dep_id in data['dependencies']:\n"
-    "            if dep_id not in mods:\n"
-    "                return {'status': 'error', 'message': f'Mod \\'{mod_id}\\' has an unmet dependency: \\'{dep_id}\\' '}\n"
-    "            adj[dep_id].append(mod_id)\n"
-    "            in_degree[mod_id] += 1\n"
-    "    queue = deque([mod_id for mod_id in mods if in_degree[mod_id] == 0])\n"
-    "    sorted_order = []\n"
-    "    while queue:\n"
-    "        mod_id = queue.popleft()\n"
-    "        sorted_order.append({'id': mod_id, 'name': mods[mod_id]['name']})\n"
-    "        for neighbor in adj[mod_id]:\n"
-    "            in_degree[neighbor] -= 1\n"
-    "            if in_degree[neighbor] == 0:\n"
-    "                queue.append(neighbor)\n"
-    "    if len(sorted_order) == len(mods):\n"
-    "        return {'status': 'ok', 'order': sorted_order}\n"
-    "    else:\n"
-    "        cycle_nodes = set(mods.keys()) - {item['id'] for item in sorted_order}\n"
-    "        return {'status': 'error', 'message': f'Circular dependency detected among mods: {list(cycle_nodes)}'}\n";
 
 
 /**
@@ -385,92 +337,56 @@ const char *g_sorter_script =
  * The caller is responsible for DECREF'ing the returned list.
  */
 int get_mod_load_order(const char *mods_dir, PyObject **load_order_list) {
-    PyObject *pName, *pModule, *pModuleDict, *pFunc, *pArgs, *pValue, *pResultObj, *pStatus, *pOrder;
-    int success = 0;
-
-    // 1. Create a new, temporary module to hold our sorter code.
-    pName = PyUnicode_FromString("mod_sorter_module");
-    pModule = PyImport_AddModuleObject(pName);
-    Py_DECREF(pName);
-    if (pModule == NULL) {
-        fprintf(stderr, "[hlmod] Error: Failed to create a temporary Python module.\n");
-        PyErr_Print();
-        return 0;
+    *load_order_list = NULL;
+    PyObject *module = PyImport_AddModule("_hlmod_mod_sorter");
+    if (module == NULL) goto error;
+    PyObject *compiled = Py_CompileString(hlmod_mod_sorter_source, "<hlmod>/mod_sorter.py", Py_file_input);
+    if (compiled == NULL) goto error;
+    PyObject *globals = PyModule_GetDict(module);
+    PyObject *result = PyEval_EvalCode(compiled, globals, globals);
+    Py_DECREF(compiled);
+    if (result == NULL) goto error;
+    Py_DECREF(result);
+    result = PyObject_CallMethod(module, "resolve_mod_order", "s", mods_dir);
+    if (result == NULL) goto error;
+    if (!PyDict_Check(result)) {
+        Py_DECREF(result);
+        PyErr_SetString(PyExc_TypeError, "Mod resolver did not return a dictionary");
+        goto error;
     }
-    pModuleDict = PyModule_GetDict(pModule);
-
-    // 2. Execute our script string within the new module's namespace to define the functions.
-    pValue = PyRun_String(g_sorter_script, Py_file_input, pModuleDict, pModuleDict);
-    if (pValue == NULL) {
-        fprintf(stderr, "Error: An exception occurred while defining Python mod resolver functions.\n");
-        PyErr_Print();
-        return 0;
-    }
-    Py_DECREF(pValue);
-
-    // 3. Get a handle to the specific function we want to call.
-    pFunc = PyObject_GetAttrString(pModule, "resolve_mod_order");
-    if (pFunc == NULL || !PyCallable_Check(pFunc)) {
-        if (PyErr_Occurred()) PyErr_Print();
-        fprintf(stderr, "[hlmod] Error: Cannot find callable function 'resolve_mod_order'.\n");
-        return 0;
-    }
-
-    // 4. Build the arguments tuple for the Python function call. It takes one argument.
-    pArgs = PyTuple_New(1);
-    pValue = PyUnicode_FromString(mods_dir);
-    if (!pValue) {
-        PyErr_Print();
-        Py_DECREF(pArgs);
-        Py_DECREF(pFunc);
-        return 0;
-    }
-    PyTuple_SetItem(pArgs, 0, pValue); // PyTuple_SetItem steals a reference to pValue
-
-    pResultObj = PyObject_CallObject(pFunc, pArgs);
-    Py_DECREF(pArgs);
-
-    Py_DECREF(pFunc);
-
-    if (pResultObj != NULL) {
-        pStatus = PyDict_GetItemString(pResultObj, "status");
-        const char* status_str = PyUnicode_AsUTF8(pStatus);
-        
-        if (strcmp(status_str, "ok") == 0) {
-            pOrder = PyDict_GetItemString(pResultObj, "order");
-            if (pOrder && PyList_Check(pOrder)) {
-                Py_INCREF(pOrder); // Pass ownership of this new reference to the caller
-                *load_order_list = pOrder;
-                success = 1;
-            }
-        } else {
-            PyObject *pMessage = PyDict_GetItemString(pResultObj, "message");
-            fprintf(stderr, "[hlmod] Error: %s\n", PyUnicode_AsUTF8(pMessage));
+    PyObject *status = PyDict_GetItemString(result, "status");
+    if (status != NULL && PyUnicode_Check(status) && PyUnicode_CompareWithASCIIString(status, "ok") == 0) {
+        PyObject *order = PyDict_GetItemString(result, "order");
+        if (order != NULL && PyList_Check(order)) {
+            *load_order_list = Py_NewRef(order);
+            Py_DECREF(result);
+            return 1;
         }
-        Py_DECREF(pResultObj); // We are done with the result dictionary.
+        PyErr_SetString(PyExc_TypeError, "Mod resolver did not return a load-order list");
     } else {
-        fprintf(stderr, "[hlmod] Error: Python function call failed.\n");
-        PyErr_Print();
+        PyObject *message = PyDict_GetItemString(result, "message");
+        PyErr_SetObject(PyExc_RuntimeError, message != NULL ? message : Py_None);
     }
-
-    return success;
+    Py_DECREF(result);
+error:
+    PyErr_Print();
+    return 0;
 }
 
 /**
- * @brief Imports a Python module by name and calls its initialize() function.
+ * @brief Imports a Python mod; initialization happens during module execution.
  * @param module_name The name of the module to import (e.g., "modcore").
  */
-void load_mod(const char* module_name) {
-    PyObject *pName, *pModule;
+static bool load_mod(const char* module_name) {
     printf("    -> Loading `%s`\n", module_name);
-
-    pName = PyUnicode_FromString(module_name);
-    pModule = PyImport_Import(pName);
-    Py_DECREF(pName);
-    if (pModule == NULL) {
+    PyObject *module = PyImport_ImportModule(module_name);
+    if (module == NULL) {
         PyErr_Print();
         fprintf(stderr, "      [!] Error: Failed to load mod '%s'\n", module_name);
+        return false;
     }
+    Py_DECREF(module);
+    return true;
 }
 
 // Helper to get the base filename without extension from a path
@@ -593,7 +509,6 @@ void hlmod_setup_pyio() {
     if (proxy_instance == NULL) {
         fprintf(stderr, "[hlmod] FATAL: Could not create ConsoleProxy instance.\n");
         PyErr_Print();
-        Py_DECREF(&ConsoleProxyType);
         return;
     }
 
@@ -658,7 +573,6 @@ int main(int argc, pchar *argv[]) {
     hlmod_setup_pyio();
 #   endif
 
-    PyEval_InitThreads();
 
 	static vclosure cl;
 	pchar *file = NULL;
@@ -738,9 +652,6 @@ int main(int argc, pchar *argv[]) {
 	hlmod_setup_handler();
 #endif
 
-#ifndef NO_STUBGEN
-    hlmod_generate_stubs(ctx.code);
-#endif
 
     printf("[hlmod] Initializing HL module...\n");
 
@@ -752,19 +663,31 @@ int main(int argc, pchar *argv[]) {
 
     g_module = ctx.m;
     g_code = ctx.code;
+    int exit_code = 1;
+#ifndef NO_STUBGEN
+    if (!hlmod_generate_stubs(ctx.code)) goto shutdown;
+#endif
 
 	printf("[hlmod] Finding mods...\n");
     const char* mods_directory = "./mods";
 
     PyObject* sys_path = PySys_GetObject("path");
     PyObject* mods_path_obj = PyUnicode_FromString(mods_directory);
-    PyList_Append(sys_path, mods_path_obj);
+    if (mods_path_obj == NULL || PyList_Append(sys_path, mods_path_obj) < 0) {
+        Py_XDECREF(mods_path_obj);
+        PyErr_Print();
+        goto shutdown;
+    }
     Py_DECREF(mods_path_obj);
+    if (hlmod_python_init() < 0) {
+        PyErr_Print();
+        goto shutdown;
+    }
 
     PyObject* load_order_list = NULL;
     if (get_mod_load_order(mods_directory, &load_order_list)) {
         Py_ssize_t mod_count = PyList_Size(load_order_list);
-        printf("[hlmod] Found %i mods.\n", mod_count);
+        printf("[hlmod] Found %zd mods.\n", mod_count);
 
         printf("[hlmod] Loading mods:\n");
         for (Py_ssize_t i = 0; i < mod_count; i++) {
@@ -772,16 +695,15 @@ int main(int argc, pchar *argv[]) {
             PyObject* name_obj = PyDict_GetItemString(mod_info_dict, "name");
             const char* module_name = PyUnicode_AsUTF8(name_obj);
             
-            load_mod(module_name);
+            if (module_name == NULL || !load_mod(module_name)) {
+                Py_DECREF(load_order_list);
+                goto shutdown;
+            }
         }
         Py_DECREF(load_order_list);
     } else {
         fprintf(stderr, "[hlmod] Could not resolve mod load order. Halting.\n");
-        hl_code_free(ctx.code);
-        Py_FinalizeEx();
-        hl_debug_break();
-        hl_global_free();
-        return 1;
+        goto shutdown;
     }
     printf("[hlmod] All mods initialized.\n\n");
 
@@ -794,23 +716,23 @@ int main(int argc, pchar *argv[]) {
     PyThreadState* _save = PyEval_SaveThread();
 	ctx.ret = hl_dyn_call_safe(&cl,NULL,0,&isExc);
 
-    hl_code_free(ctx.code);
 	hl_profile_end();
-	if( isExc ) {
-        hl_code_free(ctx.code);
-		hl_print_uncaught_exception(ctx.ret);
-		hl_debug_break();
-		hl_global_free();
-		return 1;
-	}
+    if (isExc) hl_print_uncaught_exception(ctx.ret);
+    exit_code = isExc ? 1 : 0;
 
     // Re-acquire the GIL before finalizing Python.
     PyEval_RestoreThread(_save);
+shutdown:
+    hlmod_python_shutdown();
+    hlmod_shutdown();
+    if (Py_FinalizeEx() < 0) exit_code = 1;
+    hlmod_python_dispose();
 	hl_module_free(ctx.m);
+    hl_code_free(ctx.code);
 	hl_free(&ctx.code->alloc);
 	// do not call hl_unregister_thread() or hl_global_free will display error
 	// on global_lock if there are threads that are still running (such as debugger)
 	hl_global_free();
     printf("[hlmod] Bye!\n");
-	return 0;
+    return exit_code;
 }

@@ -6,9 +6,9 @@
 #include <hlmodule.h>
 
 /**
- * @brief Generates Python class stubs for all Objs in the bytecode.
+ * @brief Extracts native metadata and renders Python proxies; false on failure.
  */
-void hlmod_generate_stubs(hl_code *code);
+bool hlmod_generate_stubs(hl_code *code);
 
 #endif // HLMOD_CODEGEN_H
 

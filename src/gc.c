@@ -799,6 +799,23 @@ static void gc_mark_stack( void *start, void *end ) {
 	GC_STACK_END();
 }
 
+static bool (*gc_foreign_defer)(void **) = NULL;
+static void (*gc_foreign_observe)(bool (*)(void *)) = NULL;
+static bool (*gc_foreign_trace)(void **, bool (*)(void *)) = NULL;
+
+HL_API void hl_gc_set_foreign_hooks(bool (*defer)(void **), void (*observe)(bool (*)(void *)), bool (*trace)(void **, bool (*)(void *))) {
+	gc_foreign_defer = defer;
+	gc_foreign_observe = observe;
+	gc_foreign_trace = trace;
+}
+
+static bool gc_foreign_marked(void *ptr) {
+	gc_pheader *page = GC_GET_PAGE(ptr);
+	if( !page || !INPAGE(ptr,page) ) return false;
+	int bid = gc_allocator_get_block_id(page,ptr);
+	return bid >= 0 && (page->bmp[bid>>3] & (1<<(bid&7))) != 0;
+}
+
 static void gc_mark() {
 	GC_STACK_BEGIN(&global_mark_stack);
 	int mark_bytes = gc_stats.mark_bytes;
@@ -816,6 +833,7 @@ static void gc_mark() {
 	gc_allocator_before_mark(mark_data);
 	// push roots
 	for(i=0;i<gc_roots_count;i++) {
+		if( gc_foreign_defer && gc_foreign_defer(gc_roots[i]) ) continue;
 		void *p = *gc_roots[i];
 		gc_pheader *page;
 		if( !p ) continue;
@@ -853,6 +871,41 @@ static void gc_mark() {
 			if( GC_STACK_COUNT(&t->stack) > 0 )
 				hl_fatal("assert");
 		}
+	}
+	if( gc_foreign_observe ) {
+		gc_foreign_observe(gc_foreign_marked);
+		if( gc_foreign_trace && gc_foreign_trace(NULL,NULL) ) {
+			unsigned char *saved = malloc(mark_bytes);
+			if( !saved ) out_of_memory("foreign mark snapshot");
+			memcpy(saved,mark_data,mark_bytes);
+			for(i=0;i<gc_roots_count;i++) {
+				if( !gc_foreign_defer(gc_roots[i]) ) continue;
+				MZERO(mark_data,mark_bytes);
+				gc_mark_stack(gc_roots[i],gc_roots[i]+1);
+				gc_flush_mark(&global_mark_stack);
+				while( mark_threads_active ) hl_semaphore_acquire(mark_threads_done);
+				gc_foreign_trace(gc_roots[i],gc_foreign_marked);
+			}
+			memcpy(mark_data,saved,mark_bytes);
+			free(saved);
+		}
+		/* The second pass preserves Python-owned graphs for this collection. */
+		GC_STACK_BEGIN(&global_mark_stack);
+		for(i=0;i<gc_roots_count;i++) {
+			void *p = *gc_roots[i];
+			gc_pheader *page;
+			if( !p || !gc_foreign_defer(gc_roots[i]) ) continue;
+			page = GC_GET_PAGE(p);
+			if( !page || !INPAGE(p,page) ) continue;
+			int bid = gc_allocator_get_block_id(page,p);
+			if( bid >= 0 && (page->bmp[bid>>3] & (1<<(bid&7))) == 0 ) {
+				page->bmp[bid>>3] |= 1<<(bid&7);
+				GC_PUSH_GEN(p,page);
+			}
+		}
+		GC_STACK_END();
+		gc_flush_mark(&global_mark_stack);
+		while( mark_threads_active ) hl_semaphore_acquire(mark_threads_done);
 	}
 	gc_allocator_after_mark();
 }

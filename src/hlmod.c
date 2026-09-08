@@ -4,6 +4,37 @@
 #include <Python.h>
 #include <structmember.h>
 #include <std_globals.h>
+#include <hlmod_python.h>
+#include <limits.h>
+#include <float.h>
+#include <math.h>
+
+static int hlmod_type_index(hl_type *type)
+{
+    if (!g_code || !type) return -1;
+    uintptr_t address = (uintptr_t)type, base = (uintptr_t)g_code->types;
+    if (address < base || (address - base) / sizeof(hl_type) >= (size_t)g_code->ntypes ||
+        (address - base) % sizeof(hl_type)) return -1;
+    return (int)((address - base) / sizeof(hl_type));
+}
+
+static hl_type *hlmod_function_type(int findex)
+{
+    if (!g_module || !g_module->code) {
+        PyErr_SetString(PyExc_RuntimeError, "hlmod is not initialized.");
+        return NULL;
+    }
+    if (findex < 0 || findex >= g_module->code->nfunctions + g_module->code->nnatives) {
+        PyErr_Format(PyExc_IndexError, "Function index %d is out of bounds.", findex);
+        return NULL;
+    }
+    hl_type *type = g_module->ctx.functions_types[findex];
+    if (!type || type->kind != HFUN || !type->fun || !g_module->functions_ptrs[findex]) {
+        PyErr_SetString(PyExc_TypeError, "Function metadata is unavailable.");
+        return NULL;
+    }
+    return type;
+}
 
 bool uchar_eq(const uchar *s1, const uchar *s2)
 {
@@ -25,13 +56,16 @@ static THREAD_LOCAL int* g_passthrough_stack = NULL;
 static THREAD_LOCAL int g_passthrough_stack_size = 0;
 static THREAD_LOCAL int g_passthrough_stack_capacity = 0;
 
-static void push_passthrough(int findex) {
+static int push_passthrough(int findex) {
     if (g_passthrough_stack_size >= g_passthrough_stack_capacity) {
         int new_capacity = g_passthrough_stack_capacity == 0 ? 8 : g_passthrough_stack_capacity * 2;
-        g_passthrough_stack = (int*)realloc(g_passthrough_stack, new_capacity * sizeof(int));
+        int *stack = realloc(g_passthrough_stack, new_capacity * sizeof(int));
+        if (!stack) { PyErr_NoMemory(); return -1; }
+        g_passthrough_stack = stack;
         g_passthrough_stack_capacity = new_capacity;
     }
     g_passthrough_stack[g_passthrough_stack_size++] = findex;
+    return 0;
 }
 
 static void pop_passthrough() {
@@ -60,16 +94,33 @@ EXPORT double hlmod_get_return_double() {
 static PyObject **g_hlobjs = NULL;
 static int g_hlobjs_l = 0;
 static PyObject *g_hlobj_module = NULL;
-static PyObject *g_hlobj_base_class = NULL;
 static PyObject *g_hlcallable_class = NULL;
 static PyObject *g_hlvirtual_class = NULL;
+typedef struct HlMethodSignature {
+    hl_type *method;
+    hl_type callable;
+    struct HlMethodSignature *next;
+} HlMethodSignature;
+static HlMethodSignature *g_method_signatures = NULL;
 
 #pragma region HlPtr
-static PyObject *HlPtr_New(void *ptr, int kind);
+static PyObject *HlPtr_get_type_index(HlPtr *self, void *closure);
+static PyObject *HlPtr_get_trusted(HlPtr *self, void *closure);
 static PyObject *HlPtr_get_ptr(HlPtr *self, void *closure);
 static PyObject *HlPtr_get_kind(HlPtr *self, void *closure);
 static int HlPtr_init(HlPtr *self, PyObject *args, PyObject *kwds);
 static void HlPtr_dealloc(HlPtr *self);
+static int HlPtr_traverse(HlPtr *self, visitproc visit, void *arg)
+{
+    return self->root ? hlmod_python_traverse(self->root, visit, arg) : 0;
+}
+
+static int HlPtr_clear(HlPtr *self)
+{
+    if (self->root) hlmod_python_clear(self->root);
+    return 0;
+}
+
 static PyObject *hlmod_py_make_hlcallable(vclosure *cl);
 static PyObject *HlHook_get_findex(HlHook *self, void *closure);
 static PyObject *HlHook_as_closure(HlHook *self, PyObject *Py_UNUSED(ignored));
@@ -78,74 +129,88 @@ static PyObject *HlHook_as_closure(HlHook *self, PyObject *Py_UNUSED(ignored));
 static PyGetSetDef HlPtr_getsetters[] = {
     {"ptr", (getter)HlPtr_get_ptr, NULL, "The raw pointer value", NULL},
     {"kind", (getter)HlPtr_get_kind, NULL, "The HL type kind enum", NULL},
+    {"type_index", (getter)HlPtr_get_type_index, NULL, "Bytecode type index, or None", NULL},
+    {"trusted", (getter)HlPtr_get_trusted, NULL, "Whether native type provenance is available", NULL},
     {NULL}};
 
 PyTypeObject HlPtrType = {
     PyVarObject_HEAD_INIT(NULL, 0)
     .tp_name = "hlmod.HlPtr",
-    .tp_doc = "A wrapper for a Haxe pointer and its type kind.",
+    .tp_doc = "Opaque raw address wrapper; only native-created pointers have trusted type provenance.",
     .tp_basicsize = sizeof(HlPtr),
     .tp_itemsize = 0,
-    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
     .tp_new = PyType_GenericNew,
     .tp_getset = HlPtr_getsetters,
     .tp_init = (initproc)HlPtr_init,
     .tp_dealloc = (destructor)HlPtr_dealloc,
+    .tp_traverse = (traverseproc)HlPtr_traverse,
+    .tp_clear = (inquiry)HlPtr_clear,
 };
 
-static PyObject *HlPtr_New(void *ptr, int kind)
+PyObject *hlmod_ptr_new(void *ptr, hl_type *type)
 {
-    PyObject *args = Py_BuildValue("(Ki)", (unsigned long long)ptr, kind);
-    if (args == NULL) {
+    if (!type || !hl_is_ptr(type) || type->kind == HPACKED || type->kind == HGUID) {
+        PyErr_SetString(PyExc_TypeError, "A pointer requires a supported native pointer type.");
         return NULL;
     }
-
-    PyObject *self = PyObject_CallObject((PyObject *)&HlPtrType, args);
-    
-    Py_DECREF(args);
-
-    return self;
+    HlPtr *self = (HlPtr *)HlPtrType.tp_alloc(&HlPtrType, 0);
+    if (!self) return NULL;
+    self->ptr = ptr;
+    self->kind = type->kind;
+    self->type = type;
+    if (ptr && hl_is_gc_ptr(ptr)) {
+        self->root = &self->ptr;
+        hl_add_root(self->root);
+        hlmod_python_root(self->root, true);
+    }
+    return (PyObject *)self;
 }
 
 static void HlPtr_dealloc(HlPtr *self)
 {
-    if (self->root != NULL)
-    {
+    PyObject_GC_UnTrack(self);
+    if (self->root) {
+        hlmod_python_root(self->root, false);
         hl_remove_root(self->root);
-        self->root = NULL; // Prevent double-free
     }
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
 static int HlPtr_init(HlPtr *self, PyObject *args, PyObject *kwds)
 {
-    unsigned long long ptr_val;
-    int kind = 0;
+    PyObject *address;
+    int kind = HVOID;
     static char *kwlist[] = {"ptr", "kind", NULL};
-
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "K|i", kwlist, &ptr_val, &kind))
-    {
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|i", kwlist, &address, &kind)) return -1;
+    void *ptr = PyLong_AsVoidPtr(address);
+    if (PyErr_Occurred()) return -1;
+    if (kind < HVOID || kind >= HLAST) {
+        PyErr_SetString(PyExc_ValueError, "Invalid HL type kind.");
         return -1;
     }
-
-    self->ptr = (void *)ptr_val;
-    self->kind = kind;
-    self->root = NULL;
-
-    if (self->ptr != NULL && hl_is_gc_ptr(self->ptr))
-    {
-        self->root = (void **)hl_gc_alloc_raw(sizeof(void *));
-        if (self->root == NULL) {
-            PyErr_SetString(PyExc_MemoryError, "Failed to allocate memory for HL GC root.");
-            return -1;
-        }
-
-        *(self->root) = self->ptr;
-
-        hl_add_root(self->root);
+    if (self->type) {
+        PyErr_SetString(PyExc_TypeError, "Cannot reinitialize a trusted native pointer.");
+        return -1;
     }
-
+    if (self->root) hl_remove_root(self->root);
+    self->root = NULL;
+    self->ptr = ptr;
+    self->kind = kind;
+    /* Caller-supplied addresses are never dereferenced, rooted, or trusted. */
     return 0;
+}
+
+static PyObject *HlPtr_get_type_index(HlPtr *self, void *closure)
+{
+    int index = hlmod_type_index(self->type);
+    if (index < 0) Py_RETURN_NONE;
+    return PyLong_FromLong(index);
+}
+
+static PyObject *HlPtr_get_trusted(HlPtr *self, void *closure)
+{
+    return PyBool_FromLong(self->type != NULL);
 }
 
 static PyObject *HlPtr_get_ptr(HlPtr *self, void *closure)
@@ -181,7 +246,7 @@ static PyObject *hlmod_py_make_hlcallable(vclosure *cl)
         }
     }
 
-    PyObject *py_ptr = HlPtr_New(cl, HFUN);
+    PyObject *py_ptr = hlmod_ptr_new(cl, cl->t);
     if (py_ptr == NULL) {
         return NULL;
     }
@@ -227,7 +292,7 @@ static PyObject *hlmod_py_make_hlvirtual(void *ptr, hl_type *type)
         return NULL;
     }
 
-    int type_idx = (int)(type - g_code->types);
+    int type_idx = hlmod_type_index(type);
     PyObject *py_class = NULL;
     if (type_idx >= 0 && type_idx < g_hlobjs_l)
     {
@@ -238,21 +303,16 @@ static PyObject *hlmod_py_make_hlvirtual(void *ptr, hl_type *type)
         py_class = g_hlvirtual_class;
     }
 
-    PyObject *py_arg_ptr = HlPtr_New(ptr, HVIRTUAL);
+    PyObject *py_arg_ptr = hlmod_ptr_new(ptr, type);
     if (py_arg_ptr == NULL)
     {
         return NULL;
     }
 
-    PyObject *py_args = PyTuple_Pack(1, py_arg_ptr);
+    PyObject *wrap = PyObject_GetAttrString(py_class, "_hlmod_wrap");
+    PyObject *py_instance = wrap ? PyObject_CallOneArg(wrap, py_arg_ptr) : NULL;
+    Py_XDECREF(wrap);
     Py_DECREF(py_arg_ptr);
-    if (py_args == NULL)
-    {
-        return NULL;
-    }
-
-    PyObject *py_instance = PyObject_CallObject(py_class, py_args);
-    Py_DECREF(py_args);
     return py_instance;
 }
 
@@ -261,94 +321,77 @@ static PyObject *HlHook_get_findex(HlHook *self, void *closure)
     return PyLong_FromLong(self->findex);
 }
 
-static PyObject *HlHook_call_original(HlHook *self, PyObject *py_args)
+static PyObject *hlmod_invoke(vclosure *closure, PyObject *arguments, int original, int direct)
 {
-    hl_function *f = g_module->code->functions + g_module->functions_indexes[self->findex];
-    hl_type_fun *fun_type = f->type->fun;
-    int nargs = fun_type->nargs;
-
-    if (PyTuple_Size(py_args) != nargs)
-    {
-        PyErr_Format(PyExc_TypeError, "call_original() expected %d arguments, but got %zd", nargs, PyTuple_Size(py_args));
+    hl_type_fun *fun = closure->t->fun;
+    int nargs = fun->nargs;
+    /* std/fun.c's dynamic dispatcher has nine machine argument slots. */
+    int bound = closure->hasValue && fun->parent != NULL;
+    if (nargs < 0 || nargs + bound > 9) {
+        PyErr_SetString(PyExc_ValueError, "HL dynamic calls support at most nine arguments including a bound receiver.");
         return NULL;
     }
-
-    vdynamic *vargs[HL_MAX_ARGS];
-    if (nargs > HL_MAX_ARGS)
-    {
-        PyErr_SetString(PyExc_ValueError, "Too many arguments for call_original");
+    if (PyTuple_GET_SIZE(arguments) != nargs) {
+        PyErr_Format(PyExc_TypeError, "Haxe call expected %d arguments, got %zd.", nargs, PyTuple_GET_SIZE(arguments));
         return NULL;
     }
-
-    for (int i = 0; i < nargs; i++)
-    {
-        PyObject *py_arg = PyTuple_GetItem(py_args, i);
-        hl_type *hl_arg_type = fun_type->args[i];
-
-        void *hl_val_ptr = hlmod_cast_to_hl(py_arg, hl_arg_type);
-        if (hl_val_ptr == NULL)
-        {
+    vdynamic *values[9] = {0};
+    for (int i = 0; i < nargs; i++) {
+        if (fun->args[i]->kind == HSTRUCT) {
+            PyErr_SetString(PyExc_TypeError, "Struct arguments are unsupported by the HL dynamic dispatcher.");
             return NULL;
         }
-
-        vargs[i] = hl_make_dyn(hl_val_ptr, hl_arg_type);
+        void *slot = hlmod_cast_to_hl(PyTuple_GET_ITEM(arguments, i), fun->args[i]);
+        if (!slot) return NULL;
+        values[i] = hl_make_dyn(slot, fun->args[i]);
     }
-
-    vclosure cl;
-    cl.t = f->type;
-    cl.fun = g_module->functions_ptrs[self->findex];
-    cl.hasValue = 0;
-
-    push_passthrough(self->findex);
-    bool is_exc;
-    vdynamic *hl_result = hl_dyn_call_safe(&cl, nargs > 0 ? vargs : NULL, nargs, &is_exc);
-    pop_passthrough();
-
-    if (is_exc)
-    {
-        uchar *u_exc_str = hl_to_string(hl_result);
-        char *exc_str_utf8 = hl_to_utf8(u_exc_str);
-        PyErr_Format(PyExc_RuntimeError, "An exception occurred in the original Haxe function: %s", exc_str_utf8);
+    if (original >= 0 && push_passthrough(original) < 0) return NULL;
+    int saved_bypass = hlmod_python_bypass;
+    if (direct >= 0) hlmod_python_bypass = direct;
+    int64_t saved_int = g_return_value_int;
+    double saved_double = g_return_value_double;
+    bool exception;
+    /* Keep bridge-owned inputs alive independently of Python GC while native
+       code runs, including workers that call back into Python before joining. */
+    for (int i = 0; i < nargs; i++) hl_add_root(&values[i]);
+    hl_add_root(&closure);
+    PyThreadState *python_state = PyEval_SaveThread();
+    vdynamic *result = hl_dyn_call_safe(closure, nargs ? values : NULL, nargs, &exception);
+    hl_add_root(&result);
+    /* Waiting for the GIL is a GC-safe blocking region, not HL execution. */
+    hl_blocking(true);
+    PyEval_RestoreThread(python_state);
+    hl_blocking(false);
+    hl_remove_root(&result);
+    hl_remove_root(&closure);
+    for (int i = 0; i < nargs; i++) hl_remove_root(&values[i]);
+    g_return_value_int = saved_int;
+    g_return_value_double = saved_double;
+    hlmod_python_bypass = saved_bypass;
+    if (original >= 0) pop_passthrough();
+    if (exception) {
+        PyErr_Format(PyExc_RuntimeError, "Haxe call raised: %s", hl_to_utf8(hl_to_string(result)));
         return NULL;
     }
+    if (fun->ret->kind == HVOID || !result) Py_RETURN_NONE;
+    return hlmod_cast_to_py(fun->ret, hl_is_dynamic(fun->ret) ? (void *)&result : (void *)&result->v);
+}
 
-    if (fun_type->ret->kind == HVOID)
-    {
-        Py_RETURN_NONE;
-    }
-
-    PyObject *py_result = NULL;
-
-    if (!hl_is_dynamic(fun_type->ret)) {
-        py_result = hlmod_cast_to_py(fun_type->ret, &hl_result->v);
-    } else {
-        py_result = hlmod_cast_to_py(fun_type->ret, &hl_result);
-    }
-
-    if (py_result == NULL)
-    {
-        return NULL;
-    }
-
-    return py_result;
+static PyObject *HlHook_call_original(HlHook *self, PyObject *py_args)
+{
+    hl_type *type = hlmod_function_type(self->findex);
+    if (!type) return NULL;
+    vclosure closure = {0};
+    closure.t = type;
+    closure.fun = g_module->functions_ptrs[self->findex];
+    return hlmod_invoke(&closure, py_args, self->findex, self->findex);
 }
 
 static PyObject *HlHook_as_closure(HlHook *self, PyObject *Py_UNUSED(ignored))
 {
-    if (g_module == NULL || g_module->code == NULL)
-    {
-        PyErr_SetString(PyExc_RuntimeError, "hlmod is not initialized.");
-        return NULL;
-    }
-
-    if (self->findex < 0 || self->findex >= g_module->code->nfunctions)
-    {
-        PyErr_Format(PyExc_IndexError, "Function index %d is out of bounds.", self->findex);
-        return NULL;
-    }
-
-    hl_function *f = g_module->code->functions + g_module->functions_indexes[self->findex];
-    vclosure *cl = hl_alloc_closure_void(f->type, g_module->functions_ptrs[self->findex]);
+    hl_type *type = hlmod_function_type(self->findex);
+    if (!type) return NULL;
+    vclosure *cl = hl_alloc_closure_void(type, g_module->functions_ptrs[self->findex]);
     if (cl == NULL)
     {
         PyErr_SetString(PyExc_MemoryError, "Failed to allocate closure wrapper.");
@@ -389,7 +432,10 @@ PyObject *hlmod_py_register_hlobj(PyObject *self, PyObject *args)
         return NULL;
     }
 
-    // printf("[hlmod] Registering HlObject for t@%i\n", type_idx);
+    if (!g_code || type_idx < 0 || type_idx >= g_code->ntypes) {
+        PyErr_Format(PyExc_IndexError, "Type index %d is out of bounds.", type_idx);
+        return NULL;
+    }
 
     if (!PyType_Check(py_class))
     {
@@ -400,581 +446,428 @@ PyObject *hlmod_py_register_hlobj(PyObject *self, PyObject *args)
     if (type_idx >= g_hlobjs_l)
     {
         int new_len = type_idx + 1;
-        g_hlobjs = realloc(g_hlobjs, sizeof(PyObject *) * new_len);
+        PyObject **registry = realloc(g_hlobjs, sizeof(PyObject *) * new_len);
+        if (!registry) return PyErr_NoMemory();
+        g_hlobjs = registry;
         memset(g_hlobjs + g_hlobjs_l, 0, sizeof(PyObject *) * (new_len - g_hlobjs_l));
         g_hlobjs_l = new_len;
     }
 
-    if (g_hlobjs[type_idx] != NULL)
-    {
-        Py_DECREF(g_hlobjs[type_idx]);
-    }
-
-    Py_INCREF(py_class);
-    g_hlobjs[type_idx] = py_class;
+    PyObject *previous = g_hlobjs[type_idx];
+    g_hlobjs[type_idx] = Py_NewRef(py_class);
+    Py_XDECREF(previous);
 
     Py_RETURN_NONE;
 }
 
-/**
- * @brief Performs a reverse lookup to find the Haxe type for a given Python object.
- * 
- * This function iterates through all registered Python classes (subclasses of HlObject)
- * and checks if the given 'obj' is an instance of any of them.
- * 
- * @param obj The Python object instance to look up.
- * @return The corresponding hl_type* if a match is found, otherwise NULL.
- */
-static hl_type* hlmod_py_find_hlobject(PyObject *obj)
+void hlmod_shutdown(void)
 {
-    for (int i = 0; i < g_hlobjs_l; i++)
-    {
-        PyObject *registered_class = g_hlobjs[i];
-
-        if (registered_class == NULL) {
-            continue;
-        }
-
-        int is_instance = PyObject_IsInstance(obj, registered_class);
-
-        if (is_instance == -1) {
-            fprintf(stderr, "[hlmod] [WARN] PyObject_IsInstance failed during reverse lookup.\n");
-            PyErr_Clear();
-            return NULL;
-        }
-
-        if (is_instance) {
-            return &g_code->types[i];
-        }
+    PyObject **classes = g_hlobjs;
+    int count = g_hlobjs_l;
+    g_hlobjs = NULL;
+    g_hlobjs_l = 0;
+    g_method_signatures = NULL; /* Storage belongs to the bytecode allocator. */
+    for (int i = 0; i < count; i++) Py_XDECREF(classes[i]);
+    free(classes);
+    Py_CLEAR(g_hlcallable_class);
+    Py_CLEAR(g_hlvirtual_class);
+    Py_CLEAR(g_hlobj_module);
+    HookRegistryEntry *entry, *next;
+    HASH_ITER(hh, g_hook_registry, entry, next) {
+        HASH_DEL(g_hook_registry, entry);
+        Py_DECREF(entry->callback);
+        free(entry);
     }
-
-    return NULL;
-}
-
-/**
- * @brief Checks if a Python object is an instance of the HlObject base class
- *        from the 'hlobj' Python module. Caches the module and class for efficiency.
- *
- * @param obj The Python object to check.
- * @return true if it's an instance of hlobj.HlObject, false otherwise.
- */
-bool hlmod_py_is_hlobject(PyObject *obj)
-{
-    if (g_hlobj_base_class == NULL)
-    {
-        g_hlobj_module = PyImport_ImportModule("hlobj");
-        if (g_hlobj_module == NULL)
-        {
-            PyErr_Print();
-            return false;
-        }
-        g_hlobj_base_class = PyObject_GetAttrString(g_hlobj_module, "HlObject");
-        if (g_hlobj_base_class == NULL)
-        {
-            Py_DECREF(g_hlobj_module);
-            g_hlobj_module = NULL;
-            PyErr_Clear();
-            return false;
-        }
-    }
-
-    int is_instance = PyObject_IsInstance(obj, g_hlobj_base_class);
-
-    if (is_instance == -1) {
-        PyErr_Clear();
-        return false;
-    }
-
-    return is_instance == 1;
+    free(g_passthrough_stack);
+    g_passthrough_stack = NULL;
+    g_passthrough_stack_size = 0;
+    g_passthrough_stack_capacity = 0;
+    g_return_value_int = 0;
+    g_return_value_double = 0;
 }
 
 #pragma region Casting
 
-/**
- * @brief Cast an HL type to Python.
- * 
- * @param type The type of the HL value
- * @param ptr A pointer to the HL value
- * @returns a PyObject* that is a casted version of the HL value
- */
+static PyObject *hlmod_wrap_pointer(const char *name, void *ptr, hl_type *type, PyObject *py_class)
+{
+    PyObject *owned_class = NULL;
+    if (!py_class) {
+        if (!g_hlobj_module) g_hlobj_module = PyImport_ImportModule("hlobj");
+        if (!g_hlobj_module) return NULL;
+        owned_class = PyObject_GetAttrString(g_hlobj_module, name);
+        if (!owned_class) return NULL;
+        py_class = owned_class;
+    }
+    PyObject *wrap = name ? Py_NewRef(py_class) : PyObject_GetAttrString(py_class, "_hlmod_wrap");
+    PyObject *pointer = wrap ? hlmod_ptr_new(ptr, type) : NULL;
+    PyObject *result = pointer ? PyObject_CallOneArg(wrap, pointer) : NULL;
+    Py_XDECREF(pointer);
+    Py_XDECREF(wrap);
+    Py_XDECREF(owned_class);
+    return result;
+}
+
+/* A missing attribute is ordinary, but a descriptor's other errors propagate. */
+static HlPtr *hlmod_extract_pointer(PyObject *obj)
+{
+    PyObject *pointer;
+    if (Py_IS_TYPE(obj, &HlPtrType)) pointer = Py_NewRef(obj);
+    else {
+        pointer = PyObject_GetAttrString(obj, "_hlmod_ptr");
+        if (!pointer) return NULL;
+    }
+    if (!Py_IS_TYPE(pointer, &HlPtrType) || !((HlPtr *)pointer)->type) {
+        Py_DECREF(pointer);
+        PyErr_SetString(PyExc_TypeError, "Expected a native-created, typed HlPtr; raw addresses are opaque.");
+        return NULL;
+    }
+    return (HlPtr *)pointer;
+}
+
+static void *hlmod_require_pointer(HlPtr *pointer, hl_type_kind kind)
+{
+    if (!pointer->type || pointer->type->kind != kind) {
+        PyErr_Format(PyExc_TypeError, "Expected a trusted %s pointer.", kind2str(kind));
+        return NULL;
+    }
+    if (!pointer->ptr) {
+        PyErr_SetString(PyExc_ValueError, "Cannot dereference a null HlPtr.");
+        return NULL;
+    }
+    return pointer->ptr;
+}
+
+static void *hlmod_pointer_slot(void *pointer)
+{
+    void **slot = hl_gc_alloc_raw(sizeof(void *));
+    *slot = pointer;
+    return slot;
+}
+
 PyObject *hlmod_cast_to_py(hl_type *type, void *ptr)
 {
-    if (type == NULL)
-    {
-        fprintf(stderr, "[hlmod] [ERROR] [hl->py] Received NULL type with pointer %p.\n", ptr);
-        Py_RETURN_NONE;
+    if (!type || !ptr) {
+        PyErr_SetString(PyExc_ValueError, "Missing HL type or value slot.");
+        return NULL;
     }
-
-    switch (type->kind)
-    {
-    case HF64:
-        return PyFloat_FromDouble(*(double *)ptr);
-    case HF32:
-        return PyFloat_FromDouble((double)(*(float *)ptr));
-    case HI32:
-        return PyLong_FromLong(*(int *)ptr);
-    case HBOOL:
-        return PyBool_FromLong(*(bool *)ptr);
-    case HUI16:
-        return PyLong_FromLong(*(unsigned short *)ptr);
-    case HUI8:
-        return PyLong_FromLong(*(unsigned char *)ptr);
-    case HOBJ:
-    {
-        void *obj_ptr = *(void **)ptr;
-        if (obj_ptr == NULL)
-        {
-            Py_RETURN_NONE;
-        }
-        if (type->obj != NULL && type->obj->name != NULL && uchar_eq(type->obj->name, u"String"))
-        {
-            // printf("%s: ", type->obj->name);
-            vstring *s = (vstring *)obj_ptr;
-            // printf("s: %p s->bytes: %p s->length: %p\n", s, s->bytes, s->length);
-            return PyUnicode_DecodeUTF16((const char *)s->bytes, s->length * sizeof(uchar), "strict", NULL);
-        }
-        if (g_code == NULL)
-            break;
-
-        int type_idx = type - g_code->types;
-
-        if (type_idx >= 0 && type_idx < g_hlobjs_l)
-        {
-            PyObject *py_class = g_hlobjs[type_idx];
-            if (py_class != NULL)
-            {
-                PyObject *py_arg_ptr = HlPtr_New(obj_ptr, HOBJ);
-                if (py_arg_ptr == NULL)
-                    return NULL;
-
-                PyObject *py_args = PyTuple_Pack(1, py_arg_ptr);
-                Py_DECREF(py_arg_ptr);
-                if (py_args == NULL)
-                    return NULL;
-
-                PyObject *py_instance = PyObject_CallObject(py_class, py_args);
-                Py_DECREF(py_args);
-
-                return py_instance;
-            }
-        }
-        break;
+    switch (type->kind) {
+    case HVOID: Py_RETURN_NONE;
+    case HI64: return PyLong_FromLongLong(*(int64 *)ptr);
+    case HI32: return PyLong_FromLong(*(int *)ptr);
+    case HUI16: return PyLong_FromUnsignedLong(*(unsigned short *)ptr);
+    case HUI8: return PyLong_FromUnsignedLong(*(unsigned char *)ptr);
+    case HBOOL: return PyBool_FromLong(*(bool *)ptr);
+    case HF32: return PyFloat_FromDouble(*(float *)ptr);
+    case HF64: return PyFloat_FromDouble(*(double *)ptr);
+    case HPACKED:
+    case HGUID:
+    case HMETHOD:
+        PyErr_Format(PyExc_TypeError, "HL %s has no supported Python value representation.", kind2str(type->kind));
+        return NULL;
+    default: break;
     }
-    case HVIRTUAL:
-    {
-        void *obj_ptr = *(void **)ptr;
-        if (obj_ptr == NULL)
-        {
-            Py_RETURN_NONE;
-        }
-        return hlmod_py_make_hlvirtual(obj_ptr, type);
+    if (!hl_is_ptr(type)) {
+        PyErr_Format(PyExc_TypeError, "Unsupported HL type %s.", kind2str(type->kind));
+        return NULL;
     }
-    case HNULL:
-    {
-        void *nullable_ptr = *(void **)ptr;
-        if (nullable_ptr == NULL)
-        {
-            Py_RETURN_NONE;
-        }
-        if (hl_is_ptr(type->tparam))
-        {
-            return hlmod_cast_to_py(type->tparam, &nullable_ptr);
-        }
-        else
-        {
-            vdynamic *dyn = (vdynamic *)nullable_ptr;
-            return hlmod_cast_to_py(type->tparam, &dyn->v);
-        }
-    }
-    case HARRAY:
-    {
-        varray *arr = *(varray **)ptr;
-        if (arr == NULL)
-        {
-            Py_RETURN_NONE;
-        }
-
-        PyObject *py_list = PyList_New(arr->size);
-        if (!py_list)
+    void *value = *(void **)ptr;
+    if (!value) Py_RETURN_NONE;
+    if (type->kind == HDYN || type->kind == HNULL) {
+        if (type->kind == HNULL && (!type->tparam || type->tparam->kind == HSTRUCT)) {
+            PyErr_SetString(PyExc_TypeError, "Nullable struct representation is unsupported.");
             return NULL;
-
-        hl_type *element_type = arr->at;
-        void *data_ptr = hl_aptr(arr, void);
-        int element_size = hl_type_size(element_type);
-
-        for (int i = 0; i < arr->size; i++)
-        {
-            void *element_ptr = (char *)data_ptr + i * element_size;
-            PyObject *py_item = hlmod_cast_to_py(element_type, element_ptr);
-            if (!py_item)
-            {
-                Py_DECREF(py_list);
-                return NULL;
-            }
-            if (PyList_SetItem(py_list, i, py_item) != 0)
-            {
-                Py_DECREF(py_item);
-                Py_DECREF(py_list);
-                return NULL;
-            }
         }
-        return py_list;
-    }
-    case HDYN:
-    {
-        vdynamic *dyn = *(vdynamic **)ptr;
-        if (dyn == NULL)
-        {
-            Py_RETURN_NONE;
+        vdynamic *dyn = value;
+        if (!dyn->t || dyn->t->kind == HDYN || dyn->t->kind == HNULL) {
+            PyErr_SetString(PyExc_TypeError, "Invalid Dynamic runtime type.");
+            return NULL;
         }
-        // printf("unwrapping dyn with type ");
-        // printf("%s...\n", kind2str(dyn->t->kind));
-        if (dyn->t->kind == HFUN)
-        {
-            // Function values carried in Dynamic are already closure objects,
-            // not boxed payloads in `dyn->v`.
-            return hlmod_cast_to_py(dyn->t, &dyn);
+        return hlmod_cast_to_py(dyn->t, hl_is_dynamic(dyn->t) ? (void *)&value : (void *)&dyn->v);
+    }
+    if (hl_is_dynamic(type)) type = ((vdynamic *)value)->t;
+    if (type->kind == HOBJ) {
+        PyObject *owned = hlmod_python_proxy(value);
+        if (owned || PyErr_Occurred()) return owned;
+        if (type->obj && type->obj->name && uchar_eq(type->obj->name, u"String")) {
+            vstring *string = value;
+            int byteorder = -1;
+            return PyUnicode_DecodeUTF16((const char *)string->bytes, (Py_ssize_t)string->length * sizeof(uchar), "strict", &byteorder);
         }
-        return hlmod_cast_to_py(dyn->t, &dyn->v);
+        PyObject *py_class = hlmod_python_type(type);
+        int index = hlmod_type_index(type);
+        if (!py_class && index >= 0 && index < g_hlobjs_l) py_class = g_hlobjs[index];
+        if (py_class) return hlmod_wrap_pointer(NULL, value, type, py_class);
+    } else if (type->kind == HVIRTUAL) {
+        return hlmod_py_make_hlvirtual(value, type);
+    } else if (type->kind == HFUN) {
+        return hlmod_py_make_hlcallable(value);
+    } else if (type->kind == HARRAY) {
+        return hlmod_wrap_pointer("HlArray", value, type, NULL);
     }
-    case HFUN:
-    {
-        // Function values are stored in pointer slots, so `ptr` points to a
-        // `vclosure*`, not the closure object itself.
-        vclosure *cl = *(vclosure **)ptr;
-        return hlmod_py_make_hlcallable(cl);
-    }
-    default:
-#       ifdef HLMOD_DEBUG
-        printf("[hlmod] [DEBUG] Falling through with %s\n", kind2str(type->kind));
-#       endif
-        break;
-    }
-
-    if (hl_is_ptr(type))
-    {
-        void *obj_ptr = *(void **)ptr;
-        if (obj_ptr == NULL)
-        {
-            Py_RETURN_NONE;
-        }
-        return HlPtr_New(obj_ptr, type->kind);
-    }
-
-    fprintf(stderr, "[hlmod] [ERROR] [hl->py] Something goofed!\n");
-    Py_RETURN_NONE;
+    return hlmod_ptr_new(value, type);
 }
 
 void *hlmod_cast_to_hl(PyObject *obj, hl_type *type)
 {
-    if (type == NULL)
-    {
-        fprintf(stderr, "[hlmod] [ERROR] [py->hl] Received NULL type.\n");
+    hlmod_python_retain();
+    if (!type) {
+        PyErr_SetString(PyExc_ValueError, "Missing HL type.");
         return NULL;
     }
-
-    if (type->kind == HDYN)
-    {
-        if (obj == Py_None) {
-            void **ret_ptr = (void **)hl_gc_alloc_raw(sizeof(void *));
-            *ret_ptr = NULL;
-            return ret_ptr;
+    if (type->kind == HVOID || type->kind == HPACKED || type->kind == HGUID || type->kind == HMETHOD) {
+        PyErr_Format(PyExc_TypeError, "HL %s has no supported Python value representation.", kind2str(type->kind));
+        return NULL;
+    }
+    if (obj == Py_None) {
+        if (hl_is_ptr(type)) return hlmod_pointer_slot(NULL);
+        PyErr_SetString(PyExc_TypeError, "None cannot represent an HL scalar.");
+        return NULL;
+    }
+    if (type->kind == HNULL) {
+        if (!type->tparam || type->tparam->kind == HSTRUCT) {
+            PyErr_SetString(PyExc_TypeError, "Nullable struct representation is unsupported.");
+            return NULL;
         }
-
-        hl_type *inner_type = NULL;
-        if (PyBool_Check(obj)) {
-            inner_type = &hlt_bool;
-        } else if (PyLong_Check(obj)) {
-            inner_type = &hlt_i32; // HACK: safe guess for types with overlap is to just take the most common. if someone decides to use a `hl.I64`, then this will die!
-        } else if (PyFloat_Check(obj)) {
-            inner_type = &hlt_f64;
-        } else if (PyUnicode_Check(obj)) {
-            // HACK: is this fucked? should this be different? or even cached? yes! does it work? also yes!
-            for (int i = 0; i < g_code->ntypes; i++) {
-                hl_type *t = &g_code->types[i];
-                if (t->kind == HOBJ && t->obj->name && uchar_eq(t->obj->name, u"String")) {
-                    inner_type = t;
+        void *inner = hlmod_cast_to_hl(obj, type->tparam);
+        if (!inner) return NULL;
+        return hlmod_pointer_slot(hl_make_dyn(inner, type->tparam));
+    }
+    if (type->kind == HDYN) {
+        hl_type *inner = NULL;
+        if (PyBool_Check(obj)) inner = &hlt_bool;
+        else if (PyLong_Check(obj)) {
+            long long value = PyLong_AsLongLong(obj);
+            if (PyErr_Occurred()) return NULL;
+            inner = value >= INT32_MIN && value <= INT32_MAX ? &hlt_i32 : &hlt_i64;
+        } else if (PyFloat_Check(obj)) inner = &hlt_f64;
+        else if (PyUnicode_Check(obj)) {
+            if (g_code) for (int i = 0; i < g_code->ntypes; i++) {
+                hl_type *candidate = &g_code->types[i];
+                if (candidate->kind == HOBJ && candidate->obj && candidate->obj->name && uchar_eq(candidate->obj->name, u"String")) {
+                    inner = candidate;
                     break;
                 }
             }
-        } else if (hlmod_py_is_hlobject(obj)) {
-            inner_type = hlmod_py_find_hlobject(obj);
-        } else if (g_hlcallable_class != NULL && PyObject_IsInstance(obj, g_hlcallable_class))
-        {
-            PyObject *py_hlptr = PyObject_GetAttrString(obj, "_hlmod_ptr");
-            if (py_hlptr == NULL || !Py_IS_TYPE(py_hlptr, &HlPtrType)) {
-                PyErr_SetString(PyExc_TypeError, "HlCallable must have a valid _hlmod_ptr attribute.");
-                if (py_hlptr) Py_DECREF(py_hlptr);
+            if (!inner) {
+                PyErr_SetString(PyExc_TypeError, "The bytecode has no String type.");
                 return NULL;
             }
-
-            vclosure* cl = (vclosure*)((HlPtr*)py_hlptr)->ptr;
-            Py_DECREF(py_hlptr);
-
-            if (cl == NULL) {
-                PyErr_SetString(PyExc_ValueError, "HlCallable's _hlmod_ptr contains a null Haxe closure.");
-                return NULL;
-            }
-
-            inner_type = cl->t;
-        } else if (PyObject_IsInstance(obj, (PyObject *)&HlPtrType)) {
-            PyErr_Format(PyExc_TypeError, "HlPtr is an ambiguous type and cannot be directly cast back to a Dynamic, which is what you're trying to do. Try wrapping this HlPtr in another type from `modcore.hlobj` to get it to cast cleanly. If you're confused as to why you're getting a HlPtr where you definitely shouldn't, then you should open an issue on Github.");
-            return NULL;
-        }
-        // TODO: more types back and forth in a HDYN
-            
-        if (inner_type == NULL) {
-            PyErr_Format(PyExc_TypeError, "Cannot wrap ambiguous type '%s' back into a Dynamic. Whoops!", Py_TYPE(obj)->tp_name);
-            return NULL;
-        }
-
-        void *inner_hl_val_ptr = hlmod_cast_to_hl(obj, inner_type);
-        if (inner_hl_val_ptr == NULL) {
-            return NULL;
-        }
-
-        if (hl_is_dynamic(inner_type)) {
-            return inner_hl_val_ptr;
-        }
-
-        vdynamic *dyn_box = hl_alloc_dynamic(inner_type);
-        if (dyn_box == NULL) {
-            PyErr_SetString(PyExc_MemoryError, "Failed to allocate vdynamic for re-wrapping.");
-            return NULL;
-        }
-
-        memcpy(&dyn_box->v, inner_hl_val_ptr, hl_type_size(inner_type));
-        void **ret_ptr = (void **)hl_gc_alloc_raw(sizeof(void *));
-        *ret_ptr = dyn_box;
-        return ret_ptr;
-    }
-
-    if (type->kind == HNULL)
-    {
-        if (obj == Py_None)
-        {
-            void **ret_ptr = (void **)hl_gc_alloc_raw(sizeof(void *));
-            *ret_ptr = NULL;
-            return ret_ptr;
-        }
-
-        hl_type* inner_type = type->tparam;
-        if (hl_is_ptr(inner_type)) {
-            return hlmod_cast_to_hl(obj, inner_type);
         } else {
-            vdynamic* box = hl_alloc_dynamic(inner_type);
-            void* inner_val_ptr = hlmod_cast_to_hl(obj, inner_type);
-            if (!inner_val_ptr) return NULL;
-
-            memcpy(&box->v, inner_val_ptr, hl_type_size(inner_type));
-
-            void** ret_ptr = (void**)hl_gc_alloc_raw(sizeof(void*));
-            *ret_ptr = box;
-            return ret_ptr;
-        }
-    }
-
-    if (type->kind == HARRAY)
-    {
-        if (!PyList_Check(obj))
-        {
-            PyErr_Format(PyExc_TypeError, "Expected a list for HARRAY, but got %s", Py_TYPE(obj)->tp_name);
-            return NULL;
-        }
-
-        Py_ssize_t size = PyList_Size(obj);
-        hl_type *element_type = type->tparam;
-        varray *arr = hl_alloc_array(element_type, (int)size);
-
-        void *data_ptr = hl_aptr(arr, void);
-        int element_size = hl_type_size(element_type);
-
-        for (Py_ssize_t i = 0; i < size; i++)
-        {
-            PyObject *py_item = PyList_GetItem(obj, i);
-            void *hl_item_ptr = hlmod_cast_to_hl(py_item, element_type);
-            if (!hl_item_ptr)
-            {
+            HlPtr *pointer = hlmod_extract_pointer(obj);
+            if (!pointer) {
+                if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
+                    PyErr_Clear();
+                    PyErr_SetString(PyExc_TypeError, "Dynamic needs a scalar or typed native value; callbacks require an explicit signature.");
+                }
                 return NULL;
             }
-
-            void *dest_ptr = (char *)data_ptr + i * element_size;
-            if (hl_is_ptr(element_type))
-            {
-                *(void **)dest_ptr = *(void **)hl_item_ptr;
-            }
-            else
-            {
-                memcpy(dest_ptr, hl_item_ptr, element_size);
-            }
+            inner = pointer->type;
+            Py_DECREF(pointer);
         }
-
-        void **ret_ptr = (void **)hl_gc_alloc_raw(sizeof(void *));
-        *ret_ptr = arr;
-        return ret_ptr;
+        if (inner->kind == HSTRUCT || inner->kind == HPACKED || inner->kind == HGUID || inner->kind == HMETHOD) {
+            PyErr_SetString(PyExc_TypeError, "This native type cannot safely be boxed as Dynamic.");
+            return NULL;
+        }
+        void *slot = hlmod_cast_to_hl(obj, inner);
+        if (!slot) return NULL;
+        return hlmod_pointer_slot(hl_make_dyn(slot, inner));
     }
-
-    if (obj == Py_None)
-    {
-        hl_null_access();
+    if (type->kind == HOBJ && type->obj && type->obj->name && uchar_eq(type->obj->name, u"String") && PyUnicode_Check(obj)) {
+        PyObject *encoded = PyUnicode_AsEncodedString(obj, "utf-16-le", "strict");
+        if (!encoded) return NULL;
+        Py_ssize_t size = PyBytes_GET_SIZE(encoded);
+        if (size > INT_MAX - (int)sizeof(uchar)) {
+            Py_DECREF(encoded);
+            PyErr_SetString(PyExc_OverflowError, "String exceeds the HL allocation limit.");
+            return NULL;
+        }
+        vstring *string = (vstring *)hl_alloc_obj(type);
+        uchar *bytes = hl_gc_alloc_noptr((int)size + sizeof(uchar));
+        memcpy(bytes, PyBytes_AS_STRING(encoded), size);
+        bytes[size / sizeof(uchar)] = 0;
+        string->bytes = bytes;
+        string->length = (int)(size / sizeof(uchar));
+        Py_DECREF(encoded);
+        return hlmod_pointer_slot(string);
+    }
+    if (!hl_is_ptr(type)) {
+        union { double d; float f; int64 i64; int i; unsigned short u16; unsigned char u8; bool b; } value;
+        switch (type->kind) {
+        case HF64:
+        case HF32: {
+            double number = PyFloat_AsDouble(obj);
+            if (PyErr_Occurred()) return NULL;
+            if (type->kind == HF32) {
+                if (isfinite(number) && fabs(number) > FLT_MAX) {
+                    PyErr_SetString(PyExc_OverflowError, "Value is outside the Float32 range.");
+                    return NULL;
+                }
+                value.f = (float)number;
+            } else value.d = number;
+            break;
+        }
+        case HBOOL:
+            if (!PyBool_Check(obj)) {
+                PyErr_SetString(PyExc_TypeError, "HL Bool requires a Python bool.");
+                return NULL;
+            }
+            value.b = obj == Py_True;
+            break;
+        case HI64:
+        case HI32:
+        case HUI16:
+        case HUI8: {
+            long long number = PyLong_AsLongLong(obj);
+            if (PyErr_Occurred()) return NULL;
+            long long low = type->kind == HI64 ? LLONG_MIN : type->kind == HI32 ? INT32_MIN : 0;
+            long long high = type->kind == HI64 ? LLONG_MAX : type->kind == HI32 ? INT32_MAX : type->kind == HUI16 ? UINT16_MAX : UINT8_MAX;
+            if (number < low || number > high) {
+                PyErr_Format(PyExc_OverflowError, "Value is outside the HL %s range.", kind2str(type->kind));
+                return NULL;
+            }
+            if (type->kind == HI64) value.i64 = number;
+            else if (type->kind == HI32) value.i = (int)number;
+            else if (type->kind == HUI16) value.u16 = (unsigned short)number;
+            else value.u8 = (unsigned char)number;
+            break;
+        }
+        default:
+            PyErr_Format(PyExc_TypeError, "Unsupported HL scalar %s.", kind2str(type->kind));
+            return NULL;
+        }
+        int size = hl_type_size(type);
+        void *slot = hl_gc_alloc_noptr(size);
+        memcpy(slot, &value, size);
+        return slot;
+    }
+    HlPtr *pointer = hlmod_extract_pointer(obj);
+    if (!pointer) {
+        if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
+            PyErr_Clear();
+            if (type->kind == HFUN && PyCallable_Check(obj)) {
+                void *callback = hlmod_python_callback(obj, type);
+                return callback ? hlmod_pointer_slot(callback) : NULL;
+            }
+            PyErr_Format(PyExc_TypeError, "Expected a typed native %s value, not %s.", kind2str(type->kind), Py_TYPE(obj)->tp_name);
+        }
         return NULL;
     }
-
-    if (type->kind == HOBJ && type->obj != NULL && type->obj->name != NULL && uchar_eq(type->obj->name, u"String"))
-    {
-        if (!PyUnicode_Check(obj))
-        {
-            PyErr_Format(PyExc_TypeError, "Expected a string for Haxe type String, but got %s", Py_TYPE(obj)->tp_name);
-            return NULL;
-        }
-
-        PyObject *utf16_bytes = PyUnicode_AsUTF16String(obj);
-        if (utf16_bytes == NULL)
-            return NULL;
-
-        const char *buffer = PyBytes_AsString(utf16_bytes);
-        Py_ssize_t size_in_bytes = PyBytes_Size(utf16_bytes);
-
-        const char *string_start = buffer;
-        Py_ssize_t string_size = size_in_bytes;
-
-        if (size_in_bytes >= 2 && (unsigned char)buffer[0] == 0xFF && (unsigned char)buffer[1] == 0xFE)
-        {
-            string_start += 2;
-            string_size -= 2;
-        }
-
-        if (string_size % 2 != 0)
-        {
-            fprintf(stderr, "[hlmod] [WARN] UTF-16 string conversion resulted in an odd number of bytes.\n");
-            string_size--;
-        }
-
-        vstring *s_data = (vstring *)hl_gc_alloc_raw(sizeof(vstring));
-        uchar *s_val = (uchar *)hl_gc_alloc_raw(string_size);
-        memcpy(s_val, string_start, string_size);
-
-        s_data->t = type;
-        s_data->bytes = s_val;
-        s_data->length = string_size / 2;
-
-        Py_DECREF(utf16_bytes);
-
-        void **ret_ptr = (void **)hl_gc_alloc_raw(sizeof(void *));
-        *ret_ptr = s_data;
-        return ret_ptr;
+    hl_type *actual = pointer->type;
+    void *value = pointer->ptr;
+    if (value && hl_is_dynamic(actual)) actual = ((vdynamic *)value)->t;
+    if (!hl_safe_cast(actual, type)) {
+        Py_DECREF(pointer);
+        PyErr_Format(PyExc_TypeError, "Native %s value is not assignable to requested %s type.", kind2str(actual->kind), kind2str(type->kind));
+        return NULL;
     }
+    void *slot = hlmod_pointer_slot(value);
+    Py_DECREF(pointer);
+    return slot;
+}
 
-    void *ptr = NULL;
+static varray *hlmod_array(HlPtr *pointer)
+{
+    varray *array = hlmod_require_pointer(pointer, HARRAY);
+    if (!array) return NULL;
+    if (!array->at || array->size < 0 || array->at->kind == HVOID ||
+        array->at->kind == HPACKED || array->at->kind == HGUID || array->at->kind == HMETHOD) {
+        PyErr_SetString(PyExc_TypeError, "Array element layout is unsupported.");
+        return NULL;
+    }
+    return array;
+}
 
-    switch (type->kind)
-    {
-    case HF64:
-    {
-        double val = PyFloat_AsDouble(obj);
-        if (PyErr_Occurred())
-            return NULL;
-        double *mem = (double *)hl_gc_alloc_noptr(sizeof(double));
-        *mem = val;
-        ptr = mem;
-        break;
+PyObject *hlmod_py_array_new(PyObject *self, PyObject *args)
+{
+    int type_index;
+    PyObject *values;
+    if (!PyArg_ParseTuple(args, "iO", &type_index, &values)) return NULL;
+    if (!g_code || type_index < 0 || type_index >= g_code->ntypes) {
+        PyErr_SetString(PyExc_IndexError, "Array element type index is out of bounds.");
+        return NULL;
     }
-    case HF32:
-    {
-        double val = PyFloat_AsDouble(obj);
-        if (PyErr_Occurred())
-            return NULL;
-        float *mem = (float *)hl_gc_alloc_noptr(sizeof(float));
-        *mem = (float)val;
-        ptr = mem;
-        break;
+    hl_type *element = &g_code->types[type_index];
+    if (element->kind == HVOID || element->kind == HPACKED || element->kind == HGUID || element->kind == HMETHOD) {
+        PyErr_SetString(PyExc_TypeError, "Array element layout is unsupported.");
+        return NULL;
     }
-    case HI32:
-    {
-        long val = PyLong_AsLong(obj);
-        if (PyErr_Occurred())
-            return NULL;
-        int *mem = (int *)hl_gc_alloc_noptr(sizeof(int));
-        *mem = (int)val;
-        ptr = mem;
-        break;
+    PyObject *sequence = PySequence_Fast(values, "Array values must be iterable.");
+    if (!sequence) return NULL;
+    Py_ssize_t size = PySequence_Fast_GET_SIZE(sequence);
+    int width = hl_type_size(element);
+    if (width <= 0 || size > (INT_MAX - (int)sizeof(varray)) / width) {
+        Py_DECREF(sequence);
+        PyErr_SetString(PyExc_OverflowError, "Array exceeds the HL allocation limit.");
+        return NULL;
     }
-    case HBOOL:
-    {
-        int val = PyObject_IsTrue(obj);
-        if (val == -1)
-            return NULL;
-        bool *mem = (bool *)hl_gc_alloc_noptr(sizeof(bool));
-        *mem = (bool)val;
-        ptr = mem;
-        break;
+    varray *array = hl_alloc_array(element, (int)size);
+    PyObject *pointer = hlmod_ptr_new(array, &hlt_array);
+    if (!pointer) { Py_DECREF(sequence); return NULL; }
+    for (Py_ssize_t i = 0; i < size; i++) {
+        PyObject *item = PySequence_GetItem(sequence, i);
+        void *slot = item ? hlmod_cast_to_hl(item, element) : NULL;
+        Py_XDECREF(item);
+        if (!slot) { Py_DECREF(pointer); Py_DECREF(sequence); return NULL; }
+        memcpy(hl_aptr(array, char) + i * width, slot, width);
     }
-    case HUI16:
-    {
-        unsigned long val = PyLong_AsUnsignedLong(obj);
-        if (PyErr_Occurred())
-            return NULL;
-        unsigned short *mem = (unsigned short *)hl_gc_alloc_noptr(sizeof(unsigned short));
-        *mem = (unsigned short)val;
-        ptr = mem;
-        break;
-    }
-    case HUI8:
-    {
-        unsigned long val = PyLong_AsUnsignedLong(obj);
-        if (PyErr_Occurred())
-            return NULL;
-        unsigned char *mem = (unsigned char *)hl_gc_alloc_noptr(sizeof(unsigned char));
-        *mem = (unsigned char)val;
-        ptr = mem;
-        break;
-    }
-    default:
-    {
-        void *inner_ptr = NULL;
+    Py_DECREF(sequence);
+    return pointer;
+}
 
-        if (PyObject_HasAttrString(obj, "_hlmod_ptr"))
-        {
-            PyObject *py_hlptr = PyObject_GetAttrString(obj, "_hlmod_ptr");
-            if (py_hlptr == NULL)
-                return NULL;
+PyObject *hlmod_py_array_length(PyObject *self, PyObject *args)
+{
+    HlPtr *pointer;
+    if (!PyArg_ParseTuple(args, "O!", &HlPtrType, &pointer)) return NULL;
+    varray *array = hlmod_array(pointer);
+    return array ? PyLong_FromLong(array->size) : NULL;
+}
 
-            if (Py_IS_TYPE(py_hlptr, &HlPtrType))
-            {
-                inner_ptr = ((HlPtr *)py_hlptr)->ptr;
-            }
-            else
-            {
-                PyErr_SetString(PyExc_TypeError, "Attribute '_hlmod_ptr' was not of type hlmod.HlPtr.");
-            }
-            Py_DECREF(py_hlptr);
-        }
-        else if (Py_IS_TYPE(obj, &HlPtrType))
-        {
-            inner_ptr = ((HlPtr *)obj)->ptr;
-        }
-        else if (PyLong_Check(obj))
-        {
-            inner_ptr = PyLong_AsVoidPtr(obj);
-        }
-
-        if (PyErr_Occurred())
-            return NULL;
-
-        if (inner_ptr == NULL)
-        {
-            PyErr_Format(PyExc_TypeError, "Expected a subclass of HlObject, an hlmod.HlPtr, or an int pointer, but got %s", Py_TYPE(obj)->tp_name);
-            return NULL;
-        }
-
-        void **outer_ptr = (void **)hl_gc_alloc_raw(sizeof(void *));
-        *outer_ptr = inner_ptr;
-        ptr = outer_ptr;
-        break;
+static void *hlmod_array_slot(varray *array, Py_ssize_t index)
+{
+    if (index < 0) index += array->size;
+    if (index < 0 || index >= array->size) {
+        PyErr_SetString(PyExc_IndexError, "Array index is out of bounds.");
+        return NULL;
     }
-    }
+    return hl_aptr(array, char) + index * hl_type_size(array->at);
+}
 
-    return ptr;
+PyObject *hlmod_py_array_get(PyObject *self, PyObject *args)
+{
+    HlPtr *pointer;
+    Py_ssize_t index;
+    if (!PyArg_ParseTuple(args, "O!n", &HlPtrType, &pointer, &index)) return NULL;
+    varray *array = hlmod_array(pointer);
+    if (!array) return NULL;
+    void *slot = hlmod_array_slot(array, index);
+    return slot ? hlmod_cast_to_py(array->at, slot) : NULL;
+}
+
+PyObject *hlmod_py_array_set(PyObject *self, PyObject *args)
+{
+    HlPtr *pointer;
+    Py_ssize_t index;
+    PyObject *value;
+    if (!PyArg_ParseTuple(args, "O!nO", &HlPtrType, &pointer, &index, &value)) return NULL;
+    varray *array = hlmod_array(pointer);
+    if (!array) return NULL;
+    void *slot = hlmod_array_slot(array, index);
+    if (!slot) return NULL;
+    void *converted = hlmod_cast_to_hl(value, array->at);
+    if (!converted) return NULL;
+    memcpy(slot, converted, hl_type_size(array->at));
+    Py_RETURN_NONE;
+}
+
+PyObject *hlmod_py_array_element_type(PyObject *self, PyObject *args)
+{
+    HlPtr *pointer;
+    if (!PyArg_ParseTuple(args, "O!", &HlPtrType, &pointer)) return NULL;
+    varray *array = hlmod_array(pointer);
+    if (!array) return NULL;
+    int index = hlmod_type_index(array->at);
+    if (index < 0) Py_RETURN_NONE;
+    return PyLong_FromLong(index);
 }
 
 #pragma region Field Access
@@ -989,17 +882,10 @@ PyObject *hlmod_py_get_obj_field(PyObject *self, PyObject *args)
         return NULL;
     }
 
-    vobj *obj = (vobj *)((HlPtr *)hlobj_ptr)->ptr;
-    if (obj == NULL)
-    {
-        PyErr_SetString(PyExc_ValueError, "Cannot get field from a null HlPtr.");
-        return NULL;
-    }
+    vobj *obj = hlmod_require_pointer((HlPtr *)hlobj_ptr, HOBJ);
+    if (!obj) return NULL;
 
     hl_runtime_obj *rt = hl_get_obj_rt(obj->t);
-    // printf("rt points to %p\n", rt);
-    // printf("t is %p\n", rt->t);
-    // printf("field indexes at %p\n", rt->fields_indexes);
 
     if (field_index < 0 || field_index >= rt->nfields)
     {
@@ -1032,12 +918,8 @@ PyObject *hlmod_py_set_obj_field(PyObject *self, PyObject *args)
         return NULL;
     }
 
-    vobj *obj = (vobj *)((HlPtr *)hlobj_ptr)->ptr;
-    if (obj == NULL)
-    {
-        PyErr_SetString(PyExc_ValueError, "Cannot set field on a null HlPtr.");
-        return NULL;
-    }
+    vobj *obj = hlmod_require_pointer((HlPtr *)hlobj_ptr, HOBJ);
+    if (!obj) return NULL;
 
     hl_runtime_obj *rt = hl_get_obj_rt(obj->t);
 
@@ -1058,31 +940,78 @@ PyObject *hlmod_py_set_obj_field(PyObject *self, PyObject *args)
 
     void *field_ptr = (char *)obj + field_offset;
     void *hl_value_ptr = hlmod_cast_to_hl(py_value, field_type);
-    if (hl_value_ptr == NULL && PyErr_Occurred())
+    if (hl_value_ptr == NULL)
     {
         return NULL;
     }
 
-    switch (field_type->kind)
-    {
-    case HI32:
-    case HUI16:
-    case HUI8:
-    case HBOOL:
-        *(int *)field_ptr = hl_value_ptr ? *(int *)hl_value_ptr : 0;
-        break;
-    case HF64:
-        *(double *)field_ptr = hl_value_ptr ? *(double *)hl_value_ptr : 0.0;
-        break;
-    case HF32:
-        *(float *)field_ptr = hl_value_ptr ? *(float *)hl_value_ptr : 0.0f;
-        break;
-    default:
-        *(void **)field_ptr = hl_value_ptr ? *(void **)hl_value_ptr : NULL;
-        break;
-    }
+    memcpy(field_ptr, hl_value_ptr, hl_type_size(field_type));
 
     Py_RETURN_NONE;
+}
+
+static hl_type *hlmod_virtual_callable_type(hl_type *type)
+{
+    if (type->kind == HFUN) return type;
+    for (HlMethodSignature *item = g_method_signatures; item; item = item->next)
+        if (item->method == type) return &item->callable;
+    if (!g_code) {
+        PyErr_SetString(PyExc_RuntimeError, "hlmod type metadata is unavailable.");
+        return NULL;
+    }
+    /* HMETHOD already excludes its receiver, but is not a closure value type.
+       Keep its HFUN view alive as long as bytecode, including escaped callbacks. */
+    HlMethodSignature *item = hl_malloc(&g_code->alloc, sizeof(*item));
+    item->method = type;
+    item->callable = *type;
+    item->callable.kind = HFUN;
+    item->next = g_method_signatures;
+    g_method_signatures = item;
+    return &item->callable;
+}
+
+static PyObject *hlmod_virtual_get_callable(vvirtual *virt, hl_obj_field *field)
+{
+    hl_type *signature = hlmod_virtual_callable_type(field->t);
+    if (!signature) return NULL;
+    hl_trap_ctx trap;
+    vdynamic *exception;
+    hl_trap(trap, exception, failed);
+    /* The runtime binds prototype code pointers to their backing receiver and
+       also handles mutable closure slots on objects and dynamic records. */
+    vdynamic *value = hl_dyn_getp((vdynamic *)virt, field->hashed_name, &hlt_dyn);
+    hl_endtrap(trap);
+    if (!value) Py_RETURN_NONE;
+    if (value->t->kind != HFUN || !hl_safe_cast(value->t, signature)) {
+        PyErr_SetString(PyExc_TypeError, "Virtual field does not contain a compatible callable.");
+        return NULL;
+    }
+    return hlmod_py_make_hlcallable((vclosure *)value);
+failed:
+    hl_endtrap(trap);
+    PyErr_Format(PyExc_TypeError, "Cannot read virtual callable: %s", hl_to_utf8(hl_to_string(exception)));
+    return NULL;
+}
+
+static PyObject *hlmod_virtual_set_callable(vvirtual *virt, hl_obj_field *field, PyObject *value)
+{
+    hl_type *signature = hlmod_virtual_callable_type(field->t);
+    if (!signature) return NULL;
+    void *slot = hlmod_cast_to_hl(value, signature);
+    if (!slot) return NULL;
+    hl_trap_ctx trap;
+    vdynamic *exception;
+    hl_trap(trap, exception, failed);
+    /* Never write to hl_vfields for methods: those entries can be code, not
+       storage. The runtime setter updates mutable backing fields/remaps views,
+       and rejects immutable prototype methods. */
+    hl_dyn_setp((vdynamic *)virt, field->hashed_name, signature, *(void **)slot);
+    hl_endtrap(trap);
+    Py_RETURN_NONE;
+failed:
+    hl_endtrap(trap);
+    PyErr_Format(PyExc_TypeError, "Cannot write virtual callable: %s", hl_to_utf8(hl_to_string(exception)));
+    return NULL;
 }
 
 PyObject *hlmod_py_get_virtual_field(PyObject *self, PyObject *args)
@@ -1095,12 +1024,8 @@ PyObject *hlmod_py_get_virtual_field(PyObject *self, PyObject *args)
         return NULL;
     }
 
-    vvirtual *virt = (vvirtual *)((HlPtr *)hlvirt_ptr)->ptr;
-    if (virt == NULL)
-    {
-        PyErr_SetString(PyExc_ValueError, "Cannot get field from a null HlPtr.");
-        return NULL;
-    }
+    vvirtual *virt = hlmod_require_pointer((HlPtr *)hlvirt_ptr, HVIRTUAL);
+    if (!virt) return NULL;
     if (virt->t == NULL || virt->t->kind != HVIRTUAL || virt->t->virt == NULL)
     {
         PyErr_SetString(PyExc_TypeError, "HlPtr does not point to a valid Haxe virtual object.");
@@ -1116,8 +1041,7 @@ PyObject *hlmod_py_get_virtual_field(PyObject *self, PyObject *args)
     hl_obj_field *field_info = &virt->t->virt->fields[field_index];
     if (field_info->t->kind == HFUN || field_info->t->kind == HMETHOD)
     {
-        PyErr_SetString(PyExc_TypeError, "Virtual function fields are not exposed to Python yet.");
-        return NULL;
+        return hlmod_virtual_get_callable(virt, field_info);
     }
 
     void *field_ptr = hl_vfields(virt)[field_index];
@@ -1140,12 +1064,8 @@ PyObject *hlmod_py_set_virtual_field(PyObject *self, PyObject *args)
         return NULL;
     }
 
-    vvirtual *virt = (vvirtual *)((HlPtr *)hlvirt_ptr)->ptr;
-    if (virt == NULL)
-    {
-        PyErr_SetString(PyExc_ValueError, "Cannot set field on a null HlPtr.");
-        return NULL;
-    }
+    vvirtual *virt = hlmod_require_pointer((HlPtr *)hlvirt_ptr, HVIRTUAL);
+    if (!virt) return NULL;
     if (virt->t == NULL || virt->t->kind != HVIRTUAL || virt->t->virt == NULL)
     {
         PyErr_SetString(PyExc_TypeError, "HlPtr does not point to a valid Haxe virtual object.");
@@ -1161,8 +1081,7 @@ PyObject *hlmod_py_set_virtual_field(PyObject *self, PyObject *args)
     hl_obj_field *field_info = &virt->t->virt->fields[field_index];
     if (field_info->t->kind == HFUN || field_info->t->kind == HMETHOD)
     {
-        PyErr_SetString(PyExc_TypeError, "Virtual function fields are not writable from Python.");
-        return NULL;
+        return hlmod_virtual_set_callable(virt, field_info, py_value);
     }
 
     void *field_ptr = hl_vfields(virt)[field_index];
@@ -1173,32 +1092,12 @@ PyObject *hlmod_py_set_virtual_field(PyObject *self, PyObject *args)
     }
 
     void *hl_value_ptr = hlmod_cast_to_hl(py_value, field_info->t);
-    if (hl_value_ptr == NULL && PyErr_Occurred())
+    if (hl_value_ptr == NULL)
     {
         return NULL;
     }
 
-    switch (field_info->t->kind)
-    {
-    case HI32:
-    case HUI16:
-    case HUI8:
-    case HBOOL:
-        *(int *)field_ptr = hl_value_ptr ? *(int *)hl_value_ptr : 0;
-        break;
-    case HI64:
-        *(int64 *)field_ptr = hl_value_ptr ? *(int64 *)hl_value_ptr : 0;
-        break;
-    case HF64:
-        *(double *)field_ptr = hl_value_ptr ? *(double *)hl_value_ptr : 0.0;
-        break;
-    case HF32:
-        *(float *)field_ptr = hl_value_ptr ? *(float *)hl_value_ptr : 0.0f;
-        break;
-    default:
-        *(void **)field_ptr = hl_value_ptr ? *(void **)hl_value_ptr : NULL;
-        break;
-    }
+    memcpy(field_ptr, hl_value_ptr, hl_type_size(field_info->t));
 
     Py_RETURN_NONE;
 }
@@ -1212,12 +1111,8 @@ PyObject *hlmod_py_get_virtual_field_count(PyObject *self, PyObject *args)
         return NULL;
     }
 
-    vvirtual *virt = (vvirtual *)((HlPtr *)hlvirt_ptr)->ptr;
-    if (virt == NULL)
-    {
-        PyErr_SetString(PyExc_ValueError, "Cannot inspect a null HlPtr.");
-        return NULL;
-    }
+    vvirtual *virt = hlmod_require_pointer((HlPtr *)hlvirt_ptr, HVIRTUAL);
+    if (!virt) return NULL;
     if (virt->t == NULL || virt->t->kind != HVIRTUAL || virt->t->virt == NULL)
     {
         PyErr_SetString(PyExc_TypeError, "HlPtr does not point to a valid Haxe virtual object.");
@@ -1237,12 +1132,8 @@ PyObject *hlmod_py_get_virtual_field_name(PyObject *self, PyObject *args)
         return NULL;
     }
 
-    vvirtual *virt = (vvirtual *)((HlPtr *)hlvirt_ptr)->ptr;
-    if (virt == NULL)
-    {
-        PyErr_SetString(PyExc_ValueError, "Cannot inspect a null HlPtr.");
-        return NULL;
-    }
+    vvirtual *virt = hlmod_require_pointer((HlPtr *)hlvirt_ptr, HVIRTUAL);
+    if (!virt) return NULL;
     if (virt->t == NULL || virt->t->kind != HVIRTUAL || virt->t->virt == NULL)
     {
         PyErr_SetString(PyExc_TypeError, "HlPtr does not point to a valid Haxe virtual object.");
@@ -1363,6 +1254,53 @@ PyObject *hlmod_py_get_global(PyObject* self, PyObject* args)
     Py_RETURN_NONE;
 }
 
+PyObject *hlmod_py_ensure_global(PyObject* self, PyObject* args)
+{
+    int type_index;
+
+    if (!PyArg_ParseTuple(args, "i", &type_index))
+    {
+        return NULL;
+    }
+
+    if (g_module == NULL || g_module->code == NULL)
+    {
+        PyErr_SetString(PyExc_RuntimeError, "hlmod is not initialized.");
+        return NULL;
+    }
+
+    if (type_index < 0 || type_index >= g_module->code->ntypes)
+    {
+        PyErr_Format(PyExc_IndexError, "Type index %d is out of bounds.", type_index);
+        return NULL;
+    }
+
+    hl_type *target_type = &g_module->code->types[type_index];
+    if ((target_type->kind == HOBJ || target_type->kind == HSTRUCT) &&
+        target_type->obj != NULL && target_type->obj->global_value != NULL &&
+        *(void **)target_type->obj->global_value != NULL)
+    {
+        return hlmod_cast_to_py(target_type, target_type->obj->global_value);
+    }
+
+    for (int i = 0; i < g_module->code->nglobals; i++)
+    {
+        hl_type *current_global_type = g_module->code->globals[i];
+
+        if (current_global_type == target_type || hl_same_type(current_global_type, target_type))
+        {
+            void *addr = g_module->globals_data + g_module->globals_indexes[i];
+            if ((target_type->kind == HOBJ || target_type->kind == HSTRUCT) &&
+                target_type->obj != NULL && *(void **)addr != NULL)
+            {
+                return hlmod_cast_to_py(target_type, addr);
+            }
+        }
+    }
+
+    Py_RETURN_NONE;
+}
+
 PyObject *hlmod_py_dump_stack(PyObject *self, PyObject *args)
 {
     if( hl_get_thread() != NULL ) {
@@ -1406,6 +1344,10 @@ PyObject *hlmod_py_findex_for_name(PyObject *self, PyObject *args)
     if (!PyArg_ParseTuple(args, "s", &name)) {
         return NULL;
     }
+    if (!g_code) {
+        PyErr_SetString(PyExc_RuntimeError, "hlmod is not initialized.");
+        return NULL;
+    }
 
     for (int i = 0; i < g_code->nfunctions; i++) {
         hl_function *f = &g_code->functions[i];
@@ -1435,83 +1377,14 @@ PyObject *hlmod_py_findex_for_name(PyObject *self, PyObject *args)
 PyObject *hlmod_py_call(PyObject *self, PyObject *args)
 {
     int findex;
-    PyObject *py_args_tuple;
-
-    if (!PyArg_ParseTuple(args, "iO!", &findex, &PyTuple_Type, &py_args_tuple))
-    {
-        PyErr_SetString(PyExc_TypeError, "Usage: call(findex: int, args: tuple)");
-        return NULL;
-    }
-
-    if (findex < 0 || findex >= g_module->code->nfunctions) {
-        PyErr_Format(PyExc_IndexError, "Function index %d is out of bounds.", findex);
-        return NULL;
-    }
-    hl_function *f = g_module->code->functions + g_module->functions_indexes[findex];
-    hl_type_fun *fun_type = f->type->fun;
-    int nargs = fun_type->nargs;
-
-    if (PyTuple_Size(py_args_tuple) != nargs)
-    {
-        PyErr_Format(PyExc_TypeError, "Haxe function f@%d expected %d arguments, but got %zd", findex, nargs, PyTuple_Size(py_args_tuple));
-        return NULL;
-    }
-
-    vdynamic *vargs[HL_MAX_ARGS];
-    if (nargs > HL_MAX_ARGS)
-    {
-        PyErr_SetString(PyExc_ValueError, "Cannot call Haxe function with more than HL_MAX_ARGS arguments.");
-        return NULL;
-    }
-
-    for (int i = 0; i < nargs; i++)
-    {
-        PyObject *py_arg = PyTuple_GetItem(py_args_tuple, i);
-        hl_type *hl_arg_type = fun_type->args[i];
-
-        void *hl_val_ptr = hlmod_cast_to_hl(py_arg, hl_arg_type);
-        if (hl_val_ptr == NULL)
-        {
-            return NULL;
-        }
-
-        vargs[i] = hl_make_dyn(hl_val_ptr, hl_arg_type);
-    }
-
-    vclosure cl;
-    cl.t = f->type;
-    cl.fun = g_module->functions_ptrs[findex];
-    cl.hasValue = 0;
-
-    bool is_exc;
-    vdynamic *hl_result = hl_dyn_call_safe(&cl, nargs > 0 ? vargs : NULL, nargs, &is_exc);
-
-    if (is_exc)
-    {
-        uchar *u_exc_str = hl_to_string(hl_result);
-        char *exc_str_utf8 = hl_to_utf8(u_exc_str);
-        PyErr_Format(PyExc_RuntimeError, "An exception occurred in the Haxe function f@%d: %s", findex, exc_str_utf8);
-        return NULL;
-    }
-
-    if (fun_type->ret->kind == HVOID)
-    {
-        Py_RETURN_NONE;
-    }
-
-    PyObject *py_result = NULL;
-    if (!hl_is_dynamic(fun_type->ret)) {
-        py_result = hlmod_cast_to_py(fun_type->ret, &hl_result->v);
-    } else {
-        py_result = hlmod_cast_to_py(fun_type->ret, &hl_result);
-    }
-    
-    if (py_result == NULL)
-    {
-        return NULL;
-    }
-
-    return py_result;
+    PyObject *arguments;
+    if (!PyArg_ParseTuple(args, "iO!", &findex, &PyTuple_Type, &arguments)) return NULL;
+    hl_type *type = hlmod_function_type(findex);
+    if (!type) return NULL;
+    vclosure closure = {0};
+    closure.t = type;
+    closure.fun = g_module->functions_ptrs[findex];
+    return hlmod_invoke(&closure, arguments, -1, findex);
 }
 
 #pragma endregion
@@ -1520,81 +1393,12 @@ PyObject *hlmod_py_call(PyObject *self, PyObject *args)
 
 PyObject *hlmod_py_call_closure(PyObject *self, PyObject *args)
 {
-    PyObject *py_closure;
-    PyObject *py_args_tuple;
-
-    if (!PyArg_ParseTuple(args, "O!O!", &HlPtrType, &py_closure, &PyTuple_Type, &py_args_tuple))
-    {
-        PyErr_SetString(PyExc_TypeError, "Usage: call_closure(vclosure: HlPtr, args: tuple)");
-        return NULL;
-    }
-
-    HlPtr *hlptr = (HlPtr *)py_closure;
-    if (hlptr->ptr == NULL)
-    {
-        PyErr_SetString(PyExc_ValueError, "call_closure() received a null closure pointer.");
-        return NULL;
-    }
-
-    vclosure *cl = (vclosure *)hlptr->ptr;
-    if (cl->t == NULL || cl->t->kind != HFUN)
-    {
-        PyErr_SetString(PyExc_TypeError, "call_closure() expected an HlPtr pointing to a Haxe closure.");
-        return NULL;
-    }
-
-    hl_type_fun *fun_type = cl->t->fun;
-    int nargs = fun_type->nargs;
-
-    if (PyTuple_Size(py_args_tuple) != nargs)
-    {
-        PyErr_Format(PyExc_TypeError, "Haxe closure expected %d arguments, but got %zd", nargs, PyTuple_Size(py_args_tuple));
-        return NULL;
-    }
-
-    if (nargs > HL_MAX_ARGS)
-    {
-        PyErr_SetString(PyExc_ValueError, "Cannot call Haxe closure with more than HL_MAX_ARGS arguments.");
-        return NULL;
-    }
-
-    vdynamic *vargs[HL_MAX_ARGS];
-    for (int i = 0; i < nargs; i++)
-    {
-        PyObject *py_arg = PyTuple_GetItem(py_args_tuple, i);
-        hl_type *hl_arg_type = fun_type->args[i];
-
-        void *hl_val_ptr = hlmod_cast_to_hl(py_arg, hl_arg_type);
-        if (hl_val_ptr == NULL)
-        {
-            return NULL;
-        }
-
-        vargs[i] = hl_make_dyn(hl_val_ptr, hl_arg_type);
-    }
-
-    bool is_exc;
-    vdynamic *hl_result = hl_dyn_call_safe(cl, nargs > 0 ? vargs : NULL, nargs, &is_exc);
-
-    if (is_exc)
-    {
-        uchar *u_exc_str = hl_to_string(hl_result);
-        char *exc_str_utf8 = hl_to_utf8(u_exc_str);
-        PyErr_Format(PyExc_RuntimeError, "An exception occurred in the Haxe closure: %s", exc_str_utf8);
-        return NULL;
-    }
-
-    if (fun_type->ret->kind == HVOID)
-    {
-        Py_RETURN_NONE;
-    }
-
-    if (!hl_is_dynamic(fun_type->ret))
-    {
-        return hlmod_cast_to_py(fun_type->ret, &hl_result->v);
-    }
-
-    return hlmod_cast_to_py(fun_type->ret, &hl_result);
+    HlPtr *pointer;
+    PyObject *arguments;
+    if (!PyArg_ParseTuple(args, "O!O!", &HlPtrType, &pointer, &PyTuple_Type, &arguments)) return NULL;
+    vclosure *closure = hlmod_require_pointer(pointer, HFUN);
+    if (!closure) return NULL;
+    return hlmod_invoke(closure, arguments, -1, -1);
 }
 
 
@@ -1616,124 +1420,78 @@ PyObject *hlmod_py_call_closure(PyObject *self, PyObject *args)
 
 int jit_dispatch_hook(int findex, int nargs, void **args)
 {
-    if (is_passthrough(findex)) {
-        return 0;
-    }
+    if (is_passthrough(findex)) return 0;
+    if (hlmod_python_dispatch(findex, nargs, args)) return 1;
 
+    /* Only the wait for the GIL is blocking: conversions allocate in the HL GC. */
+    hl_blocking(true);
+    PyGILState_STATE gstate = PyGILState_Ensure();
+    hl_blocking(false);
     HookRegistryEntry *entry;
     HASH_FIND_INT(g_hook_registry, &findex, entry);
-
-    if (entry == NULL)
-    {
-        return 0;
-    }
-
-    void** safe_args = NULL;
-    if (nargs > 0) {
-        safe_args = (void**)malloc(nargs * sizeof(void*));
-        if (safe_args == NULL) { PyErr_NoMemory(); PyErr_Print(); return 0; }
-        memcpy(safe_args, args, nargs * sizeof(void*));
-    }
-
-    g_return_value_int = 0;
-    g_return_value_double = 0.0;
-
-    hl_blocking(true);
-    PyGILState_STATE gstate;
-    gstate = PyGILState_Ensure();
-
-    hl_function *f = g_module->code->functions + g_module->functions_indexes[findex];
-    hl_type_fun *fun_type = f->type->fun;
-
-    PyObject *pArgs = PyTuple_New(nargs + 1); // for hook
-    if (!pArgs)
-    {
-        PyErr_Print();
+    if (!entry) {
         PyGILState_Release(gstate);
-        hl_blocking(false);
         return 0;
     }
-
-    HlHook *hook_obj = (HlHook *)HlHookType.tp_new(&HlHookType, NULL, NULL);
-    if (!hook_obj)
-    {
-        PyErr_Print();
-        Py_DECREF(pArgs);
-        PyGILState_Release(gstate);
-        hl_blocking(false);
-        return 0;
+    int64_t saved_int = g_return_value_int;
+    double saved_double = g_return_value_double;
+    int64_t result_int = 0;
+    double result_double = 0;
+    void *result_pointer = NULL;
+    bool pointer_rooted = false;
+    int handled = 0;
+    PyObject *callback = Py_NewRef(entry->callback);
+    PyObject *arguments = NULL, *result = NULL;
+    hl_type *type = hlmod_function_type(findex);
+    if (!type) goto done;
+    hl_type_fun *fun = type->fun;
+    if (nargs < 0 || nargs > HL_MAX_ARGS || nargs != fun->nargs || (nargs && !args)) {
+        PyErr_SetString(PyExc_ValueError, "Invalid JIT hook argument metadata.");
+        goto done;
     }
-    hook_obj->findex = findex;
-    PyTuple_SetItem(pArgs, 0, (PyObject *)hook_obj);
-
-    for (int i = 0; i < nargs; i++)
-    {
-        PyObject *pValue = hlmod_cast_to_py(fun_type->args[i], safe_args[i]);
-        if (pValue == NULL)
-        {
-            PyErr_Print();
-            Py_DECREF(pArgs);
-            PyGILState_Release(gstate);
-            hl_blocking(false);
-            return 0;
+    arguments = PyTuple_New(nargs + 1);
+    if (!arguments) goto done;
+    HlHook *hook = (HlHook *)HlHookType.tp_alloc(&HlHookType, 0);
+    if (!hook) goto done;
+    hook->findex = findex;
+    PyTuple_SET_ITEM(arguments, 0, (PyObject *)hook);
+    for (int i = 0; i < nargs; i++) {
+        PyObject *value = hlmod_cast_to_py(fun->args[i], args[i]);
+        if (!value) goto done;
+        PyTuple_SET_ITEM(arguments, i + 1, value);
+    }
+    result = PyObject_CallObject(callback, arguments);
+    if (!result) goto done;
+    if (fun->ret->kind != HVOID) {
+        void *slot = hlmod_cast_to_hl(result, fun->ret);
+        if (!slot) goto done;
+        switch (fun->ret->kind) {
+        case HF64: result_double = *(double *)slot; break;
+        case HF32: result_double = *(float *)slot; break;
+        case HI64: result_int = *(int64 *)slot; break;
+        case HI32: result_int = *(int *)slot; break;
+        case HUI16: result_int = *(unsigned short *)slot; break;
+        case HUI8: result_int = *(unsigned char *)slot; break;
+        case HBOOL: result_int = *(bool *)slot; break;
+        default:
+            result_pointer = *(void **)slot;
+            result_int = (int64_t)(intptr_t)result_pointer;
+            hl_add_root(&result_pointer);
+            pointer_rooted = true;
+            break;
         }
-
-        PyTuple_SetItem(pArgs, i + 1, pValue);
     }
-
-    PyObject *pResult = PyObject_CallObject(entry->callback, pArgs);
-    
-    if (safe_args != NULL) {
-        free(safe_args);
-    }
-
-    Py_DECREF(pArgs);
-
-    if (pResult == NULL)
-    {
-        PyErr_Print();
-
-        PyGILState_Release(gstate);
-        hl_blocking(false);
-        return 0;
-    }
-    else
-    {
-        int res = 1;
-        if (Py_IsNone(pResult) != 1)
-        {
-            if (f->type->fun->ret->kind == HF32 || f->type->fun->ret->kind == HF64)
-            {
-                g_return_value_double = PyFloat_AsDouble(pResult);
-                if (PyErr_Occurred())
-                {
-                    PyErr_Print();
-                }
-            }
-            else
-            {
-                void *hl_val = hlmod_cast_to_hl(pResult, fun_type->ret);
-                if (hl_val != NULL)
-                {
-                    if (hl_is_ptr(fun_type->ret))
-                    {
-                        // For pointer types, hl_val is a pointer to the pointer (e.g., vobj**)
-                        g_return_value_int = (int64_t)(*(void **)hl_val);
-                    }
-                    else
-                    {
-                        // For primitive types, hl_val is a pointer to the value itself (e.g., int*)
-                        g_return_value_int = (int64_t)hl_val;
-                    }
-                }
-            }
-            res = 1;
-        }
-        Py_DECREF(pResult);
-        PyGILState_Release(gstate);
-        hl_blocking(false);
-        return res;
-    }
+    handled = 1;
+done:
+    if (PyErr_Occurred()) PyErr_Print();
+    Py_XDECREF(result);
+    Py_XDECREF(arguments);
+    Py_DECREF(callback);
+    g_return_value_int = handled ? result_int : saved_int;
+    g_return_value_double = handled ? result_double : saved_double;
+    PyGILState_Release(gstate);
+    if (pointer_rooted) hl_remove_root(&result_pointer);
+    return handled;
 }
 
 const char *kind2str(hl_type_kind kind) {

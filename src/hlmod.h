@@ -15,6 +15,7 @@ typedef struct {
     PyObject_HEAD
     void* ptr;
     int kind;
+    hl_type *type; /* NULL for explicitly constructed, opaque raw pointers. */
     void **root;
 } HlPtr;
 
@@ -46,6 +47,7 @@ PyObject *hlmod_py_assert_code_sha(PyObject* self, PyObject* args);
 PyObject *hlmod_py_call(PyObject *self, PyObject *args);
 PyObject *hlmod_py_call_closure(PyObject *self, PyObject *args);
 PyObject *hlmod_py_get_global(PyObject* self, PyObject* args);
+PyObject *hlmod_py_ensure_global(PyObject* self, PyObject* args);
 PyObject *hlmod_py_dump_stack(PyObject *self, PyObject *args);
 PyObject *hlmod_py_findex_for_name(PyObject *self, PyObject *args);
 PyObject *hlmod_py_profile_start(PyObject *self, PyObject *args);
@@ -57,6 +59,13 @@ extern THREAD_LOCAL double g_return_value_double;
 int jit_dispatch_hook(int findex, int nargs, void** args);
 void* hlmod_cast_to_hl(PyObject* obj, hl_type* type);
 PyObject* hlmod_cast_to_py(hl_type* type, void* ptr);
+PyObject *hlmod_ptr_new(void *ptr, hl_type *type);
+void hlmod_shutdown(void);
+PyObject *hlmod_py_array_new(PyObject *self, PyObject *args);
+PyObject *hlmod_py_array_length(PyObject *self, PyObject *args);
+PyObject *hlmod_py_array_get(PyObject *self, PyObject *args);
+PyObject *hlmod_py_array_set(PyObject *self, PyObject *args);
+PyObject *hlmod_py_array_element_type(PyObject *self, PyObject *args);
 
 typedef struct HookRegistryEntry {
     int findex;

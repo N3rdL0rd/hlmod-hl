@@ -172,5 +172,10 @@ int hl_jit_function( jit_ctx *ctx, hl_module *m, hl_function *f );
 void *hl_jit_code( jit_ctx *ctx, hl_module *m, int *codesize, hl_debug_infos **debug, hl_module *previous );
 void hl_jit_patch_method( void *old_fun, void **new_fun_table );
 
+/* Foreign roots are marked after native reachability is observed. Callbacks run
+   with the world stopped: they must not allocate, acquire the GIL, or call HL. */
+HL_API void hl_gc_set_foreign_hooks(bool (*defer)(void **), void (*observe)(bool (*)(void *)), bool (*trace)(void **, bool (*)(void *)));
+void *hl_jit_python_adapter(hl_type *signature, void *context, bool closure, int *size);
+
       
 #endif // HLMODULE_H_
