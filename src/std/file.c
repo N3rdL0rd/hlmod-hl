@@ -99,7 +99,7 @@ HL_PRIM hl_fdesc *hl_file_open( vbyte *name, int mode, bool binary ) {
 
 HL_PRIM bool hl_file_is_locked( vbyte *name ) {
 #	ifdef HL_WIN
-	HANDLE h = CreateFile((uchar*)name,GENERIC_READ,0,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
+	HANDLE h = CreateFileW((uchar*)name,GENERIC_READ,0,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
 	if( h == INVALID_HANDLE_VALUE ) return true;
 	CloseHandle(h);
 	return false;

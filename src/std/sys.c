@@ -561,7 +561,7 @@ HL_PRIM vbyte *hl_sys_full_path( vbyte *path ) {
 	pchar out[MAX_PATH+1];
 	int len, i, last;
 	HANDLE handle;
-	WIN32_FIND_DATA data;
+	WIN32_FIND_DATAW data;
 	const char sep = '\\';
 	if( GetFullPathNameW((pchar*)path,MAX_PATH+1,out,NULL) == 0 )
 		return NULL;

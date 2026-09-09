@@ -48,6 +48,8 @@ struct _hl_tls {
 
 #elif defined(HL_WIN)
 
+#include <process.h> /* _beginthreadex */
+
 struct _hl_mutex {
 	void (*free)( hl_mutex * );
 	CRITICAL_SECTION cs;
