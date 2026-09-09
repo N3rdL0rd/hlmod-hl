@@ -229,6 +229,7 @@ if (WITH_VM)
         src/sha256.c
         ${HLMOD_EMBEDDED_HEADER}
         src/hlmod_python.c
+        src/native_hook.c
     )
 
 

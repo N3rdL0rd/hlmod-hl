@@ -26,6 +26,24 @@ typedef struct {
     int findex;
 } HlHook;
 
+/* Context bound into a generated native-hook landing stub (see
+ * hl_jit_native_hook_adapter / native_hook.c). `original` is a small
+ * executable trampoline holding a copy of the native's own overwritten
+ * prologue bytes plus a jump back past them, so it remains callable with the
+ * real platform ABI after the entry point has been redirected. */
+typedef struct {
+    int findex;
+    void *original;
+} HlmodNativeHookCtx;
+
+/* Generates a landing stub matching `signature`'s real platform calling
+ * convention. On entry it marshals the incoming call into hlmod's ordinary
+ * findex hook dispatch (jit_dispatch_hook); when no hook overrides the call,
+ * it invokes hookctx->original via HL's generic dynamic call so natives and
+ * bytecode functions share one hook composition model. Implemented in jit.c
+ * alongside hl_jit_python_adapter, which it closely mirrors. */
+void *hl_jit_native_hook_adapter(hl_type *signature, void *hookctx, int *size);
+
 EXPORT int64_t hlmod_get_return_int();
 EXPORT double hlmod_get_return_double();
 

@@ -2700,6 +2700,107 @@ void *hl_jit_python_adapter(hl_type *signature, void *context, bool closure, int
 	return code;
 }
 
+/* Native-hook dispatch: receives args captured the same way jit_python_call
+ * does (raw ABI regs/stack, generic across signatures), then reuses the
+ * exact hook dispatch already proven for bytecode functions (jit_hook_call /
+ * jit_dispatch_hook), so `register_hook`/`hook()` behave identically whether
+ * the target is a JIT-compiled function or a native. When no registered hook
+ * overrides the call, the real original is invoked through HL's generic
+ * dynamic call (hl_dyn_call_safe) via the resume trampoline saved at
+ * install time - see native_hook.c. */
+static vdynamic jit_native_hook_call(HlmodNativeHookCtx *hookctx, hl_type *signature, char *stack, void **regs) {
+	void *slots[HL_MAX_ARGS];
+	call_regs cregs = {0};
+	vdynamic result = {0};
+	int nargs = signature->fun->nargs;
+	int i;
+	if (nargs > HL_MAX_ARGS) hl_error("Too many arguments for native hook");
+	for(i=0;i<nargs;i++) {
+		hl_type *t = signature->fun->args[i];
+		int reg = select_call_reg(&cregs,t,i);
+		if( reg < 0 ) {
+			slots[i] = stack;
+			stack += stack_size(t);
+		} else if( REG_IS_FPU(reg) )
+			slots[i] = regs + CALL_NREGS + reg - XMM(0);
+		else
+			slots[i] = regs + call_reg_index(reg);
+	}
+	result.t = signature->fun->ret;
+	if( jit_dispatch_hook(hookctx->findex, nargs, slots) ) {
+		switch( result.t->kind ) {
+		case HF32: result.v.f = (float)g_return_value_double; break;
+		case HF64: result.v.d = g_return_value_double; break;
+		case HVOID: break;
+		default: result.v.i64 = g_return_value_int; break;
+		}
+		return result;
+	}
+	/* No hook overrode this call: fall through to the untouched original via
+	 * HL's generic dynamic dispatch, reusing the same mechanism hlmod's
+	 * Python-facing HlHook.call_original uses for bytecode functions. */
+	vdynamic *dargs[HL_MAX_ARGS];
+	for(i=0;i<nargs;i++) dargs[i] = hl_make_dyn(slots[i], signature->fun->args[i]);
+	vclosure closure = {0};
+	closure.t = signature;
+	closure.fun = hookctx->original;
+	bool exc = false;
+	vdynamic *ret = hl_dyn_call_safe(&closure, nargs ? dargs : NULL, nargs, &exc);
+	if( exc ) hl_rethrow(ret);
+	if( result.t->kind != HVOID && ret ) { result.t = ret->t; result.v = ret->v; }
+	return result;
+}
+
+static int64 jit_native_hook_int(void *c, hl_type *t, char *stack, void **regs) {
+	return jit_native_hook_call((HlmodNativeHookCtx*)c,t,stack,regs).v.i64;
+}
+
+static float jit_native_hook_float(void *c, hl_type *t, char *stack, void **regs) {
+	return jit_native_hook_call((HlmodNativeHookCtx*)c,t,stack,regs).v.f;
+}
+
+static double jit_native_hook_double(void *c, hl_type *t, char *stack, void **regs) {
+	return jit_native_hook_call((HlmodNativeHookCtx*)c,t,stack,regs).v.d;
+}
+
+void *hl_jit_native_hook_adapter(hl_type *signature, void *hookctx, int *codesize) {
+	jit_ctx *ctx = hl_jit_alloc();
+	preg p;
+	void *code;
+	int i, size;
+	if( !ctx ) return NULL;
+	ctx->m = g_module;
+	jit_buf(ctx);
+	op64(ctx,PUSH,PEBP,UNUSED);
+	op64(ctx,MOV,PEBP,PESP);
+#ifdef HL_64
+	op64(ctx,SUB,PESP,pconst(&p,CALL_NREGS*8));
+	for(i=0;i<CALL_NREGS;i++)
+		op64(ctx,MOVSD,pmem(&p,Esp,i*8),REG_AT(XMM(i)));
+	for(i=0;i<CALL_NREGS;i++)
+		op64(ctx,PUSH,REG_AT(CALL_REGS[CALL_NREGS-1-i]),UNUSED);
+#endif
+	size = begin_native_call(ctx,4);
+	op64(ctx,LEA,PEAX,pmem(&p,Ebp,-HL_WSIZE*CALL_NREGS*2));
+	set_native_arg(ctx,PEAX); // regs
+	op64(ctx,LEA,PEAX,pmem(&p,Ebp,HL_WSIZE*2+(IS_WINCALL64?32:0)));
+	set_native_arg(ctx,PEAX); // stack
+	op64(ctx,MOV,PEAX,pconst64(&p,(int_val)signature));
+	set_native_arg(ctx,PEAX); // signature
+	op64(ctx,MOV,PEAX,pconst64(&p,(int_val)hookctx));
+	set_native_arg(ctx,PEAX); // hookctx
+	call_native(ctx,signature->fun->ret->kind == HF32 ? (void*)jit_native_hook_float :
+		signature->fun->ret->kind == HF64 ? (void*)jit_native_hook_double : (void*)jit_native_hook_int, size);
+	op64(ctx,MOV,PESP,PEBP);
+	op64(ctx,POP,PEBP,UNUSED);
+	op64(ctx,RET,UNUSED,UNUSED);
+	*codesize = (BUF_POS()+4095)&~4095;
+	code = hl_alloc_executable_memory(*codesize);
+	if( code ) memcpy(code,ctx->startBuf,BUF_POS());
+	hl_jit_free(ctx,false);
+	return code;
+}
+
 #ifdef JIT_CUSTOM_LONGJUMP
 // Win64 debug CRT performs a Rtl stack check in debug mode, preventing from
 // using longjump. This in an alternate implementation that follows the native

@@ -31,6 +31,7 @@
 #include <hlmod_codegen.h>
 #include <hlmod_embedded.h>
 #include <hlmod_python.h>
+#include "native_hook.h"
 
 #ifndef HL_WIN
 #   include <unistd.h>
@@ -260,8 +261,9 @@ void hlmod_register_hook(int findex, PyObject* callback) {
         return;
     }
     int index = g_module->functions_indexes[findex];
-    if(index < 0 || index >= g_module->code->nfunctions) {
-        PyErr_SetString(PyExc_ValueError, "Only JIT functions can be hooked");
+    bool is_native = index >= g_module->code->nfunctions;
+    if(index < 0 || index >= g_module->code->nfunctions + g_module->code->nnatives) {
+        PyErr_SetString(PyExc_ValueError, "Unknown function index");
         return;
     }
     if(!PyCallable_Check(callback)) {
@@ -273,6 +275,10 @@ void hlmod_register_hook(int findex, PyObject* callback) {
         if(slot->callback != callback)
             PyErr_SetString(PyExc_ValueError, "Function already has a different hook callback");
         return;
+    }
+    if(is_native) {
+        hl_native *native = &g_module->code->natives[index - g_module->code->nfunctions];
+        if(hlmod_native_hook_ensure_installed(findex, native->t) != 0) return;
     }
     slot->callback = Py_NewRef(callback);
     hlmod_atomic_store_int(&slot->registered, 1);
@@ -357,6 +363,7 @@ static PyMethodDef HlmodMethods[] = {
     {"call_closure", hlmod_py_call_closure, METH_VARARGS, "Calls an HL closure by pointer."},
     {"dump_stack", hlmod_py_dump_stack, METH_NOARGS, "Dumps the current HL stack."},
     {"findex_for_name", hlmod_py_findex_for_name, METH_VARARGS, "Gets the findex for a specific function by its name"},
+    {"native_findex", hlmod_py_native_findex, METH_VARARGS, "Gets the findex of a @:hlNative function by its (lib, name)."},
     {"profile_start", hlmod_py_profile_start, METH_VARARGS, "Starts the HL sampling profiler at the given samples/sec (default 1000)."},
     {"profile_end", hlmod_py_profile_end, METH_NOARGS, "Stops the profiler and writes hlprofile.dump."},
     {NULL, NULL, 0, NULL}
