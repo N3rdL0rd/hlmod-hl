@@ -7,6 +7,14 @@
 
 #include <stdbool.h>
 
+/* Defines HL_WIN (and `uchar`) via platform detection - must come before any
+ * `#ifdef HL_WIN` below. Without this, a translation unit that includes
+ * platform.h before hl.h would see HL_WIN as undefined and silently take the
+ * non-Windows branch even when actually compiling for Windows: invisible on
+ * Linux (the non-Windows branch is correct there anyway) but a hard failure
+ * on Windows (missing unistd.h, wrong path/string macros). */
+#include <hl.h>
+
 #ifdef HL_WIN
 #   include <locale.h>
 #   include <direct.h>
@@ -16,6 +24,10 @@
 #   define pcompare wcscmp
 #   define ptoi(s)	wcstol(s,NULL,10)
 #   define PSTR(x) USTR(x)
+/* hl.h's own _GUID macro (a native type-signature string constant) collides
+ * textually with windows.h's `typedef struct _GUID { ... } GUID;` - the same
+ * workaround already used in gc.c/module.c/random.c/sys.c/native_hook.c. */
+#   undef _GUID
 #   include <windows.h>
 #   include <fcntl.h>
 #   include <stdio.h>
