@@ -253,7 +253,6 @@ if (WITH_VM)
     if(MSVC)
         target_link_libraries(native_hook_obj PRIVATE libhl Python::Python)
         target_include_directories(native_hook_obj PRIVATE ${Python_INCLUDE_DIRS} ${CMAKE_CURRENT_BINARY_DIR}/generated)
-        add_dependencies(native_hook_obj ${HLMOD_EMBEDDED_HEADER})
     endif()
 
 
