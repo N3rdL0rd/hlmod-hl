@@ -232,6 +232,18 @@ if (WITH_VM)
         src/native_hook.c
     )
 
+    if(MSVC)
+        # windows.h's structs (GUID, CONTEXT, ...) rely on MS-specific
+        # anonymous struct/union extensions that CMAKE_C_STANDARD 11's
+        # resulting /std:c11 disables in strict ISO C mode (unlike C++, where
+        # anonymous unions are standard - directx.cpp/dx12.cpp are unaffected).
+        # Only this file touches <windows.h> directly; drop the explicit
+        # standard just for it so MSVC falls back to its extension-permitting
+        # legacy C dialect. Confirmed via a standalone cl.exe repro: removing
+        # -std:c11 alone (keeping /permissive-) compiles cleanly.
+        set_source_files_properties(src/native_hook.c PROPERTIES C_STANDARD 90)
+    endif()
+
 
     if(APPLE)
         set_target_properties(hl PROPERTIES
