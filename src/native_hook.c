@@ -23,6 +23,7 @@
 
 #include "native_hook.h"
 #include <string.h>
+#include <stdint.h>
 
 #if defined(HL_WIN)
 /* hl.h's own _GUID macro (a native type-signature string constant) collides
@@ -71,10 +72,11 @@ static int modrm_len(const unsigned char *p) {
  * or 0 if the encoding is outside the narrow set this decoder recognizes.
  * Only common compiler-emitted prologue instructions are accepted; anything
  * else is treated as unrecognized rather than guessed at. */
-static int decode_one(const unsigned char *code, int *out_len, int *is_terminal) {
+static int decode_one(const unsigned char *code, int *out_len, int *is_terminal, bool *is_call_reloc) {
     int i = 0;
     int rex_w = 0;
     *is_terminal = 0;
+    *is_call_reloc = false;
 
     if (code[0] == 0xF3 && code[1] == 0x0F && code[2] == 0x1E && code[3] == 0xFA) {
         *out_len = 4; /* endbr64 */
@@ -112,7 +114,17 @@ static int decode_one(const unsigned char *code, int *out_len, int *is_terminal)
         *out_len = i + 3;
         *is_terminal = 1;
         return 1;
-    case 0xE8: case 0xE9:
+    /* `call rel32` always returns control to the very next byte, so unlike
+     * every other control-flow instruction here it's safe to keep decoding
+     * past it - but only after fixing up its displacement for its new
+     * address, since rel32 is relative to the instruction's own location.
+     * `jmp rel32` never returns, so it stays an unrelocated hard stop: its
+     * target is arbitrary and may not be the trampoline's own resume point. */
+    case 0xE8:
+        *out_len = i + 5;
+        *is_call_reloc = true;
+        return 1;
+    case 0xE9:
         *out_len = i + 5;
         *is_terminal = 1;
         return 1;
@@ -194,19 +206,36 @@ static int decode_one(const unsigned char *code, int *out_len, int *is_terminal)
     }
 }
 
+#define HLMOD_MAX_RELOCATIONS 4
+
 /* Walks instructions from `code` until at least `min_len` bytes have been
  * accounted for, refusing (returns -1) on any unrecognized encoding or any
- * control-flow instruction reached before that point. */
-static int safe_prologue_len(const unsigned char *code, int min_len) {
+ * unrelocatable control-flow instruction reached before that point.
+ * Records the offset of every `call rel32` found (it will need its
+ * displacement fixed up once copied to a new address) into `reloc_offsets`,
+ * up to `max_relocs` entries; refuses rather than silently dropping one if
+ * there are more than that. */
+static int safe_prologue_len_ex(const unsigned char *code, int min_len, int *reloc_offsets, int max_relocs, int *reloc_count) {
     int offset = 0;
+    *reloc_count = 0;
     while (offset < min_len) {
         int len = 0, terminal = 0;
-        if (!decode_one(code + offset, &len, &terminal) || len <= 0) return -1;
+        bool call_reloc = false;
+        if (!decode_one(code + offset, &len, &terminal, &call_reloc) || len <= 0) return -1;
         if (terminal) return -1;
+        if (call_reloc) {
+            if (*reloc_count >= max_relocs) return -1;
+            reloc_offsets[(*reloc_count)++] = offset;
+        }
         offset += len;
         if (offset > min_len + 16) return -1; /* runaway guard */
     }
     return offset;
+}
+
+static int safe_prologue_len(const unsigned char *code, int min_len) {
+    int reloc_offsets[HLMOD_MAX_RELOCATIONS], reloc_count = 0;
+    return safe_prologue_len_ex(code, min_len, reloc_offsets, HLMOD_MAX_RELOCATIONS, &reloc_count);
 }
 
 #define HLMOD_JUMP_SIZE 14
@@ -258,7 +287,8 @@ int hlmod_native_hook_ensure_installed(int findex, hl_type *signature) {
         PyErr_SetString(PyExc_RuntimeError, "This native has not been resolved yet");
         return -1;
     }
-    int safe_len = safe_prologue_len((const unsigned char *)target, HLMOD_JUMP_SIZE);
+    int reloc_offsets[HLMOD_MAX_RELOCATIONS], reloc_count = 0;
+    int safe_len = safe_prologue_len_ex((const unsigned char *)target, HLMOD_JUMP_SIZE, reloc_offsets, HLMOD_MAX_RELOCATIONS, &reloc_count);
     if (safe_len < 0) {
         const unsigned char *b = (const unsigned char *)target;
         PyErr_Format(PyExc_RuntimeError,
@@ -274,6 +304,24 @@ int hlmod_native_hook_ensure_installed(int findex, hl_type *signature) {
         return -1;
     }
     memcpy(resume, target, safe_len);
+    /* `call rel32`'s displacement is relative to its own address, which
+     * differs between `target` and `resume`; recompute it so the copied
+     * call still reaches the exact same absolute destination. */
+    for (int i = 0; i < reloc_count; i++) {
+        int off = reloc_offsets[i];
+        int32_t old_disp;
+        memcpy(&old_disp, (const unsigned char *)target + off + 1, 4);
+        intptr_t call_target = (intptr_t)((const unsigned char *)target + off + 5) + old_disp;
+        intptr_t new_disp_wide = call_target - (intptr_t)((unsigned char *)resume + off + 5);
+        if (new_disp_wide < INT32_MIN || new_disp_wide > INT32_MAX) {
+            hl_free_executable_memory(resume, safe_len + HLMOD_JUMP_SIZE);
+            PyErr_SetString(PyExc_RuntimeError,
+                "Cannot safely hook this native: a relocated call's target is out of 32-bit displacement range");
+            return -1;
+        }
+        int32_t new_disp = (int32_t)new_disp_wide;
+        memcpy((unsigned char *)resume + off + 1, &new_disp, 4);
+    }
     write_jump((unsigned char *)resume + safe_len, (unsigned char *)target + safe_len);
 
     HlmodNativeHookCtx *hookctx = malloc(sizeof(HlmodNativeHookCtx));
