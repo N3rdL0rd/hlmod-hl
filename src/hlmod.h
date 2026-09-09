@@ -77,6 +77,11 @@ PyObject *hlmod_py_ref_new(PyObject *self, PyObject *args);
 PyObject *hlmod_py_ref_get(PyObject *self, PyObject *args);
 PyObject *hlmod_py_ref_set(PyObject *self, PyObject *args);
 PyObject *hlmod_py_inspect_native(PyObject *self, PyObject *args);
+PyObject *hlmod_py_bytes_new(PyObject *self, PyObject *args);
+PyObject *hlmod_py_bytes_from(PyObject *self, PyObject *args);
+PyObject *hlmod_py_bytes_capacity(PyObject *self, PyObject *args);
+PyObject *hlmod_py_bytes_read(PyObject *self, PyObject *args);
+PyObject *hlmod_py_bytes_write(PyObject *self, PyObject *args);
 
 extern hl_module *g_module;
 extern hl_code *g_code;

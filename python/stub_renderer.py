@@ -11,7 +11,7 @@ import typing
 from pathlib import Path
 
 
-OBJ, STRUCT, VIRTUAL, FUN, METHOD = 11, 21, 15, 10, 20
+OBJ, STRUCT, VIRTUAL, FUN, METHOD, BYTES = 11, 21, 15, 10, 20, 8
 
 
 def escaped_identifier(name: str) -> str:
@@ -32,7 +32,7 @@ def identifier(name: str) -> str:
 
 
 GLOBAL_NAMES = frozenset(dir(builtins)) | {
-    "hlmod", "HlPtr", "HlObject", "HlVirtual", "HlArray", "HlEnum", "HlDynObject", "HlRef", "hltype", "hlfunction",
+    "hlmod", "HlPtr", "HlObject", "HlVirtual", "HlArray", "HlBytes", "HlEnum", "HlDynObject", "HlRef", "hltype", "hlfunction",
     "Any", "Callable", "ClassVar", "Never", "TYPE_CHECKING",
 }
 MEMBER_NAMES = {
@@ -108,7 +108,7 @@ class Renderer:
             raise ValueError("Typing overlay imports and types must be objects")
         exports = {f"{module}.{name}" for module, name in self.locations.values()}
         exports.update("hlobj." + name for name in (
-            "HlArray", "HlObject", "HlVirtual", "HlEnum", "HlDynObject", "HlRef", "HlCallable"))
+            "HlArray", "HlBytes", "HlObject", "HlVirtual", "HlEnum", "HlDynObject", "HlRef", "HlCallable"))
         exports.add("hlmod.HlPtr")
         exports.update("typing." + name for name in typing.__all__)
         reserved = GLOBAL_NAMES | {name for _, name in self.locations.values()}
@@ -120,7 +120,7 @@ class Renderer:
                 raise ValueError(f"Unknown overlay import: {source!r}")
         allowed_names = {"Any", "Callable", "Never", "int", "str", "float", "bool", "bytes",
                          "list", "dict", "tuple", "set", "frozenset", "object", "type",
-                         "HlArray", "HlEnum", "HlDynObject", "HlRef", "HlPtr", "HlObject", "HlVirtual"} | imports.keys()
+                         "HlArray", "HlBytes", "HlEnum", "HlDynObject", "HlRef", "HlPtr", "HlObject", "HlVirtual"} | imports.keys()
         self.overlay_names = allowed_names
         for native_name, patch in targets.items():
             t = self.named.get(native_name)
@@ -252,9 +252,12 @@ class Renderer:
             return "Any"
         kind = t["kind"]
         simple = {0: "None", 1: "int", 2: "int", 3: "int", 4: "int", 5: "float", 6: "float",
-                  7: "bool", 8: "HlPtr", 9: "Any", 12: "HlArray[Any]", 13: "HlPtr",
+                  7: "bool", 8: "HlBytes", 9: "Any", 12: "HlArray[Any]", 13: "HlPtr",
                   14: "HlRef[Any]", 16: "HlDynObject", 17: "HlPtr", 18: "HlEnum", 20: "Never",
                   21: "HlPtr", 22: "Never", 23: "Never"}
+        if kind == BYTES and argument:
+            # HL copies a Python buffer; HlBytes shares the native allocation.
+            return "HlBytes | bytes | bytearray | memoryview | None"
         if kind == STRUCT and argument:
             return "Never"
         if kind == 19:
@@ -460,7 +463,7 @@ class Renderer:
                       "from typing import Any, Callable, ClassVar, Never, TYPE_CHECKING",
                       "import hlmod", "from hlmod import HlPtr",
                       "import builtins as _hlmod_builtins",
-                      "from hlobj import HlArray, HlDynObject, HlEnum, HlRef, HlObject, HlVirtual, hltype, hlfunction", *sorted(imports), ""]
+                      "from hlobj import HlArray, HlBytes, HlDynObject, HlEnum, HlRef, HlObject, HlVirtual, hltype, hlfunction", *sorted(imports), ""]
             if used:
                 header.append("if TYPE_CHECKING:")
                 for dependency in sorted(used):

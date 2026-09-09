@@ -598,6 +598,8 @@ PyObject *hlmod_cast_to_py(hl_type *type, void *ptr)
         return hlmod_py_make_hlcallable(value);
     } else if (type->kind == HARRAY) {
         return hlmod_wrap_pointer("HlArray", value, type, NULL);
+    } else if (type->kind == HBYTES) {
+        return hlmod_wrap_pointer("HlBytes", value, type, NULL);
     } else if (type->kind == HENUM) {
         return hlmod_wrap_pointer("HlEnum", value, type, NULL);
     } else if (type->kind == HDYNOBJ) {
@@ -749,6 +751,17 @@ void *hlmod_cast_to_hl(PyObject *obj, hl_type *type)
     if (!pointer) {
         if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
             PyErr_Clear();
+            if (type->kind == HBYTES && PyObject_CheckBuffer(obj)) {
+                /* Bytes parameters receive a GC-owned copy: later Python edits
+                   are not visible to HL. Pass HlBytes to share storage. */
+                PyObject *arguments = Py_BuildValue("(O)", obj);
+                PyObject *copy = arguments ? hlmod_py_bytes_from(NULL, arguments) : NULL;
+                Py_XDECREF(arguments);
+                if (!copy) return NULL;
+                void *slot = hlmod_pointer_slot(((HlPtr *)copy)->ptr);
+                Py_DECREF(copy);
+                return slot;
+            }
             if (type->kind == HFUN && PyCallable_Check(obj)) {
                 void *callback = hlmod_python_callback(obj, type);
                 return callback ? hlmod_pointer_slot(callback) : NULL;
@@ -1693,6 +1706,101 @@ PyObject *hlmod_py_enum_new(PyObject *self, PyObject *args)
     }
     Py_DECREF(sequence);
     return pointer;
+}
+
+/* HL bytes carry no logical length. The GC block size is the only real bound,
+   so foreign (non-GC) buffers stay unreadable rather than guessed. */
+static vbyte *hlmod_bytes(HlPtr *pointer, int *capacity)
+{
+    vbyte *bytes = hlmod_require_pointer(pointer, HBYTES);
+    if (!bytes) return NULL;
+    int size = hl_is_gc_ptr(bytes) ? hl_gc_get_memsize(bytes) : -1;
+    if (size < 0) {
+        PyErr_SetString(PyExc_TypeError, "This bytes pointer has no known allocation size; "
+            "copy it with an explicit length from native code instead.");
+        return NULL;
+    }
+    *capacity = size;
+    return bytes;
+}
+
+static int hlmod_bytes_range(int capacity, Py_ssize_t offset, Py_ssize_t length)
+{
+    if (offset < 0 || length < 0 || offset > capacity || length > capacity - offset) {
+        PyErr_Format(PyExc_IndexError, "Bytes range [%zd, %zd) is outside the %d byte allocation.",
+            offset, offset + length, capacity);
+        return -1;
+    }
+    return 0;
+}
+
+PyObject *hlmod_py_bytes_new(PyObject *self, PyObject *args)
+{
+    Py_ssize_t size;
+    if (!PyArg_ParseTuple(args, "n:bytes_new", &size)) return NULL;
+    if (size < 0 || size > INT_MAX) {
+        PyErr_SetString(PyExc_ValueError, "Bytes size must fit in a positive HL allocation.");
+        return NULL;
+    }
+    vbyte *bytes = hl_gc_alloc_noptr((int)size ? (int)size : 1);
+    if (!bytes) return PyErr_NoMemory();
+    memset(bytes, 0, (size_t)((int)size ? size : 1));
+    return hlmod_ptr_new(bytes, &hlt_bytes);
+}
+
+PyObject *hlmod_py_bytes_from(PyObject *self, PyObject *args)
+{
+    Py_buffer view;
+    if (!PyArg_ParseTuple(args, "y*:bytes_from", &view)) return NULL;
+    if (view.len > INT_MAX) {
+        PyBuffer_Release(&view);
+        PyErr_SetString(PyExc_OverflowError, "Buffer exceeds the HL allocation limit.");
+        return NULL;
+    }
+    vbyte *bytes = hl_gc_alloc_noptr(view.len ? (int)view.len : 1);
+    PyObject *pointer = bytes ? hlmod_ptr_new(bytes, &hlt_bytes) : PyErr_NoMemory();
+    if (pointer) memcpy(bytes, view.buf, (size_t)view.len);
+    PyBuffer_Release(&view);
+    return pointer;
+}
+
+PyObject *hlmod_py_bytes_capacity(PyObject *self, PyObject *args)
+{
+    HlPtr *pointer;
+    if (!PyArg_ParseTuple(args, "O!:bytes_capacity", &HlPtrType, &pointer)) return NULL;
+    vbyte *bytes = hlmod_require_pointer(pointer, HBYTES);
+    if (!bytes) return NULL;
+    int size = hl_is_gc_ptr(bytes) ? hl_gc_get_memsize(bytes) : -1;
+    if (size < 0) Py_RETURN_NONE;
+    return PyLong_FromLong(size);
+}
+
+PyObject *hlmod_py_bytes_read(PyObject *self, PyObject *args)
+{
+    HlPtr *pointer;
+    Py_ssize_t offset, length;
+    if (!PyArg_ParseTuple(args, "O!nn:bytes_read", &HlPtrType, &pointer, &offset, &length)) return NULL;
+    int capacity;
+    vbyte *bytes = hlmod_bytes(pointer, &capacity);
+    if (!bytes || hlmod_bytes_range(capacity, offset, length) < 0) return NULL;
+    return PyBytes_FromStringAndSize((const char *)bytes + offset, length);
+}
+
+PyObject *hlmod_py_bytes_write(PyObject *self, PyObject *args)
+{
+    HlPtr *pointer;
+    Py_ssize_t offset;
+    Py_buffer view;
+    if (!PyArg_ParseTuple(args, "O!ny*:bytes_write", &HlPtrType, &pointer, &offset, &view)) return NULL;
+    int capacity;
+    vbyte *bytes = hlmod_bytes(pointer, &capacity);
+    if (!bytes || hlmod_bytes_range(capacity, offset, view.len) < 0) {
+        PyBuffer_Release(&view);
+        return NULL;
+    }
+    memcpy(bytes + offset, view.buf, (size_t)view.len);
+    PyBuffer_Release(&view);
+    Py_RETURN_NONE;
 }
 
 static int hlmod_field_hash(PyObject *key, int *hash)
