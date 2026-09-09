@@ -155,7 +155,25 @@ static LONG WINAPI unhandled_exception_filter(struct _EXCEPTION_POINTERS *Except
 }
 
 
+/* Diagnostic only: VEH fires at first-chance, *before* RtlDispatchException
+ * walks any frame's unwind data to search for a handler - unlike
+ * SetUnhandledExceptionFilter below, this always runs even if that search
+ * later dies with STATUS_BAD_FUNCTION_TABLE partway through, so it is the
+ * only place that can report what the *original* fault actually was in
+ * that case. Always returns CONTINUE_SEARCH: purely observational, changes
+ * no behavior. Remove once the real Windows native-hook unwind issue is
+ * root-caused. */
+static LONG WINAPI hlmod_diagnostic_veh(struct _EXCEPTION_POINTERS *info) {
+    fprintf(stderr, "HLMOD_DEBUG VEH: code=0x%08lX addr=%p rip=0x%llX\n",
+        info->ExceptionRecord->ExceptionCode,
+        info->ExceptionRecord->ExceptionAddress,
+        (unsigned long long)info->ContextRecord->Rip);
+    fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 void hlmod_setup_handler() {
+    AddVectoredExceptionHandler(1, hlmod_diagnostic_veh);
     SetUnhandledExceptionFilter(unhandled_exception_filter);
 }
 
