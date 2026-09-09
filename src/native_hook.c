@@ -277,6 +277,37 @@ static int patch_target(void *target, void *landing) {
 }
 #endif
 
+
+/* MSVC's `/INCREMENTAL` linking (the default for many Debug/RelWithDebInfo
+ * configs) gives every function its own 5-byte `jmp rel32` thunk in a
+ * dedicated table, so the address seen through a function pointer is the
+ * thunk, not the real function body - and the thunk itself is nothing but
+ * an unconditional jump, with no usable prologue at all. Also handles the
+ * `jmp qword ptr [rip+disp32]` form used by cross-DLL import thunks.
+ * Chases up to 8 hops (real chains are 1 deep; the bound only guards
+ * against a malformed/cyclic table) to reach the actual function to hook,
+ * so both thunk-mediated and any direct internal callers are intercepted. */
+static void *resolve_jmp_chain(void *addr) {
+    for (int hop = 0; hop < 8; hop++) {
+        const unsigned char *b = (const unsigned char *)addr;
+        if (b[0] == 0xE9) {
+            int32_t disp;
+            memcpy(&disp, b + 1, 4);
+            addr = (void *)(b + 5 + disp);
+            continue;
+        }
+        if (b[0] == 0xFF && b[1] == 0x25) {
+            int32_t disp;
+            memcpy(&disp, b + 2, 4);
+            void *const *slot = (void *const *)(b + 6 + disp);
+            addr = *slot;
+            continue;
+        }
+        break;
+    }
+    return addr;
+}
+
 int hlmod_native_hook_ensure_installed(int findex, hl_type *signature) {
     InstalledNativeHook *existing;
     HASH_FIND_INT(g_installed_native_hooks, &findex, existing);
@@ -287,6 +318,7 @@ int hlmod_native_hook_ensure_installed(int findex, hl_type *signature) {
         PyErr_SetString(PyExc_RuntimeError, "This native has not been resolved yet");
         return -1;
     }
+    target = resolve_jmp_chain(target);
     int reloc_offsets[HLMOD_MAX_RELOCATIONS], reloc_count = 0;
     int safe_len = safe_prologue_len_ex((const unsigned char *)target, HLMOD_JUMP_SIZE, reloc_offsets, HLMOD_MAX_RELOCATIONS, &reloc_count);
     if (safe_len < 0) {
