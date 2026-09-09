@@ -10,7 +10,15 @@
 #include <stdio.h>
 
 int pfiletime( pchar *file ) {
-#ifdef HL_WIN
+#ifdef HL_MINGW
+	/* Fedora/MSYS2's mingw-w64 msvcrt.a import library doesn't export
+	 * `_wstat32` under that exact name; `_wstat64i32` is the modern,
+	 * universally-available replacement with an identical field layout.
+	 * MSVC's own CRT already exports `_wstat32` fine. */
+	struct _stat64i32 st;
+	_wstat64i32(file,&st);
+	return (int)st.st_mtime;
+#elif defined(HL_WIN)
 	struct _stat32 st;
 	_wstat32(file,&st);
 	return (int)st.st_mtime;

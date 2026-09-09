@@ -55,10 +55,6 @@ if (MINGW)
     add_link_options(-municode)
 endif()
 
-if (MINGW)
-    add_compile_options(-municode)
-    add_link_options(-municode)
-endif()
 
 list(APPEND CMAKE_MODULE_PATH
     ${CMAKE_CURRENT_SOURCE_DIR}/other/cmake

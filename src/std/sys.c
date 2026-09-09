@@ -46,8 +46,20 @@
 #	define getcwd(buf,size) (void*)(int_val)GetCurrentDirectoryW(size,buf)
 #	define chdir	!SetCurrentDirectoryW
 #	define system	_wsystem
+#ifdef HL_MINGW
+/* Fedora/MSYS2's mingw-w64 msvcrt.a import library doesn't export
+ * `_wstat32`/`struct _stat32` under that exact name (only a MinGW "extra"
+ * compatibility object exports an unrelated, wrongly-decorated `wstat32`
+ * symbol) - link fails with "undefined reference to `__imp__wstat32'".
+ * `_wstat64i32`/`struct _stat64i32` is the modern, universally-available
+ * replacement with an identical field layout; MSVC's own CRT already
+ * exports `_wstat32` fine, so this is MinGW-only. */
+typedef struct _stat64i32 pstat;
+#	define stat		_wstat64i32
+#else
 typedef struct _stat32 pstat;
 #	define stat		_wstat32
+#endif
 #	define unlink	_wunlink
 #	define rename	_wrename
 #	define mkdir(path,mode)	_wmkdir(path)
