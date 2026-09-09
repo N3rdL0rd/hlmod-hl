@@ -241,6 +241,11 @@ if (WITH_VM)
         src/debugger.c
         src/profile.c
         src/hlmod.c
+        src/hlmod_ptr.c
+        src/hlmod_cast.c
+        src/hlmod_fields.c
+        src/hlmod_jit_hook.c
+        src/hlmod_api.c
         src/hlmod_codegen.c
         src/hlmod_crash.c
         src/cJSON.c
