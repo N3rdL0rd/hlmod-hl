@@ -364,6 +364,8 @@ static PyMethodDef HlmodMethods[] = {
     {"dump_stack", hlmod_py_dump_stack, METH_NOARGS, "Dumps the current HL stack."},
     {"findex_for_name", hlmod_py_findex_for_name, METH_VARARGS, "Gets the findex for a specific function by its name"},
     {"native_findex", hlmod_py_native_findex, METH_VARARGS, "Gets the findex of a @:hlNative function by its (lib, name)."},
+    {"native_hook_test_prologue", hlmod_py_native_hook_test_prologue, METH_VARARGS,
+        "Testing hook: decodes a raw prologue buffer with the native-hook engine's own instruction decoder."},
     {"profile_start", hlmod_py_profile_start, METH_VARARGS, "Starts the HL sampling profiler at the given samples/sec (default 1000)."},
     {"profile_end", hlmod_py_profile_end, METH_NOARGS, "Stops the profiler and writes hlprofile.dump."},
     {NULL, NULL, 0, NULL}

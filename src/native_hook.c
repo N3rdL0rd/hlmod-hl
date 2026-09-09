@@ -340,3 +340,27 @@ PyObject *hlmod_py_native_findex(PyObject *self, PyObject *args) {
     PyErr_Format(PyExc_KeyError, "No native \"%s@%s\" in the loaded bytecode", lib, name);
     return NULL;
 }
+
+/* Testing/debugging hook: runs the same prologue decoder used by
+ * `hlmod_native_hook_ensure_installed` over an arbitrary caller-supplied
+ * buffer, returning the decoded length or -1 if the buffer starts with an
+ * unrecognized or control-flow instruction. `buf` must contain at least
+ * `min_len + 16` trailing bytes so the decoder's own runaway guard can never
+ * read past the end of the buffer while decoding the instruction that
+ * crosses `min_len`. */
+PyObject *hlmod_py_native_hook_test_prologue(PyObject *self, PyObject *args) {
+    const char *buf;
+    Py_ssize_t buflen;
+    int min_len;
+    if (!PyArg_ParseTuple(args, "y#i", &buf, &buflen, &min_len)) return NULL;
+    if (min_len < 0 || (Py_ssize_t)min_len + 16 > buflen) {
+        PyErr_SetString(PyExc_ValueError, "buf must have at least min_len + 16 bytes");
+        return NULL;
+    }
+#if defined(HL_64) && !defined(HL_CONSOLE)
+    return PyLong_FromLong(safe_prologue_len((const unsigned char *)buf, min_len));
+#else
+    PyErr_SetString(PyExc_RuntimeError, "Native hook prologue decoding requires an x86-64 build of hlmod");
+    return NULL;
+#endif
+}

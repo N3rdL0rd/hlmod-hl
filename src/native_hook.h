@@ -14,5 +14,6 @@
 int hlmod_native_hook_ensure_installed(int findex, hl_type *signature);
 
 PyObject *hlmod_py_native_findex(PyObject *self, PyObject *args);
+PyObject *hlmod_py_native_hook_test_prologue(PyObject *self, PyObject *args);
 
 #endif // HLMOD_NATIVE_HOOK_H
