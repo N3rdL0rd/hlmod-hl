@@ -263,6 +263,24 @@ if (WITH_VM)
         target_include_directories(native_hook_obj PRIVATE ${Python_INCLUDE_DIRS} ${CMAKE_CURRENT_BINARY_DIR}/generated)
     endif()
 
+    if(MINGW)
+        # CMake's Windows-GNU platform rules unconditionally pass
+        # `-Wl,--out-implib,lib<target>.dll.a` for every linked binary, not
+        # just DLLs. `libhl`'s OUTPUT_NAME is "hl" (matching Linux's
+        # `libhl.so` convention - see set_target_properties(libhl ...)
+        # above), so its import library is `libhl.dll.a`; the `hl`
+        # executable target's own auto-generated import library would use
+        # the SAME name purely from sharing the target name "hl", and the
+        # link command reads the real `libhl.dll.a` as an input while
+        # simultaneously being told to overwrite it as output - a self
+        # collision that fails with an unexplained "final link failed".
+        # Give the executable's unwanted import library a distinct name;
+        # nothing links against hl.exe as a library. MSVC needs no
+        # equivalent fix: OUTPUT_NAME "libhl" there already differs from
+        # the executable target name "hl".
+        set_target_properties(hl PROPERTIES ARCHIVE_OUTPUT_NAME "hl_exe")
+    endif()
+
 
     if(APPLE)
         set_target_properties(hl PROPERTIES
