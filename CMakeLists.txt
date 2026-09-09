@@ -248,6 +248,13 @@ if (WITH_VM)
         ${HLMOD_EMBEDDED_HEADER}
         src/hlmod_python.c
         ${NATIVE_HOOK_SOURCE}
+        src/platform.c
+        src/bytecode_loader.c
+        src/game_profiles.c
+        src/hook_registry.c
+        src/mod_loader.c
+        src/console_proxy.c
+        src/py_module.c
     )
 
     if(MSVC)

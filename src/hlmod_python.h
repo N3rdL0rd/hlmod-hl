@@ -28,6 +28,8 @@ void hlmod_hook_registry_shutdown(void);
 bool hlmod_hook_registered(int findex);
 /* Returns an owned reference, or NULL without an exception. Requires the GIL. */
 PyObject *hlmod_hook_callback(int findex);
+PyObject *hlmod_py_unregister_hook(PyObject *self, PyObject *args);
+PyObject *hlmod_py_register_hook(PyObject *self, PyObject *args);
 /* Take/format Python error under GIL; throw only after cleanup and GIL release. */
 char *hlmod_python_take_error(void);
 void hlmod_python_throw_error(char *error);
