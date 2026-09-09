@@ -616,6 +616,19 @@ int wmain(int argc, pchar *argv[]) {
 #else
 int main(int argc, pchar *argv[]) {
 #endif
+#ifdef HL_WIN_DESKTOP
+	/* hl_sys_print's Windows path only transcodes UTF-16 -> console UTF-8
+	 * when print_flags includes PR_WIN_UTF8 (bit 0), which upstream
+	 * HashLink leaves off by default. Without it, every Sys.print/println
+	 * writes raw UTF-16LE bytes into a byte-mode stream (each ASCII
+	 * character followed by a stray NUL), which most terminals render as
+	 * if nothing were wrong but corrupts anything that captures stdout
+	 * verbatim (redirection, pipes, subprocess capture). Enable it here so
+	 * hlmod's own PR_AUTO_FLUSH default is preserved alongside a working
+	 * console encoding. */
+	extern int hl_sys_set_flags(int flags);
+	hl_sys_set_flags(1 /* PR_WIN_UTF8 */ | 2 /* PR_AUTO_FLUSH */);
+#endif
 	if (PyImport_AppendInittab("hlmod", PyInit_hlmod) == -1) {
         fprintf(stderr, "Fatal Error: Could not add 'hlmod' to the built-in module table\n");
         return 1;
