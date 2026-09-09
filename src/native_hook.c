@@ -25,6 +25,10 @@
 #include <string.h>
 
 #if defined(HL_WIN)
+/* hl.h's own _GUID macro (a native type-signature string constant) collides
+ * textually with windows.h's `typedef struct _GUID { ... } GUID;` - the same
+ * workaround already used in gc.c/module.c/random.c/sys.c. */
+#undef _GUID
 #include <windows.h>
 #else
 #include <sys/mman.h>
