@@ -147,7 +147,8 @@ static int decode_one(const unsigned char *code, int *out_len, int *is_terminal)
             *is_terminal = 1;
             return 1;
         }
-        if (op2 == 0x1F || op2 == 0xB6 || op2 == 0xB7 || op2 == 0xBE || op2 == 0xBF || op2 == 0xAF) {
+        if (op2 == 0x1F || op2 == 0xB6 || op2 == 0xB7 || op2 == 0xBE || op2 == 0xBF || op2 == 0xAF ||
+            op2 == 0x10 || op2 == 0x11 || op2 == 0x28 || op2 == 0x29 || op2 == 0x6F || op2 == 0x7F) {
             *out_len = i + 2 + modrm_len(code + i + 2);
             return 1;
         }
