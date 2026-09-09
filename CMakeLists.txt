@@ -215,6 +215,24 @@ if (WITH_VM)
         VERBATIM
     )
 
+    if(MSVC)
+        # windows.h's structs (GUID, CONTEXT, ...) rely on MS-specific
+        # anonymous struct/union extensions that CMAKE_C_STANDARD 11's
+        # resulting /std:c11 disables in strict ISO C mode (unlike C++, where
+        # anonymous unions are standard - directx.cpp/dx12.cpp are unaffected).
+        # Ninja/Makefiles only honor C_STANDARD at the target level, not per
+        # source file (that's an IDE-generator-only feature), so this file
+        # gets its own object library with a relaxed standard instead of a
+        # source-file property override. Confirmed via a standalone cl.exe
+        # repro: removing -std:c11 alone (keeping /permissive-) compiles
+        # cleanly.
+        add_library(native_hook_obj OBJECT src/native_hook.c)
+        set_target_properties(native_hook_obj PROPERTIES C_STANDARD 90 C_STANDARD_REQUIRED OFF)
+        set(NATIVE_HOOK_SOURCE $<TARGET_OBJECTS:native_hook_obj>)
+    else()
+        set(NATIVE_HOOK_SOURCE src/native_hook.c)
+    endif()
+
     add_executable(hl
         src/code.c
         src/jit.c
@@ -229,19 +247,13 @@ if (WITH_VM)
         src/sha256.c
         ${HLMOD_EMBEDDED_HEADER}
         src/hlmod_python.c
-        src/native_hook.c
+        ${NATIVE_HOOK_SOURCE}
     )
 
     if(MSVC)
-        # windows.h's structs (GUID, CONTEXT, ...) rely on MS-specific
-        # anonymous struct/union extensions that CMAKE_C_STANDARD 11's
-        # resulting /std:c11 disables in strict ISO C mode (unlike C++, where
-        # anonymous unions are standard - directx.cpp/dx12.cpp are unaffected).
-        # Only this file touches <windows.h> directly; drop the explicit
-        # standard just for it so MSVC falls back to its extension-permitting
-        # legacy C dialect. Confirmed via a standalone cl.exe repro: removing
-        # -std:c11 alone (keeping /permissive-) compiles cleanly.
-        set_source_files_properties(src/native_hook.c PROPERTIES C_STANDARD 90)
+        target_link_libraries(native_hook_obj PRIVATE libhl Python::Python)
+        target_include_directories(native_hook_obj PRIVATE ${Python_INCLUDE_DIRS} ${CMAKE_CURRENT_BINARY_DIR}/generated)
+        add_dependencies(native_hook_obj ${HLMOD_EMBEDDED_HEADER})
     endif()
 
 
