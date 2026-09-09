@@ -208,42 +208,88 @@ static bool check_reload( main_context *m ) {
 	return changed;
 }
 
-HookRegistryEntry* g_hook_registry = NULL;
+typedef struct {
+    int registered;
+    PyObject *callback; /* GIL protected; dispatch takes its own reference. */
+} HookSlot;
+
+static HookSlot *hook_slots;
+static int hook_slot_count;
+
+/* Init/dispose run outside the lifetime of native callers. Slots never move. */
+int hlmod_hook_registry_init(int count) {
+    if(hook_slots || count < 0) {
+        PyErr_SetString(PyExc_RuntimeError, "Invalid hook registry initialization");
+        return -1;
+    }
+    hook_slots = calloc(count ? count : 1, sizeof(*hook_slots));
+    if(!hook_slots) {
+        PyErr_NoMemory();
+        return -1;
+    }
+    hook_slot_count = count;
+    return 0;
+}
+
+bool hlmod_hook_registered(int findex) {
+    return findex >= 0 && findex < hook_slot_count &&
+        hlmod_atomic_load_int(&hook_slots[findex].registered) != 0;
+}
+
+PyObject *hlmod_hook_callback(int findex) {
+    if(findex < 0 || findex >= hook_slot_count) return NULL;
+    return Py_XNewRef(hook_slots[findex].callback);
+}
+
+void hlmod_hook_registry_shutdown(void) {
+    /* Unpublish all callbacks before decrefs can reenter the registry. */
+    int count = hook_slot_count;
+    hook_slot_count = 0;
+    for(int i = 0; i < count; i++) Py_CLEAR(hook_slots[i].callback);
+    free(hook_slots);
+    hook_slots = NULL;
+}
 
 void hlmod_register_hook(int findex, PyObject* callback) {
-    if (g_module == NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "HL module is not initialized");
+    if(g_module == NULL || !hook_slots) {
+        PyErr_SetString(PyExc_RuntimeError, "HL hook registry is not initialized");
         return;
     }
-    if (findex < 0 || findex >= g_module->code->nfunctions + g_module->code->nnatives) {
+    if(findex < 0 || findex >= hook_slot_count) {
         PyErr_SetString(PyExc_IndexError, "Function index is out of bounds");
         return;
     }
     int index = g_module->functions_indexes[findex];
-    if (index < 0 || index >= g_module->code->nfunctions) {
+    if(index < 0 || index >= g_module->code->nfunctions) {
         PyErr_SetString(PyExc_ValueError, "Only JIT functions can be hooked");
         return;
     }
-    if (!PyCallable_Check(callback)) {
+    if(!PyCallable_Check(callback)) {
         PyErr_SetString(PyExc_TypeError, "Hook callback must be callable");
         return;
     }
-    HookRegistryEntry* entry;
-    HASH_FIND_INT(g_hook_registry, &findex, entry);
-    PyObject *previous = NULL;
-    if (entry == NULL) {
-        entry = malloc(sizeof(*entry));
-        if (entry == NULL) {
-            PyErr_NoMemory();
-            return;
-        }
-        entry->findex = findex;
-        HASH_ADD_INT(g_hook_registry, findex, entry);
-    } else {
-        previous = entry->callback;
+    HookSlot *slot = &hook_slots[findex];
+    if(slot->callback) {
+        if(slot->callback != callback)
+            PyErr_SetString(PyExc_ValueError, "Function already has a different hook callback");
+        return;
     }
-    entry->callback = Py_NewRef(callback);
-    Py_XDECREF(previous);
+    slot->callback = Py_NewRef(callback);
+    hlmod_atomic_store_int(&slot->registered, 1);
+}
+
+static PyObject *hlmod_py_unregister_hook(PyObject *self, PyObject *args) {
+    int findex;
+    PyObject *callback = Py_None;
+    if(!PyArg_ParseTuple(args, "i|O:unregister_hook", &findex, &callback)) return NULL;
+    if(findex < 0 || findex >= hook_slot_count) Py_RETURN_FALSE;
+    HookSlot *slot = &hook_slots[findex];
+    if(!slot->callback || (callback != Py_None && callback != slot->callback)) Py_RETURN_FALSE;
+    /* Readers that already saw true recheck under the GIL, never dereference
+       a callback from the no-GIL path. In-flight calls own their callback. */
+    hlmod_atomic_store_int(&slot->registered, 0);
+    Py_CLEAR(slot->callback);
+    Py_RETURN_TRUE;
 }
 
 static PyObject* hlmod_py_register_hook(PyObject *self, PyObject *args) {
@@ -268,6 +314,7 @@ static PyObject* hlmod_py_register_hook(PyObject *self, PyObject *args) {
 
 static PyMethodDef HlmodMethods[] = {
     {"register_hook", hlmod_py_register_hook, METH_VARARGS, "Hooks a function by its findex."},
+    {"unregister_hook", hlmod_py_unregister_hook, METH_VARARGS, "Remove a hook, optionally only if its callback is identical."},
     {"register_hlobj", hlmod_py_register_hlobj, METH_VARARGS, "Registers a Python class for a given Haxe type index."},
     {"create_subclass", hlmod_py_create_subclass, METH_VARARGS, "Register a native HL subtype backed by a Python class."},
     {"alloc_obj", hlmod_py_alloc_obj, METH_VARARGS, "Allocate an instance of an HL object type."},
@@ -279,6 +326,17 @@ static PyMethodDef HlmodMethods[] = {
     {"array_get", hlmod_py_array_get, METH_VARARGS, "Read a native array element."},
     {"array_set", hlmod_py_array_set, METH_VARARGS, "Write a native array element."},
     {"array_element_type", hlmod_py_array_element_type, METH_VARARGS, "Return the element type index or None."},
+    {"enum_info", hlmod_py_enum_info, METH_VARARGS, "Inspect a native enum constructor and parameters."},
+    {"enum_new", hlmod_py_enum_new, METH_VARARGS, "Construct a typed native enum value."},
+    {"dynobj_new", hlmod_py_dynobj_new, METH_VARARGS, "Allocate a native dynamic object."},
+    {"dynobj_keys", hlmod_py_dynobj_keys, METH_VARARGS, "List native dynamic object fields."},
+    {"dynobj_get", hlmod_py_dynobj_get, METH_VARARGS, "Read a native dynamic object field."},
+    {"dynobj_set", hlmod_py_dynobj_set, METH_VARARGS, "Write a native dynamic object field."},
+    {"dynobj_delete", hlmod_py_dynobj_delete, METH_VARARGS, "Delete a native dynamic object field."},
+    {"ref_new", hlmod_py_ref_new, METH_VARARGS, "Allocate a typed native reference."},
+    {"ref_get", hlmod_py_ref_get, METH_VARARGS, "Read a native reference."},
+    {"ref_set", hlmod_py_ref_set, METH_VARARGS, "Write a native reference."},
+    {"inspect_native", hlmod_py_inspect_native, METH_VARARGS, "Inspect native type fields and methods."},
     {"get_obj_field", hlmod_py_get_obj_field, METH_VARARGS, "Gets a field value from a Haxe object."},
     {"set_obj_field", hlmod_py_set_obj_field, METH_VARARGS, "Sets a field value on a Haxe object."},
     {"get_virtual_field", hlmod_py_get_virtual_field, METH_VARARGS, "Gets a field value from a Haxe virtual object."},
@@ -374,18 +432,27 @@ error:
 }
 
 /**
- * @brief Imports a Python mod; initialization happens during module execution.
- * @param module_name The name of the module to import (e.g., "modcore").
+ * @brief Loads and initializes a Python mod within its ownership scope.
  */
-static bool load_mod(const char* module_name) {
+static bool load_mod(PyObject *framework, PyObject *info) {
+    PyObject *id = PyDict_GetItemString(info, "id");
+    PyObject *name = PyDict_GetItemString(info, "name");
+    PyObject *dependencies = PyDict_GetItemString(info, "dependencies");
+    if (id == NULL || name == NULL || dependencies == NULL) {
+        PyErr_SetString(PyExc_ValueError, "Incomplete mod resolver entry");
+        PyErr_Print();
+        return false;
+    }
+    const char *module_name = PyUnicode_AsUTF8(name);
+    if (module_name == NULL) { PyErr_Print(); return false; }
     printf("    -> Loading `%s`\n", module_name);
-    PyObject *module = PyImport_ImportModule(module_name);
-    if (module == NULL) {
+    PyObject *mod = PyObject_CallMethod(framework, "load_mod", "OOO", id, name, dependencies);
+    if (mod == NULL) {
         PyErr_Print();
         fprintf(stderr, "      [!] Error: Failed to load mod '%s'\n", module_name);
         return false;
     }
-    Py_DECREF(module);
+    Py_DECREF(mod);
     return true;
 }
 
@@ -584,6 +651,7 @@ int main(int argc, pchar *argv[]) {
 	bool vtune_later = false;
 	main_context ctx;
 	bool isExc = false;
+    bool sdk_only = false;
 	int first_boot_arg = -1;
 	argv++;
 	argc--;
@@ -595,6 +663,10 @@ int main(int argc, pchar *argv[]) {
 			printf("%d.%d.%d (hlmod)\n",HL_VERSION>>16,(HL_VERSION>>8)&0xFF,HL_VERSION&0xFF);
 			return 0;
 		}
+        if (pcompare(arg, PSTR("--generate-stubs")) == 0) {
+            sdk_only = true;
+            continue;
+        }
 		if( *arg == '-' || *arg == '+' ) {
 			if( first_boot_arg < 0 ) first_boot_arg = argc + 1;
 			// skip value
@@ -607,8 +679,9 @@ int main(int argc, pchar *argv[]) {
 		file = arg;
 		break;
 	}
-#define COPOUT printf("HL/JIT %d.%d.%d (c)2015-2025 Haxe Foundation. hlmod (c)2025 N3rdL0rd\n  Usage: hl <file>\n",HL_VERSION>>16,(HL_VERSION>>8)&0xFF,HL_VERSION&0xFF);return 1;
+#define COPOUT printf("HL/JIT %d.%d.%d (c)2015-2025 Haxe Foundation. hlmod (c)2025 N3rdL0rd\n  Usage: hl [--generate-stubs] <file>\n",HL_VERSION>>16,(HL_VERSION>>8)&0xFF,HL_VERSION&0xFF);return 1;
 	if( file == NULL ) {
+        if (sdk_only) { COPOUT }
 		FILE *fchk;
         if (fileExists("hlboot.dat")) {
 		    file = PSTR("hlboot.dat");
@@ -664,9 +737,15 @@ int main(int argc, pchar *argv[]) {
     g_module = ctx.m;
     g_code = ctx.code;
     int exit_code = 1;
+    PyObject *framework = NULL;
+    if (hlmod_hook_registry_init(ctx.code->nfunctions + ctx.code->nnatives) < 0) {
+        PyErr_Print();
+        goto shutdown;
+    }
 #ifndef NO_STUBGEN
     if (!hlmod_generate_stubs(ctx.code)) goto shutdown;
 #endif
+    if (sdk_only) { exit_code = 0; goto shutdown; }
 
 	printf("[hlmod] Finding mods...\n");
     const char* mods_directory = "./mods";
@@ -683,6 +762,11 @@ int main(int argc, pchar *argv[]) {
         PyErr_Print();
         goto shutdown;
     }
+    framework = PyImport_ImportModule("modcore");
+    if (framework == NULL) {
+        PyErr_Print();
+        goto shutdown;
+    }
 
     PyObject* load_order_list = NULL;
     if (get_mod_load_order(mods_directory, &load_order_list)) {
@@ -692,10 +776,7 @@ int main(int argc, pchar *argv[]) {
         printf("[hlmod] Loading mods:\n");
         for (Py_ssize_t i = 0; i < mod_count; i++) {
             PyObject* mod_info_dict = PyList_GetItem(load_order_list, i);
-            PyObject* name_obj = PyDict_GetItemString(mod_info_dict, "name");
-            const char* module_name = PyUnicode_AsUTF8(name_obj);
-            
-            if (module_name == NULL || !load_mod(module_name)) {
+            if (!load_mod(framework, mod_info_dict)) {
                 Py_DECREF(load_order_list);
                 goto shutdown;
             }
@@ -705,6 +786,9 @@ int main(int argc, pchar *argv[]) {
         fprintf(stderr, "[hlmod] Could not resolve mod load order. Halting.\n");
         goto shutdown;
     }
+    PyObject *loaded = PyObject_CallMethod(framework, "finish_loading", NULL);
+    if (loaded == NULL) { PyErr_Print(); goto shutdown; }
+    Py_DECREF(loaded);
     printf("[hlmod] All mods initialized.\n\n");
 
 	cl.t = ctx.code->functions[ctx.m->functions_indexes[ctx.m->code->entrypoint]].type;
@@ -723,6 +807,12 @@ int main(int argc, pchar *argv[]) {
     // Re-acquire the GIL before finalizing Python.
     PyEval_RestoreThread(_save);
 shutdown:
+    if (framework != NULL) {
+        PyObject *stopped = PyObject_CallMethod(framework, "shutdown", NULL);
+        if (stopped == NULL) { PyErr_Print(); exit_code = 1; }
+        Py_XDECREF(stopped);
+        Py_CLEAR(framework);
+    }
     hlmod_python_shutdown();
     hlmod_shutdown();
     if (Py_FinalizeEx() < 0) exit_code = 1;

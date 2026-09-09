@@ -66,14 +66,18 @@ PyObject *hlmod_py_array_length(PyObject *self, PyObject *args);
 PyObject *hlmod_py_array_get(PyObject *self, PyObject *args);
 PyObject *hlmod_py_array_set(PyObject *self, PyObject *args);
 PyObject *hlmod_py_array_element_type(PyObject *self, PyObject *args);
+PyObject *hlmod_py_enum_info(PyObject *self, PyObject *args);
+PyObject *hlmod_py_enum_new(PyObject *self, PyObject *args);
+PyObject *hlmod_py_dynobj_new(PyObject *self, PyObject *args);
+PyObject *hlmod_py_dynobj_keys(PyObject *self, PyObject *args);
+PyObject *hlmod_py_dynobj_get(PyObject *self, PyObject *args);
+PyObject *hlmod_py_dynobj_set(PyObject *self, PyObject *args);
+PyObject *hlmod_py_dynobj_delete(PyObject *self, PyObject *args);
+PyObject *hlmod_py_ref_new(PyObject *self, PyObject *args);
+PyObject *hlmod_py_ref_get(PyObject *self, PyObject *args);
+PyObject *hlmod_py_ref_set(PyObject *self, PyObject *args);
+PyObject *hlmod_py_inspect_native(PyObject *self, PyObject *args);
 
-typedef struct HookRegistryEntry {
-    int findex;
-    PyObject* callback;
-    UT_hash_handle hh;
-} HookRegistryEntry;
-
-extern HookRegistryEntry* g_hook_registry;
 extern hl_module *g_module;
 extern hl_code *g_code;
 

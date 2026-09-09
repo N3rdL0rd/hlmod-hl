@@ -1,10 +1,13 @@
 """Render importable HashLink proxies from native metadata, without runtime access."""
 from __future__ import annotations
 
+import ast
 import builtins
 import hashlib
 import json
 import keyword
+import os
+import typing
 from pathlib import Path
 
 
@@ -29,7 +32,7 @@ def identifier(name: str) -> str:
 
 
 GLOBAL_NAMES = frozenset(dir(builtins)) | {
-    "hlmod", "HlPtr", "HlObject", "HlVirtual", "HlArray", "hltype",
+    "hlmod", "HlPtr", "HlObject", "HlVirtual", "HlArray", "HlEnum", "HlDynObject", "HlRef", "hltype", "hlfunction",
     "Any", "Callable", "ClassVar", "Never", "TYPE_CHECKING",
 }
 MEMBER_NAMES = {
@@ -55,7 +58,7 @@ def member_identifier(name: str) -> str:
 
 
 class Renderer:
-    def __init__(self, metadata: dict):
+    def __init__(self, metadata: dict, overlay: dict | None = None):
         self.types = {t["index"]: t for t in metadata["types"]}
         self.functions = {f["findex"]: f for f in metadata["functions"]}
         self.docs = metadata.get("docs", {})
@@ -89,6 +92,159 @@ class Renderer:
         for static, instance in self.instance_pairs.items():
             module, name = self.locations[instance]
             self.locations[static] = (module, f"_{name}Static")
+        self.overlay = {} if overlay is None else overlay
+        self.validate_overlay()
+
+    def validate_overlay(self) -> None:
+        """Accept data-only annotation patches; never import or execute user code."""
+        overlay = self.overlay
+        if not isinstance(overlay, dict) or set(overlay) - {"version", "imports", "types"}:
+            raise ValueError("Typing overlay must contain only version, imports, and types")
+        if overlay and (type(overlay.get("version")) is not int or overlay["version"] != 1):
+            raise ValueError("Typing overlay version must be 1")
+        imports = overlay.get("imports", {})
+        targets = overlay.get("types", {})
+        if not isinstance(imports, dict) or not isinstance(targets, dict):
+            raise ValueError("Typing overlay imports and types must be objects")
+        exports = {f"{module}.{name}" for module, name in self.locations.values()}
+        exports.update("hlobj." + name for name in (
+            "HlArray", "HlObject", "HlVirtual", "HlEnum", "HlDynObject", "HlRef", "HlCallable"))
+        exports.add("hlmod.HlPtr")
+        exports.update("typing." + name for name in typing.__all__)
+        reserved = GLOBAL_NAMES | {name for _, name in self.locations.values()}
+        for alias, source in imports.items():
+            if (not isinstance(alias, str) or not alias.isidentifier() or keyword.iskeyword(alias)
+                    or alias.startswith("_") or alias in reserved):
+                raise ValueError(f"Invalid or conflicting overlay import alias: {alias!r}")
+            if not isinstance(source, str) or source not in exports:
+                raise ValueError(f"Unknown overlay import: {source!r}")
+        allowed_names = {"Any", "Callable", "Never", "int", "str", "float", "bool", "bytes",
+                         "list", "dict", "tuple", "set", "frozenset", "object", "type",
+                         "HlArray", "HlEnum", "HlDynObject", "HlRef", "HlPtr", "HlObject", "HlVirtual"} | imports.keys()
+        self.overlay_names = allowed_names
+        for native_name, patch in targets.items():
+            t = self.named.get(native_name)
+            if t is None or not isinstance(patch, dict) or set(patch) - {"fields", "methods"}:
+                raise ValueError(f"Unknown overlay type or invalid patch: {native_name!r}")
+            methods = self.methods(t)
+            fields = {field["name"] for field in t.get("fields", [])} - methods.keys()
+            for category in ("fields", "methods"):
+                entries = patch.get(category, {})
+                if not isinstance(entries, dict):
+                    raise ValueError(f"{native_name}.{category} must be an object")
+                for name, value in entries.items():
+                    target = f"{native_name}.{name}"
+                    if category == "fields":
+                        if name not in fields:
+                            raise ValueError(f"Unknown overlay field: {target}")
+                        self.overlay_annotation(value)
+                        continue
+                    constructor = self.constructors.get(self.pairs.get(t["index"])) if name == "new" else None
+                    method = methods.get(name)
+                    if method is None and constructor is None:
+                        raise ValueError(f"Unknown overlay method: {target}")
+                    if not isinstance(value, dict) or set(value) != {"args", "returns"} or not isinstance(value["args"], list):
+                        raise ValueError(f"{target} requires args (annotation list) and returns")
+                    function = self.functions[constructor if constructor is not None else method["findex"]]
+                    signature = self.types[function["type"]]
+                    skip = 1
+                    if constructor is not None:
+                        skip = int(bool(signature["args"]) and signature["args"][0] == t["index"]
+                                   and self.types[signature["return"]]["kind"] == 0)
+                    elif "field_type" in method:
+                        skip = len(signature["args"]) - len(self.types[method["field_type"]]["args"])
+                    if len(value["args"]) != len(signature["args"]) - skip:
+                        raise ValueError(f"Overlay argument count differs from native signature: {target}")
+                    if name == "new" and value["returns"] != "None":
+                        raise ValueError(f"Constructor overlay must return None: {target}")
+                    for annotation in [*value["args"], value["returns"]]:
+                        self.overlay_annotation(annotation)
+
+    def overlay_annotation(self, text: str) -> ast.expr:
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("Overlay annotations must be nonempty strings")
+        try:
+            expression = ast.parse(text, mode="eval").body
+        except SyntaxError as error:
+            raise ValueError(f"Invalid overlay annotation: {text!r}") from error
+        for node in ast.walk(expression):
+            if not isinstance(node, (ast.Name, ast.Subscript, ast.Tuple, ast.List, ast.BinOp,
+                                     ast.BitOr, ast.Constant, ast.Load)):
+                raise ValueError(f"Forbidden overlay annotation syntax: {text!r}")
+            if isinstance(node, ast.Name) and node.id not in self.overlay_names:
+                raise ValueError(f"Unknown overlay annotation name: {node.id}")
+            if isinstance(node, ast.Constant) and node.value is not None and node.value is not Ellipsis:
+                raise ValueError("Overlay annotations do not permit literals or string forward references")
+        return expression
+
+    def editor_source(self, source: str, index: int) -> str:
+        """Strip runtime machinery while retaining real method declarations."""
+        tree = ast.parse(source)
+        classes = {self.locations[index][1]: self.types[index]}
+        if index in self.pairs:
+            static = self.pairs[index]
+            classes[self.locations[static][1]] = self.types[static]
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            t = classes[node.name]
+            patch = self.overlay.get("types", {}).get(t.get("name"), {})
+            field_patches = {member_identifier(name): value for name, value in patch.get("fields", {}).items()}
+            method_patches = {"__init__" if name == "new" else member_identifier(name): value
+                              for name, value in patch.get("methods", {}).items()}
+            static_index = self.pairs.get(t["index"])
+            if static_index is not None:
+                static_patch = self.overlay.get("types", {}).get(self.types[static_index]["name"], {})
+                for name, value in static_patch.get("fields", {}).items():
+                    field_patches.setdefault(member_identifier(name), value)
+                for name, value in static_patch.get("methods", {}).items():
+                    method_patches.setdefault(member_identifier(name), value)
+            dynamic = {member_identifier(name) for name, method in self.methods(t).items() if "field" in method}
+            if t["index"] in self.instance_pairs or t.get("name", "").rsplit(".", 1)[-1].startswith("$"):
+                dynamic = set()
+            node.decorator_list = []
+            body = []
+            for member in node.body:
+                if isinstance(member, ast.Assign):
+                    continue
+                if isinstance(member, ast.AnnAssign):
+                    patch_text = field_patches.get(member.target.id)
+                    if patch_text is not None:
+                        annotation = self.overlay_annotation(patch_text)
+                        if isinstance(member.annotation, ast.Subscript) and isinstance(member.annotation.value, ast.Name) and member.annotation.value.id == "ClassVar":
+                            member.annotation.slice = annotation
+                        else:
+                            member.annotation = annotation
+                if isinstance(member, ast.FunctionDef):
+                    member.body = [ast.Expr(value=ast.Constant(value=Ellipsis))]
+                    member.decorator_list = [decorator for decorator in member.decorator_list
+                                             if isinstance(decorator, ast.Attribute) and decorator.attr == "staticmethod"]
+                    static = bool(member.decorator_list)
+                    patch_method = method_patches.get(member.name)
+                    if patch_method is not None:
+                        for parameter, annotation in zip(member.args.args[0 if static else 1:], patch_method["args"]):
+                            parameter.annotation = self.overlay_annotation(annotation)
+                        member.returns = self.overlay_annotation(patch_method["returns"])
+                    if member.name == "__init__" and member.args.vararg is not None:
+                        # There is no native constructor: accepting arbitrary args would lie.
+                        member.args.vararg = None
+                        member.args.kwarg = None
+                        member.args.args.append(ast.arg(arg="_unavailable", annotation=ast.Name(id="Never", ctx=ast.Load())))
+                    if member.name in dynamic:
+                        args = ", ".join(ast.unparse(arg.annotation) for arg in member.args.args[1:])
+                        annotation = ast.parse(f"Callable[[{args}], {ast.unparse(member.returns)}]", mode="eval").body
+                        member = ast.AnnAssign(target=ast.Name(id=member.name, ctx=ast.Store()), annotation=annotation, value=None, simple=1)
+                if isinstance(member, ast.FunctionDef):
+                    # HL calls are positional: parameter names are not a contract,
+                    # so hook callbacks must not be forced to reuse these names.
+                    member.args.posonlyargs = member.args.posonlyargs + member.args.args
+                    member.args.args = []
+                body.append(member)
+            node.body = body or [ast.Expr(value=ast.Constant(value=Ellipsis))]
+        for alias, source in sorted(self.overlay.get("imports", {}).items()):
+            module, _, name = source.rpartition(".")
+            tree.body.insert(1, ast.ImportFrom(module=module, names=[ast.alias(name=name, asname=alias)], level=0))
+        return "# Generated editor interface; typing overlays apply only here.\n" + ast.unparse(ast.fix_missing_locations(tree)) + "\n"
 
     def annotation(self, index: int, used: set[int], active: frozenset[int] = frozenset(), *, argument: bool = False, bound_method: bool = False) -> str:
         t = self.types.get(index)
@@ -97,7 +253,7 @@ class Renderer:
         kind = t["kind"]
         simple = {0: "None", 1: "int", 2: "int", 3: "int", 4: "int", 5: "float", 6: "float",
                   7: "bool", 8: "HlPtr", 9: "Any", 12: "HlArray[Any]", 13: "HlPtr",
-                  14: "HlPtr", 16: "HlPtr", 17: "HlPtr", 18: "HlPtr", 20: "Never",
+                  14: "HlRef[Any]", 16: "HlDynObject", 17: "HlPtr", 18: "HlEnum", 20: "Never",
                   21: "HlPtr", 22: "Never", 23: "Never"}
         if kind == STRUCT and argument:
             return "Never"
@@ -176,6 +332,8 @@ class Renderer:
             parameters = params
         else:
             parameters = "self" + (", " + params if params else "")
+        if not constructor:
+            prefix.append(f"    @hlfunction({method['findex']})")
         prefix.append(f"    def {name}({parameters}) -> {result}:")
         doc = self.member_doc(t, method["name"], "functions")
         if doc:
@@ -302,7 +460,7 @@ class Renderer:
                       "from typing import Any, Callable, ClassVar, Never, TYPE_CHECKING",
                       "import hlmod", "from hlmod import HlPtr",
                       "import builtins as _hlmod_builtins",
-                      "from hlobj import HlArray, HlObject, HlVirtual, hltype", *sorted(imports), ""]
+                      "from hlobj import HlArray, HlDynObject, HlEnum, HlRef, HlObject, HlVirtual, hltype, hlfunction", *sorted(imports), ""]
             if used:
                 header.append("if TYPE_CHECKING:")
                 for dependency in sorted(used):
@@ -310,6 +468,7 @@ class Renderer:
                     header.append(f"    from {dep_module} import {dep_name} as _T{dependency}")
                 header.append("")
             files[module.removeprefix("stubs.").replace(".", "/") + ".py"] = "\n".join(header + body) + "\n"
+            files[module.removeprefix("stubs.").replace(".", "/") + ".pyi"] = self.editor_source("\n".join(header + body), index)
             package = module.rsplit(".", 1)[0]
             packages.setdefault(package, {})[name] = module
             while "." in package:
@@ -335,6 +494,9 @@ class Renderer:
                 "            return getattr(_import_module(exports[name]), name)\n"
                 "        return super().__getattribute__(name)\n"
                 "_sys.modules[__name__].__class__ = _Package\n")
+            files[(path + "/" if path else "") + "__init__.pyi"] = "\n".join(
+                f"from {module} import {name} as {name}" for name, module in sorted(exports.items())
+            ) + "\n"
         return files
 
 
@@ -355,8 +517,16 @@ def generate(metadata: dict, base_dir: str, source_hash: str) -> None:
             metadata["docs"] = docs
             break
     root = Path(base_dir)
+    overlay_path = Path(os.environ.get("HLMOD_TYPING_OVERLAY", "mods/typing_overlays.json"))
+    try:
+        overlay = json.loads(overlay_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        if "HLMOD_TYPING_OVERLAY" in os.environ:
+            raise
+        overlay = {}
+    renderer = Renderer(metadata, overlay)
     signature = hashlib.sha256((source_hash + metadata["code_hash"] + json.dumps(
-        metadata.get("docs", {}), sort_keys=True, ensure_ascii=True)).encode()).hexdigest()
+        {"docs": metadata.get("docs", {}), "overlay": overlay}, sort_keys=True, ensure_ascii=True)).encode()).hexdigest()
     manifest_path = root / ".hlmod_generated.json"
     try:
         previous = json.loads(manifest_path.read_text())
@@ -367,7 +537,7 @@ def generate(metadata: dict, base_dir: str, source_hash: str) -> None:
     ):
         print("[hlmod] Python proxy signature matches; skipping generation.")
         return
-    files = Renderer(metadata).render()
+    files = renderer.render()
     for name, source in sorted(files.items()):
         target = root / name
         target.parent.mkdir(parents=True, exist_ok=True)

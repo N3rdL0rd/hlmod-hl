@@ -52,6 +52,7 @@ static PyObject *peer_reference(PythonPeer *peer) {
 typedef struct PythonRoot {
     void **slot;
     PyObject *edges;
+    size_t snapshot_index;
     UT_hash_handle hh;
 } PythonRoot;
 typedef struct {
@@ -68,6 +69,23 @@ typedef struct Adapter {
 } Adapter;
 
 static PythonType *python_types;
+
+static PythonType *published_python_types(void) {
+#if defined(HL_VCC)
+    return _InterlockedCompareExchangePointer((void *volatile *)&python_types, NULL, NULL);
+#else
+    return __atomic_load_n(&python_types, __ATOMIC_ACQUIRE);
+#endif
+}
+
+static void publish_python_type(PythonType *type) {
+    type->next = published_python_types();
+#if defined(HL_VCC)
+    _InterlockedExchangePointer((void *volatile *)&python_types, type);
+#else
+    __atomic_store_n(&python_types, type, __ATOMIC_RELEASE);
+#endif
+}
 static PythonPeer *python_peers;
 static PythonRoot *python_roots;
 static Adapter *adapters;
@@ -112,23 +130,54 @@ static PyTypeObject CallbackOwnerType = {
     .tp_weaklistoffset = offsetof(CallbackOwner, weakrefs),
 };
 
-static PythonRoot **snapshot_roots;
-static PythonPeer **snapshot_peers;
-static unsigned char *snapshot_edges;
-static size_t snapshot_nroots, snapshot_npeers;
+typedef struct {
+    PythonRoot *root;
+    size_t offset, count;
+} RootSnapshot;
 
-static bool trace_foreign(void **slot, bool (*marked)(void *)) {
-    size_t i, j;
-    if(!slot) return snapshot_edges != NULL && snapshot_npeers != 0;
-    for(i = 0; i < snapshot_nroots; i++) {
-        if(snapshot_roots[i]->slot != slot) continue;
-        for(j = 0; j < snapshot_npeers; j++) {
-            PythonPeer *p = snapshot_peers[j];
-            snapshot_edges[i * snapshot_npeers + j] = !p->dead &&
-                marked(p->callback ? (void*)p->callback : p->ptr);
-        }
-        break;
+typedef struct {
+    void *ptr;
+    PythonPeer *peer;
+    UT_hash_handle hh;
+} PeerSnapshot;
+
+static RootSnapshot *snapshot_roots, *snapshot_current;
+static PeerSnapshot *snapshot_peers, *snapshot_peer_index;
+static PythonPeer **snapshot_edges;
+static size_t snapshot_nroots, snapshot_npeers, snapshot_count, snapshot_capacity;
+static bool snapshot_failed, snapshot_active;
+
+/* GC calls this serially with the world stopped. Only libc scratch allocation
+   is allowed here; Python references are materialized after the GC unlocks. */
+static bool trace_foreign(void **slot, void *ptr) {
+    if(!slot) return snapshot_active && snapshot_npeers != 0;
+    if(!ptr) {
+        PythonRoot *root;
+        HASH_FIND_PTR(python_roots, &slot, root);
+        snapshot_current = root ? &snapshot_roots[root->snapshot_index] : NULL;
+        if(snapshot_current) snapshot_current->offset = snapshot_count;
+        return true;
     }
+    if(snapshot_failed || !snapshot_current) return false;
+    PeerSnapshot *entry;
+    HASH_FIND_PTR(snapshot_peer_index, &ptr, entry);
+    if(!entry || entry->peer->dead) return true;
+    if(snapshot_count == snapshot_capacity) {
+        size_t capacity = snapshot_capacity ? snapshot_capacity * 2 : 64;
+        if(capacity < snapshot_capacity || capacity > SIZE_MAX / sizeof(*snapshot_edges)) {
+            snapshot_failed = true;
+            return false;
+        }
+        PythonPeer **edges = realloc(snapshot_edges, capacity * sizeof(*edges));
+        if(!edges) {
+            snapshot_failed = true;
+            return false;
+        }
+        snapshot_edges = edges;
+        snapshot_capacity = capacity;
+    }
+    snapshot_edges[snapshot_count++] = entry->peer;
+    snapshot_current->count++;
     return true;
 }
 
@@ -140,34 +189,44 @@ static int refresh_foreign_edges(void) {
     int result = -1;
     snapshot_nroots = HASH_COUNT(python_roots);
     snapshot_npeers = HASH_COUNT(python_peers);
-    if(snapshot_nroots && snapshot_npeers > SIZE_MAX / snapshot_nroots) {
-        PyErr_NoMemory();
-        return -1;
-    }
+    snapshot_count = snapshot_capacity = 0;
+    snapshot_failed = false;
     snapshot_roots = calloc(snapshot_nroots + 1, sizeof(*snapshot_roots));
     snapshot_peers = calloc(snapshot_npeers + 1, sizeof(*snapshot_peers));
-    snapshot_edges = calloc(snapshot_nroots * snapshot_npeers + 1, 1);
     holders = PyTuple_New(snapshot_nroots);
     new_edges = PyTuple_New(snapshot_nroots);
-    if(!snapshot_roots || !snapshot_peers || !snapshot_edges || !holders || !new_edges) {
+    if(!snapshot_roots || !snapshot_peers || !holders || !new_edges) {
         if(!PyErr_Occurred()) PyErr_NoMemory();
         goto done;
     }
     HASH_ITER(hh, python_roots, root, rtmp) {
-        snapshot_roots[i] = root;
+        root->snapshot_index = i;
+        snapshot_roots[i].root = root;
         PyObject *holder = (PyObject*)((char*)root->slot - offsetof(HlPtr, ptr));
         PyTuple_SET_ITEM(holders, i++, Py_NewRef(holder));
     }
     i = 0;
-    HASH_ITER(hh, python_peers, peer, ptmp) snapshot_peers[i++] = peer;
+    HASH_ITER(hh, python_peers, peer, ptmp) {
+        PeerSnapshot *entry = &snapshot_peers[i++];
+        entry->ptr = peer->callback ? (void*)peer->callback : peer->ptr;
+        entry->peer = peer;
+        HASH_ADD_PTR(snapshot_peer_index, ptr, entry);
+    }
+    snapshot_active = true;
     hl_gc_major();
+    snapshot_active = false;
+    if(snapshot_failed) {
+        PyErr_NoMemory();
+        goto done;
+    }
     for(i = 0; i < snapshot_nroots; i++) {
         PyObject *edges = PyList_New(0);
         if(!edges) goto done;
         PyTuple_SET_ITEM(new_edges, i, edges);
-        for(j = 0; j < snapshot_npeers; j++) {
-            peer = snapshot_peers[j];
-            if(!snapshot_edges[i * snapshot_npeers + j] || peer->dead) continue;
+        RootSnapshot *snapshot = &snapshot_roots[i];
+        for(j = 0; j < snapshot->count; j++) {
+            peer = snapshot_edges[snapshot->offset + j];
+            if(peer->dead) continue;
             PyObject *obj = peer_reference(peer);
             if(!obj) {
                 if(PyErr_Occurred()) goto done;
@@ -179,11 +238,13 @@ static int refresh_foreign_edges(void) {
         }
     }
     for(i = 0; i < snapshot_nroots; i++) {
-        root = snapshot_roots[i];
+        root = snapshot_roots[i].root;
         Py_XSETREF(root->edges, Py_NewRef(PyTuple_GET_ITEM(new_edges, i)));
     }
     result = 0;
 done:
+    HASH_CLEAR(hh, snapshot_peer_index);
+    snapshot_current = NULL;
     free(snapshot_roots);
     free(snapshot_peers);
     free(snapshot_edges);
@@ -197,7 +258,7 @@ done:
 
 static PythonType *find_type(hl_type *type) {
     PythonType *p;
-    for(p = python_types; p; p = p->next)
+    for(p = published_python_types(); p; p = p->next)
         if(&p->type == type) return p;
     return NULL;
 }
@@ -507,8 +568,7 @@ PyObject *hlmod_py_create_subclass(PyObject *self, PyObject *args) {
     }
     PyObject *handle = hlmod_ptr_new(&p->type, &type_handle_type);
     if(!handle) goto fail;
-    p->next = python_types;
-    python_types = p;
+    publish_python_type(p);
     return handle;
 fail:
     free_python_type(p);
@@ -705,6 +765,46 @@ PyObject *hlmod_py_init_obj(PyObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+char *hlmod_python_take_error(void) {
+    PyObject *exc_type, *exc_value, *traceback;
+    PyErr_Fetch(&exc_type, &exc_value, &traceback);
+    PyErr_NormalizeException(&exc_type, &exc_value, &traceback);
+    char *error = NULL;
+    if(exc_value) {
+        /* Modders need the Python location, not just the exception message. */
+        if(traceback) PyException_SetTraceback(exc_value, traceback);
+        PyObject *module = PyImport_ImportModule("traceback");
+        PyObject *lines = module ? PyObject_CallMethod(module, "format_exception", "O", exc_value) : NULL;
+        PyObject *separator = lines ? PyUnicode_FromString("") : NULL;
+        PyObject *text = separator ? PyUnicode_Join(separator, lines) : NULL;
+        const char *message = text ? PyUnicode_AsUTF8(text) : NULL;
+        if(message) error = strdup(message);
+        Py_XDECREF(text);
+        Py_XDECREF(separator);
+        Py_XDECREF(lines);
+        Py_XDECREF(module);
+        if(!error) {
+            PyErr_Clear();
+            PyObject *fallback = PyObject_Repr(exc_value);
+            const char *repr = fallback ? PyUnicode_AsUTF8(fallback) : NULL;
+            if(repr) error = strdup(repr);
+            Py_XDECREF(fallback);
+        }
+    }
+    Py_XDECREF(exc_type);
+    Py_XDECREF(exc_value);
+    Py_XDECREF(traceback);
+    PyErr_Clear();
+    return error ? error : strdup("Python callback failed without an exception");
+}
+
+void hlmod_python_throw_error(char *error) {
+    if(!error) hl_error("Python callback failed (unable to format exception)");
+    vdynamic *exception = hl_alloc_strbytes(USTR("Python callback: %s"), hl_to_utf16(error));
+    free(error);
+    hl_throw(exception);
+}
+
 /* No Python references, GIL, or HL blocking scope may cross an HL longjmp. */
 void hlmod_python_invoke(void *context, void **slots, vdynamic *result) {
     NativeCall *call = context;
@@ -746,17 +846,7 @@ void hlmod_python_invoke(void *context, void **slots, vdynamic *result) {
     }
     if(!value || PyErr_Occurred()) {
         failed = true;
-        PyObject *exc_type, *exc_value, *traceback;
-        PyErr_Fetch(&exc_type, &exc_value, &traceback);
-        PyErr_NormalizeException(&exc_type, &exc_value, &traceback);
-        PyObject *text = exc_value ? PyObject_Str(exc_value) : NULL;
-        const char *message = text ? PyUnicode_AsUTF8(text) : NULL;
-        error = strdup(message ? message : "Python callback failed");
-        Py_XDECREF(text);
-        Py_XDECREF(exc_type);
-        Py_XDECREF(exc_value);
-        Py_XDECREF(traceback);
-        PyErr_Clear();
+        error = hlmod_python_take_error();
     }
     Py_XDECREF(value);
     Py_XDECREF(args);
@@ -764,12 +854,7 @@ void hlmod_python_invoke(void *context, void **slots, vdynamic *result) {
     hl_blocking(true);
     PyGILState_Release(gil);
     hl_blocking(false);
-    if(failed && !error) hl_error("Python callback failed (unable to format exception)");
-    if(error) {
-        vdynamic *exception = hl_alloc_strbytes(USTR("Python callback: %s"), hl_to_utf16(error));
-        free(error);
-        hl_throw(exception);
-    }
+    if(failed) hlmod_python_throw_error(error);
 }
 
 int hlmod_python_dispatch(int findex, int nargs, void **args) {
@@ -777,25 +862,21 @@ int hlmod_python_dispatch(int findex, int nargs, void **args) {
         hlmod_python_bypass = -1;
         return 0;
     }
-    if(!python_peers || nargs == 0) return 0;
+    /* Type metadata is immutable after atomic publication and is reclaimed only
+       after native callers stop. Never inspect the GIL-owned peer hash here. */
+    if(nargs == 0 || !published_python_types()) return 0;
     hl_type *signature = g_module->ctx.functions_types[findex];
     if(signature->fun->args[0]->kind != HOBJ) return 0;
     void *ptr = *(void**)args[0];
-    PythonPeer *peer;
-    HASH_FIND_PTR(python_peers, &ptr, peer);
-    if(!peer || peer->dead || peer->callback) return 0;
-    int index = g_module->functions_indexes[findex];
-    if(index < 0 || index >= g_code->nfunctions) return 0;
-    const uchar *name = fun_field_name(g_code->functions + index);
-    if(!name) return 0;
-    int hash = hl_hash_gen(name, false);
-    hl_type *t;
-    for(t = ((vobj*)ptr)->t; t && t->kind == HOBJ; t = t->obj->super) {
+    if(!ptr) return 0;
+    hl_type *t = ((vobj*)ptr)->t;
+    if(t->kind != HOBJ || t->obj->m == &g_module->ctx) return 0;
+    for(; t && t->kind == HOBJ; t = t->obj->super) {
         PythonType *p = find_type(t);
         if(!p) continue;
         NativeCall *call;
         for(call = p->methods; call; call = call->next) {
-            if(call->hash == hash && call->findex == findex && call->signature->fun->nargs == nargs) {
+            if(call->findex == findex && call->signature->fun->nargs == nargs) {
                 vdynamic result = {0};
                 hlmod_python_invoke(call, args, &result);
                 g_return_value_int = result.v.i64;

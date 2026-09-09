@@ -592,12 +592,35 @@ static gc_mthread mark_threads[GC_MAX_MARK_THREADS] = {0};
 static unsigned char mark_threads_active = 0;
 static hl_semaphore *mark_threads_done;
 
+static bool (*gc_foreign_trace)(void **, void *) = NULL;
+static void **gc_trace_root;
+static unsigned char **gc_trace_marks;
+static size_t gc_trace_count, gc_trace_capacity;
+
+/* The foreign pass is serial. Remember only visited mark bytes so clearing a
+   small root graph never scans the entire heap bitmap. Duplicate bytes are
+   bounded by eight marked allocations and are harmless when clearing. */
+static void gc_trace_visit(void *ptr, gc_pheader *page, int bid) {
+    if(gc_trace_count == gc_trace_capacity) {
+        size_t capacity = gc_trace_capacity ? gc_trace_capacity * 2 : 256;
+        if(capacity < gc_trace_capacity || capacity > SIZE_MAX / sizeof(*gc_trace_marks))
+            out_of_memory("foreign visited marks");
+        unsigned char **marks = realloc(gc_trace_marks, capacity * sizeof(*marks));
+        if(!marks) out_of_memory("foreign visited marks");
+        gc_trace_marks = marks;
+        gc_trace_capacity = capacity;
+    }
+    gc_trace_marks[gc_trace_count++] = &page->bmp[bid >> 3];
+    gc_foreign_trace(gc_trace_root, ptr);
+}
+
 #define GC_STACK_BEGIN(st) register void **__current_stack = (st)->cur; gc_mstack *__current_mstack = st;
 #define GC_STACK_END() __current_mstack->cur = __current_stack;
 #define GC_STACK_RESUME() __current_stack = __current_mstack->cur;
 #define GC_STACK_COUNT(st) ((st)->size - ((st)->end - (st)->cur) - 1)
 
 #define GC_PUSH_GEN(ptr,page) \
+    if( gc_trace_root ) gc_trace_visit(ptr,page,bid); \
 	if( MEM_HAS_PTR((page)->page_kind) ) { \
 		if( __current_stack == __current_mstack->end ) { __current_mstack->cur = __current_stack; __current_stack = hl_gc_mark_grow(__current_mstack); } \
 		*__current_stack++ = ptr; \
@@ -720,7 +743,7 @@ static int gc_flush_mark( gc_mstack *stack ) {
 			__current_stack++;
 			break;
 		}
-		if( (count++ & (1 << REGULAR_BITS)) != regular_mask && GC_MAX_MARK_THREADS > 1 && gc_mark_threads > 1 ) {
+		if( !gc_trace_root && (count++ & (1 << REGULAR_BITS)) != regular_mask && GC_MAX_MARK_THREADS > 1 && gc_mark_threads > 1 ) {
 			regular_mask = regular_mask ? 0 : 1 << REGULAR_BITS;
 			GC_STACK_END();
 			gc_dispatch_mark(stack,false);
@@ -801,9 +824,8 @@ static void gc_mark_stack( void *start, void *end ) {
 
 static bool (*gc_foreign_defer)(void **) = NULL;
 static void (*gc_foreign_observe)(bool (*)(void *)) = NULL;
-static bool (*gc_foreign_trace)(void **, bool (*)(void *)) = NULL;
 
-HL_API void hl_gc_set_foreign_hooks(bool (*defer)(void **), void (*observe)(bool (*)(void *)), bool (*trace)(void **, bool (*)(void *))) {
+HL_API void hl_gc_set_foreign_hooks(bool (*defer)(void **), void (*observe)(bool (*)(void *)), bool (*trace)(void **, void *)) {
 	gc_foreign_defer = defer;
 	gc_foreign_observe = observe;
 	gc_foreign_trace = trace;
@@ -878,14 +900,19 @@ static void gc_mark() {
 			unsigned char *saved = malloc(mark_bytes);
 			if( !saved ) out_of_memory("foreign mark snapshot");
 			memcpy(saved,mark_data,mark_bytes);
+			MZERO(mark_data,mark_bytes);
 			for(i=0;i<gc_roots_count;i++) {
 				if( !gc_foreign_defer(gc_roots[i]) ) continue;
-				MZERO(mark_data,mark_bytes);
-				gc_mark_stack(gc_roots[i],gc_roots[i]+1);
+				gc_trace_root = gc_roots[i];
+				gc_foreign_trace(gc_trace_root,NULL);
+				gc_mark_stack(gc_trace_root,gc_trace_root+1);
 				gc_flush_mark(&global_mark_stack);
-				while( mark_threads_active ) hl_semaphore_acquire(mark_threads_done);
-				gc_foreign_trace(gc_roots[i],gc_foreign_marked);
+				while( gc_trace_count ) *gc_trace_marks[--gc_trace_count] = 0;
 			}
+			gc_trace_root = NULL;
+			free(gc_trace_marks);
+			gc_trace_marks = NULL;
+			gc_trace_capacity = 0;
 			memcpy(mark_data,saved,mark_bytes);
 			free(saved);
 		}

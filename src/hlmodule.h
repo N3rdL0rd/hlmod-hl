@@ -173,8 +173,10 @@ void *hl_jit_code( jit_ctx *ctx, hl_module *m, int *codesize, hl_debug_infos **d
 void hl_jit_patch_method( void *old_fun, void **new_fun_table );
 
 /* Foreign roots are marked after native reachability is observed. Callbacks run
-   with the world stopped: they must not allocate, acquire the GIL, or call HL. */
-HL_API void hl_gc_set_foreign_hooks(bool (*defer)(void **), void (*observe)(bool (*)(void *)), bool (*trace)(void **, bool (*)(void *)));
+   with the world stopped: no Python/HL allocation, GIL acquisition, or HL calls.
+   Serial trace(NULL,NULL) tests readiness; trace(slot,NULL) begins a root;
+   trace(slot,ptr) visits each reachable allocation once. libc scratch is allowed. */
+HL_API void hl_gc_set_foreign_hooks(bool (*defer)(void **), void (*observe)(bool (*)(void *)), bool (*trace)(void **, void *));
 void *hl_jit_python_adapter(hl_type *signature, void *context, bool closure, int *size);
 
       

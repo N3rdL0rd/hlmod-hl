@@ -472,12 +472,7 @@ void hlmod_shutdown(void)
     Py_CLEAR(g_hlcallable_class);
     Py_CLEAR(g_hlvirtual_class);
     Py_CLEAR(g_hlobj_module);
-    HookRegistryEntry *entry, *next;
-    HASH_ITER(hh, g_hook_registry, entry, next) {
-        HASH_DEL(g_hook_registry, entry);
-        Py_DECREF(entry->callback);
-        free(entry);
-    }
+    hlmod_hook_registry_shutdown();
     free(g_passthrough_stack);
     g_passthrough_stack = NULL;
     g_passthrough_stack_size = 0;
@@ -603,6 +598,16 @@ PyObject *hlmod_cast_to_py(hl_type *type, void *ptr)
         return hlmod_py_make_hlcallable(value);
     } else if (type->kind == HARRAY) {
         return hlmod_wrap_pointer("HlArray", value, type, NULL);
+    } else if (type->kind == HENUM) {
+        return hlmod_wrap_pointer("HlEnum", value, type, NULL);
+    } else if (type->kind == HDYNOBJ) {
+        return hlmod_wrap_pointer("HlDynObject", value, type, NULL);
+    } else if (type->kind == HREF) {
+        if (!hl_is_gc_ptr(value)) {
+            PyErr_SetString(PyExc_TypeError, "Stack-backed HL references cannot escape into Python; use HlRef.create with an explicit reference type.");
+            return NULL;
+        }
+        return hlmod_wrap_pointer("HlRef", value, type, NULL);
     }
     return hlmod_ptr_new(value, type);
 }
@@ -1422,14 +1427,14 @@ int jit_dispatch_hook(int findex, int nargs, void **args)
 {
     if (is_passthrough(findex)) return 0;
     if (hlmod_python_dispatch(findex, nargs, args)) return 1;
+    if (!hlmod_hook_registered(findex)) return 0;
 
     /* Only the wait for the GIL is blocking: conversions allocate in the HL GC. */
     hl_blocking(true);
     PyGILState_STATE gstate = PyGILState_Ensure();
     hl_blocking(false);
-    HookRegistryEntry *entry;
-    HASH_FIND_INT(g_hook_registry, &findex, entry);
-    if (!entry) {
+    PyObject *callback = hlmod_hook_callback(findex);
+    if (callback == NULL) {
         PyGILState_Release(gstate);
         return 0;
     }
@@ -1440,7 +1445,8 @@ int jit_dispatch_hook(int findex, int nargs, void **args)
     void *result_pointer = NULL;
     bool pointer_rooted = false;
     int handled = 0;
-    PyObject *callback = Py_NewRef(entry->callback);
+    bool failed = false;
+    char *error = NULL;
     PyObject *arguments = NULL, *result = NULL;
     hl_type *type = hlmod_function_type(findex);
     if (!type) goto done;
@@ -1483,14 +1489,20 @@ int jit_dispatch_hook(int findex, int nargs, void **args)
     }
     handled = 1;
 done:
-    if (PyErr_Occurred()) PyErr_Print();
+    if (PyErr_Occurred() || !handled) {
+        failed = true;
+        error = hlmod_python_take_error();
+    }
     Py_XDECREF(result);
     Py_XDECREF(arguments);
     Py_DECREF(callback);
-    g_return_value_int = handled ? result_int : saved_int;
-    g_return_value_double = handled ? result_double : saved_double;
+    g_return_value_int = failed ? saved_int : result_int;
+    g_return_value_double = failed ? saved_double : result_double;
+    hl_blocking(true);
     PyGILState_Release(gstate);
+    hl_blocking(false);
     if (pointer_rooted) hl_remove_root(&result_pointer);
+    if (failed) hlmod_python_throw_error(error);
     return handled;
 }
 
@@ -1546,4 +1558,427 @@ const char *kind2str(hl_type_kind kind) {
             return "guid";
     }
     return "unknown";
+}
+
+/* Reflection primitives exported by std/obj.c, but not declared in hl.h. */
+HL_API vdynamic *hl_obj_get_field(vdynamic *obj, int hfield);
+HL_API void hl_obj_set_field(vdynamic *obj, int hfield, vdynamic *value);
+HL_API bool hl_obj_delete_field(vdynamic *obj, int hfield);
+
+static hl_type *hlmod_indexed_type(int index)
+{
+    if (!g_code || index < 0 || index >= g_code->ntypes) {
+        PyErr_SetString(PyExc_IndexError, "Native type index is out of bounds.");
+        return NULL;
+    }
+    return &g_code->types[index];
+}
+
+static bool hlmod_value_layout(hl_type *type)
+{
+    if (!type || type->kind == HVOID || type->kind == HSTRUCT ||
+        type->kind == HPACKED || type->kind == HGUID || type->kind == HMETHOD ||
+        hl_type_size(type) <= 0) {
+        PyErr_SetString(PyExc_TypeError, "Native value layout is unavailable or unsupported.");
+        return false;
+    }
+    return true;
+}
+
+static PyObject *hlmod_unicode(const uchar *value)
+{
+    if (!value) Py_RETURN_NONE;
+    int byteorder = -1;
+    return PyUnicode_DecodeUTF16((const char *)value, ustrlen(value) * sizeof(uchar), "strict", &byteorder);
+}
+
+/* Set a newly allocated value and release it on both success and failure. */
+static int hlmod_metadata_set(PyObject *dict, const char *key, PyObject *value)
+{
+    if (!value) return -1;
+    int result = PyDict_SetItemString(dict, key, value);
+    Py_DECREF(value);
+    return result;
+}
+
+static PyObject *hlmod_type_descriptor(hl_type *type)
+{
+    PyObject *result = PyDict_New();
+    if (!result) return NULL;
+    int index = hlmod_type_index(type);
+    if (hlmod_metadata_set(result, "type_index", index < 0 ? Py_NewRef(Py_None) : PyLong_FromLong(index)) < 0 ||
+        hlmod_metadata_set(result, "kind", PyUnicode_FromString(kind2str(type->kind))) < 0 ||
+        hlmod_metadata_set(result, "name", hlmod_unicode(hl_type_str(type))) < 0) {
+        Py_DECREF(result);
+        return NULL;
+    }
+    return result;
+}
+
+static hl_enum_construct *hlmod_enum_constructor(hl_type *type, int index)
+{
+    if (!type || type->kind != HENUM || !type->tenum) {
+        PyErr_SetString(PyExc_TypeError, "Expected an enum type with constructor metadata.");
+        return NULL;
+    }
+    if (index < 0 || index >= type->tenum->nconstructs) {
+        PyErr_SetString(PyExc_IndexError, "Enum constructor index is out of bounds.");
+        return NULL;
+    }
+    hl_enum_construct *constructor = &type->tenum->constructs[index];
+    if (constructor->size < (int)(sizeof(void *) + sizeof(int)) ||
+        (constructor->nparams && (!constructor->params || !constructor->offsets))) {
+        PyErr_SetString(PyExc_TypeError, "Enum constructor layout is unavailable.");
+        return NULL;
+    }
+    for (int i = 0; i < constructor->nparams; i++) {
+        if (!hlmod_value_layout(constructor->params[i])) return NULL;
+        int offset = constructor->offsets[i], size = hl_type_size(constructor->params[i]);
+        if (offset < (int)(sizeof(void *) + sizeof(int)) || offset > constructor->size - size) {
+            PyErr_SetString(PyExc_TypeError, "Enum parameter layout is invalid.");
+            return NULL;
+        }
+    }
+    return constructor;
+}
+
+PyObject *hlmod_py_enum_info(PyObject *self, PyObject *args)
+{
+    HlPtr *pointer;
+    if (!PyArg_ParseTuple(args, "O!", &HlPtrType, &pointer)) return NULL;
+    venum *value = hlmod_require_pointer(pointer, HENUM);
+    if (!value) return NULL;
+    hl_enum_construct *constructor = hlmod_enum_constructor(pointer->type, value->index);
+    if (!constructor) return NULL;
+    PyObject *parameters = PyTuple_New(constructor->nparams);
+    if (!parameters) return NULL;
+    for (int i = 0; i < constructor->nparams; i++) {
+        PyObject *parameter = hlmod_cast_to_py(constructor->params[i], (char *)value + constructor->offsets[i]);
+        if (!parameter) { Py_DECREF(parameters); return NULL; }
+        PyTuple_SET_ITEM(parameters, i, parameter);
+    }
+    PyObject *name = hlmod_unicode(constructor->name);
+    PyObject *result = name ? Py_BuildValue("{s:i,s:O,s:O}", "constructor_index", value->index,
+        "constructor_name", name, "parameters", parameters) : NULL;
+    Py_XDECREF(name);
+    Py_DECREF(parameters);
+    return result;
+}
+
+PyObject *hlmod_py_enum_new(PyObject *self, PyObject *args)
+{
+    int type_index, constructor_index;
+    PyObject *parameters;
+    if (!PyArg_ParseTuple(args, "iiO", &type_index, &constructor_index, &parameters)) return NULL;
+    hl_type *type = hlmod_indexed_type(type_index);
+    if (!type) return NULL;
+    hl_enum_construct *constructor = hlmod_enum_constructor(type, constructor_index);
+    if (!constructor) return NULL;
+    PyObject *sequence = PySequence_Fast(parameters, "Enum parameters must be iterable.");
+    if (!sequence) return NULL;
+    if (PySequence_Fast_GET_SIZE(sequence) != constructor->nparams) {
+        Py_DECREF(sequence);
+        PyErr_Format(PyExc_TypeError, "Enum constructor expects %d parameters.", constructor->nparams);
+        return NULL;
+    }
+    venum *value = hl_alloc_enum(type, constructor_index);
+    PyObject *pointer = hlmod_ptr_new(value, type);
+    if (!pointer) { Py_DECREF(sequence); return NULL; }
+    for (int i = 0; i < constructor->nparams; i++) {
+        PyObject *item = PySequence_GetItem(sequence, i);
+        void *slot = item ? hlmod_cast_to_hl(item, constructor->params[i]) : NULL;
+        Py_XDECREF(item);
+        if (!slot) { Py_DECREF(pointer); Py_DECREF(sequence); return NULL; }
+        memcpy((char *)value + constructor->offsets[i], slot, hl_type_size(constructor->params[i]));
+    }
+    Py_DECREF(sequence);
+    return pointer;
+}
+
+static int hlmod_field_hash(PyObject *key, int *hash)
+{
+    if (!PyUnicode_Check(key)) {
+        PyErr_SetString(PyExc_TypeError, "Dynamic field names must be strings.");
+        return -1;
+    }
+    if (PyUnicode_FindChar(key, 0, 0, PyUnicode_GET_LENGTH(key), 1) >= 0) {
+        PyErr_SetString(PyExc_ValueError, "Dynamic field names cannot contain NUL.");
+        return -1;
+    }
+    PyObject *encoded = PyUnicode_AsEncodedString(key, "utf-16-le", "strict");
+    if (!encoded) return -1;
+    Py_ssize_t size = PyBytes_GET_SIZE(encoded);
+    uchar *name = PyMem_Malloc(size + sizeof(uchar));
+    if (!name) { Py_DECREF(encoded); PyErr_NoMemory(); return -1; }
+    memcpy(name, PyBytes_AS_STRING(encoded), size);
+    name[size / sizeof(uchar)] = 0;
+    *hash = hl_hash_gen(name, true);
+    PyMem_Free(name);
+    Py_DECREF(encoded);
+    return 0;
+}
+
+PyObject *hlmod_py_dynobj_new(PyObject *self, PyObject *args)
+{
+    if (!PyArg_ParseTuple(args, "")) return NULL;
+    vdynobj *value = hl_alloc_dynobj();
+    return hlmod_ptr_new(value, value->t);
+}
+
+PyObject *hlmod_py_dynobj_keys(PyObject *self, PyObject *args)
+{
+    HlPtr *pointer;
+    if (!PyArg_ParseTuple(args, "O!", &HlPtrType, &pointer)) return NULL;
+    vdynobj *value = hlmod_require_pointer(pointer, HDYNOBJ);
+    if (!value) return NULL;
+    PyObject *keys = PyTuple_New(value->nfields);
+    if (!keys) return NULL;
+    for (int i = 0; i < value->nfields; i++) {
+        PyObject *name = hlmod_unicode((const uchar *)hl_field_name(value->lookup[i].hashed_name));
+        if (!name) { Py_DECREF(keys); return NULL; }
+        PyTuple_SET_ITEM(keys, i, name);
+    }
+    return keys;
+}
+
+PyObject *hlmod_py_dynobj_get(PyObject *self, PyObject *args)
+{
+    HlPtr *pointer;
+    PyObject *key;
+    int hash;
+    if (!PyArg_ParseTuple(args, "O!O", &HlPtrType, &pointer, &key)) return NULL;
+    vdynobj *value = hlmod_require_pointer(pointer, HDYNOBJ);
+    if (!value || hlmod_field_hash(key, &hash) < 0) return NULL;
+    if (!hl_lookup_find(value->lookup, value->nfields, hash)) {
+        PyErr_SetObject(PyExc_KeyError, key);
+        return NULL;
+    }
+    hl_trap_ctx trap;
+    vdynamic *exception;
+    hl_trap(trap, exception, failed);
+    vdynamic *result = hl_obj_get_field((vdynamic *)value, hash);
+    hl_endtrap(trap);
+    return hlmod_cast_to_py(&hlt_dyn, &result);
+failed:
+    hl_endtrap(trap);
+    PyErr_Format(PyExc_TypeError, "Cannot read dynamic field: %s", hl_to_utf8(hl_to_string(exception)));
+    return NULL;
+}
+
+PyObject *hlmod_py_dynobj_set(PyObject *self, PyObject *args)
+{
+    HlPtr *pointer;
+    PyObject *key, *item;
+    int hash;
+    if (!PyArg_ParseTuple(args, "O!OO", &HlPtrType, &pointer, &key, &item)) return NULL;
+    vdynobj *value = hlmod_require_pointer(pointer, HDYNOBJ);
+    if (!value || hlmod_field_hash(key, &hash) < 0) return NULL;
+    /* Dynamic deliberately does not guess callable signatures. */
+    void *slot = hlmod_cast_to_hl(item, &hlt_dyn);
+    if (!slot) return NULL;
+    hl_trap_ctx trap;
+    vdynamic *exception;
+    hl_trap(trap, exception, failed);
+    hl_obj_set_field((vdynamic *)value, hash, *(vdynamic **)slot);
+    hl_endtrap(trap);
+    Py_RETURN_NONE;
+failed:
+    hl_endtrap(trap);
+    PyErr_Format(PyExc_TypeError, "Cannot write dynamic field: %s", hl_to_utf8(hl_to_string(exception)));
+    return NULL;
+}
+
+PyObject *hlmod_py_dynobj_delete(PyObject *self, PyObject *args)
+{
+    HlPtr *pointer;
+    PyObject *key;
+    int hash;
+    if (!PyArg_ParseTuple(args, "O!O", &HlPtrType, &pointer, &key)) return NULL;
+    vdynobj *value = hlmod_require_pointer(pointer, HDYNOBJ);
+    if (!value || hlmod_field_hash(key, &hash) < 0) return NULL;
+    if (!hl_obj_delete_field((vdynamic *)value, hash)) {
+        PyErr_SetObject(PyExc_KeyError, key);
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+static void *hlmod_ref(HlPtr *pointer)
+{
+    void *value = hlmod_require_pointer(pointer, HREF);
+    if (!value || !hlmod_value_layout(pointer->type->tparam)) return NULL;
+    if (!pointer->root) {
+        PyErr_SetString(PyExc_TypeError, "Stack-backed HL references have no safe escaping lifetime.");
+        return NULL;
+    }
+    return value;
+}
+
+PyObject *hlmod_py_ref_new(PyObject *self, PyObject *args)
+{
+    int index;
+    PyObject *value;
+    if (!PyArg_ParseTuple(args, "iO", &index, &value)) return NULL;
+    hl_type *type = hlmod_indexed_type(index);
+    if (!type) return NULL;
+    if (type->kind != HREF) {
+        PyErr_SetString(PyExc_TypeError, "Reference creation requires an explicit HREF type index.");
+        return NULL;
+    }
+    if (!hlmod_value_layout(type->tparam)) return NULL;
+    void *slot = hlmod_cast_to_hl(value, type->tparam);
+    return slot ? hlmod_ptr_new(slot, type) : NULL;
+}
+
+PyObject *hlmod_py_ref_get(PyObject *self, PyObject *args)
+{
+    HlPtr *pointer;
+    if (!PyArg_ParseTuple(args, "O!", &HlPtrType, &pointer)) return NULL;
+    void *value = hlmod_ref(pointer);
+    return value ? hlmod_cast_to_py(pointer->type->tparam, value) : NULL;
+}
+
+PyObject *hlmod_py_ref_set(PyObject *self, PyObject *args)
+{
+    HlPtr *pointer;
+    PyObject *item;
+    if (!PyArg_ParseTuple(args, "O!O", &HlPtrType, &pointer, &item)) return NULL;
+    void *value = hlmod_ref(pointer);
+    if (!value) return NULL;
+    void *slot = hlmod_cast_to_hl(item, pointer->type->tparam);
+    if (!slot) return NULL;
+    memcpy(value, slot, hl_type_size(pointer->type->tparam));
+    Py_RETURN_NONE;
+}
+
+static PyObject *hlmod_type_descriptors(hl_type **types, int count)
+{
+    PyObject *result = PyTuple_New(count);
+    if (!result) return NULL;
+    for (int i = 0; i < count; i++) {
+        PyObject *item = hlmod_type_descriptor(types[i]);
+        if (!item) { Py_DECREF(result); return NULL; }
+        PyTuple_SET_ITEM(result, i, item);
+    }
+    return result;
+}
+
+static int hlmod_inspect_field(PyObject *fields, const uchar *name, int index, hl_type *type, hl_type *owner)
+{
+    PyObject *field = PyDict_New();
+    if (!field) return -1;
+    int result = -1;
+    if (hlmod_metadata_set(field, "name", hlmod_unicode(name)) < 0 ||
+        hlmod_metadata_set(field, "index", PyLong_FromLong(index)) < 0 ||
+        hlmod_metadata_set(field, "type", hlmod_type_descriptor(type)) < 0 ||
+        hlmod_metadata_set(field, "declaring_type_index", hlmod_type_index(owner) < 0 ? Py_NewRef(Py_None) : PyLong_FromLong(hlmod_type_index(owner))) < 0)
+        goto done;
+    result = PyList_Append(fields, field);
+done:
+    Py_DECREF(field);
+    return result;
+}
+
+PyObject *hlmod_py_inspect_native(PyObject *self, PyObject *args)
+{
+    PyObject *value;
+    if (!PyArg_ParseTuple(args, "O", &value)) return NULL;
+    HlPtr *pointer = NULL;
+    hl_type *type;
+    if (PyLong_Check(value) && !PyBool_Check(value)) {
+        long index = PyLong_AsLong(value);
+        if (PyErr_Occurred()) return NULL;
+        if (index < 0 || index > INT_MAX) {
+            PyErr_SetString(PyExc_IndexError, "Native type index is out of bounds.");
+            return NULL;
+        }
+        type = hlmod_indexed_type((int)index);
+        if (!type) return NULL;
+    } else {
+        pointer = hlmod_extract_pointer(value);
+        if (!pointer) return NULL;
+        type = pointer->type;
+        if (pointer->ptr && hl_is_dynamic(type)) type = ((vdynamic *)pointer->ptr)->t;
+    }
+    PyObject *result = hlmod_type_descriptor(type);
+    PyObject *fields = PyList_New(0), *methods = PyList_New(0);
+    if (!result || !fields || !methods) goto failed;
+    if (type->kind == HOBJ || type->kind == HSTRUCT) {
+        hl_type *current = type;
+        int depth = 0;
+        while (current && depth++ < HLMOD_MAX_INHERITANCE) {
+            hl_type_obj *obj = current->obj;
+            hl_runtime_obj *rt = hl_get_obj_rt(current);
+            for (int i = 0; i < obj->nfields; i++) {
+                hl_obj_field *field = &obj->fields[i];
+                if (hlmod_inspect_field(fields, field->name, rt->nfields - obj->nfields + i, field->t, current) < 0) goto failed;
+            }
+            for (int i = 0; i < obj->nproto; i++) {
+                hl_obj_proto *proto = &obj->proto[i];
+                hl_type *signature = hlmod_function_type(proto->findex);
+                if (!signature) goto failed;
+                PyObject *method = PyDict_New();
+                if (!method) goto failed;
+                int status = hlmod_metadata_set(method, "name", hlmod_unicode(proto->name));
+                if (!status) status = hlmod_metadata_set(method, "findex", PyLong_FromLong(proto->findex));
+                if (!status) status = hlmod_metadata_set(method, "declaring_type_index", hlmod_type_index(current) < 0 ? Py_NewRef(Py_None) : PyLong_FromLong(hlmod_type_index(current)));
+                if (!status) status = hlmod_metadata_set(method, "type", hlmod_type_descriptor(signature));
+                if (!status) status = hlmod_metadata_set(method, "arguments", hlmod_type_descriptors(signature->fun->args, signature->fun->nargs));
+                if (!status) status = hlmod_metadata_set(method, "return_type", hlmod_type_descriptor(signature->fun->ret));
+                if (!status) status = PyList_Append(methods, method);
+                Py_DECREF(method);
+                if (status < 0) goto failed;
+            }
+            current = obj->super;
+        }
+        if (current) {
+            PyErr_SetString(PyExc_TypeError, "Native inheritance exceeds the inspection depth limit.");
+            goto failed;
+        }
+    } else if (type->kind == HVIRTUAL) {
+        for (int i = 0; i < type->virt->nfields; i++) {
+            hl_obj_field *field = &type->virt->fields[i];
+            if (hlmod_inspect_field(fields, field->name, i, field->t, type) < 0) goto failed;
+        }
+    } else if (type->kind == HDYNOBJ && pointer && pointer->ptr) {
+        vdynobj *obj = pointer->ptr;
+        for (int i = 0; i < obj->nfields; i++) {
+            hl_field_lookup *field = &obj->lookup[i];
+            if (hlmod_inspect_field(fields, (const uchar *)hl_field_name(field->hashed_name), i, field->t, type) < 0) goto failed;
+        }
+    } else if (type->kind == HENUM) {
+        PyObject *constructors = PyList_New(0);
+        if (!constructors) goto failed;
+        for (int i = 0; i < type->tenum->nconstructs; i++) {
+            hl_enum_construct *constructor = &type->tenum->constructs[i];
+            PyObject *entry = PyDict_New();
+            if (!entry) { Py_DECREF(constructors); goto failed; }
+            int status = hlmod_metadata_set(entry, "name", hlmod_unicode(constructor->name));
+            if (!status) status = hlmod_metadata_set(entry, "index", PyLong_FromLong(i));
+            if (!status) status = hlmod_metadata_set(entry, "parameters", hlmod_type_descriptors(constructor->params, constructor->nparams));
+            if (!status) status = PyList_Append(constructors, entry);
+            Py_DECREF(entry);
+            if (status < 0) { Py_DECREF(constructors); goto failed; }
+        }
+        if (hlmod_metadata_set(result, "constructors", constructors) < 0) goto failed;
+    }
+    if (type->kind == HREF || type->kind == HNULL || type->kind == HPACKED) {
+        if (hlmod_metadata_set(result, "element_type", hlmod_type_descriptor(type->tparam)) < 0) goto failed;
+    } else if (type->kind == HARRAY && pointer && pointer->ptr) {
+        if (hlmod_metadata_set(result, "element_type", hlmod_type_descriptor(((varray *)pointer->ptr)->at)) < 0) goto failed;
+    } else if (type->kind == HFUN || type->kind == HMETHOD) {
+        if (hlmod_metadata_set(result, "arguments", hlmod_type_descriptors(type->fun->args, type->fun->nargs)) < 0 ||
+            hlmod_metadata_set(result, "return_type", hlmod_type_descriptor(type->fun->ret)) < 0) goto failed;
+    }
+    if (PyDict_SetItemString(result, "fields", fields) < 0 || PyDict_SetItemString(result, "methods", methods) < 0) goto failed;
+    Py_DECREF(fields);
+    Py_DECREF(methods);
+    Py_XDECREF(pointer);
+    return result;
+failed:
+    Py_XDECREF(result);
+    Py_XDECREF(fields);
+    Py_XDECREF(methods);
+    Py_XDECREF(pointer);
+    return NULL;
 }
