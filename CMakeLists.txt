@@ -232,6 +232,16 @@ if (WITH_VM)
         src/native_hook.c
     )
 
+    if(MSVC)
+        # native_hook.c is plain C including <windows.h> to reach VirtualProtect/
+        # FlushInstructionCache. Windows SDK headers (guiddef.h, winnt.h) rely on
+        # MS anonymous struct/union extensions that /permissive- disables in C
+        # mode specifically (C++ is unaffected, which is why directx.cpp/dx12.cpp
+        # compile fine under the same flag) - restore permissive mode for just
+        # this file rather than dropping /permissive- project-wide.
+        set_source_files_properties(src/native_hook.c PROPERTIES COMPILE_OPTIONS "/permissive")
+    endif()
+
 
     if(APPLE)
         set_target_properties(hl PROPERTIES
