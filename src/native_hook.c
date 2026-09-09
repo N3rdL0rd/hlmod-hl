@@ -257,6 +257,73 @@ static void write_jump(unsigned char *at, void *target) {
 }
 
 #if defined(HL_WIN)
+/* x86-64 SEH requires every non-leaf function - one whose frame could be a
+ * return address sitting on the stack when an exception is dispatched - to
+ * carry unwind metadata describing how to restore the caller's registers.
+ * Code the OS itself never linked, like the landing stub
+ * hl_jit_native_hook_adapter (jit.c) builds at runtime, carries none by
+ * default. The moment any exception needs to unwind *through* such a frame
+ * - a real hardware fault surfacing deeper in a hook callback, for example
+ * - `RtlDispatchException` can't compute how to walk past it, and the
+ * whole process is torn down immediately with STATUS_BAD_FUNCTION_TABLE,
+ * bypassing even hlmod's own top-level SEH filter (hlmod_setup_handler)
+ * entirely. This was reproduced on real Windows CI hardware (Wine's own
+ * unwinder is far more lenient about missing tables and let it slide).
+ *
+ * The landing stub's prologue is fixed and known: `push rbp; mov rbp, rsp`
+ * (see hl_jit_native_hook_adapter), exactly the shape x64 unwind info
+ * describes via UWOP_SET_FPREG. Once the frame register is pinned to rbp,
+ * the unwinder only needs that one fact to walk past this frame correctly
+ * - whatever it does afterwards (further pushes, `sub rsp`, calls) is
+ * irrelevant to unwinding once a frame pointer is established, so this
+ * minimal, hand-built UNWIND_INFO stays correct regardless of how the rest
+ * of that stub's code generation evolves. */
+#pragma pack(push, 1)
+typedef struct HlmodUnwindInfo {
+    unsigned char VersionAndFlags;      /* version 1, flags 0 (UNW_FLAG_NHANDLER) */
+    unsigned char SizeOfProlog;         /* `push rbp` (1) + `mov rbp,rsp` (3) = 4 */
+    unsigned char CountOfCodes;
+    unsigned char FrameRegisterAndOffset; /* rbp, offset 0 */
+    unsigned char CodeOffset0;          /* codes stored in reverse execution order */
+    unsigned char UnwindOpAndInfo0;     /* UWOP_SET_FPREG @ offset 4 */
+    unsigned char CodeOffset1;
+    unsigned char UnwindOpAndInfo1;     /* UWOP_PUSH_NONVOL(rbp) @ offset 1 */
+} HlmodUnwindInfo;
+#pragma pack(pop)
+
+typedef struct HlmodUnwindBlob {
+    HlmodUnwindInfo info;
+    RUNTIME_FUNCTION fn;
+} HlmodUnwindBlob;
+
+#define HLMOD_UWOP_PUSH_NONVOL 0
+#define HLMOD_UWOP_SET_FPREG   3
+#define HLMOD_REG_RBP          5
+
+/* Registers unwind info for a landing stub allocated at `code`/`codesize`
+ * (the buffer hl_alloc_executable_memory returned for it). `codesize` is
+ * always page-rounded (see hl_jit_native_hook_adapter) while the real
+ * instructions are a few dozen bytes at most, leaving plenty of room to
+ * tuck the metadata away in the same page without a second allocation. */
+static void register_landing_unwind_info(void *code, int codesize) {
+    size_t blob_off = ((size_t)codesize - sizeof(HlmodUnwindBlob)) & ~(size_t)3;
+    HlmodUnwindBlob *blob = (HlmodUnwindBlob *)((unsigned char *)code + blob_off);
+    blob->info.VersionAndFlags = 1;
+    blob->info.SizeOfProlog = 4;
+    blob->info.CountOfCodes = 2;
+    blob->info.FrameRegisterAndOffset = HLMOD_REG_RBP;
+    blob->info.CodeOffset0 = 4;
+    blob->info.UnwindOpAndInfo0 = HLMOD_UWOP_SET_FPREG;
+    blob->info.CodeOffset1 = 1;
+    blob->info.UnwindOpAndInfo1 = (unsigned char)(HLMOD_UWOP_PUSH_NONVOL | (HLMOD_REG_RBP << 4));
+    blob->fn.BeginAddress = 0;
+    blob->fn.EndAddress = (DWORD)codesize;
+    blob->fn.UnwindData = (DWORD)blob_off;
+    RtlAddFunctionTable(&blob->fn, 1, (DWORD64)(uintptr_t)code);
+}
+#endif
+
+#if defined(HL_WIN)
 static int patch_target(void *target, void *landing) {
     DWORD old;
     if (!VirtualProtect(target, HLMOD_JUMP_SIZE, PAGE_EXECUTE_READWRITE, &old)) return -1;
@@ -330,6 +397,27 @@ int hlmod_native_hook_ensure_installed(int findex, hl_type *signature) {
         return -1;
     }
 
+#if defined(HL_WIN)
+    /* Unlike the landing stub (fixed shape, unwind info hand-built below),
+     * `resume` is an arbitrary copy of this specific native's own prologue
+     * bytes. A `call rel32` in there (typically a `__chkstk` stack probe
+     * for natives with large locals) means `resume` briefly becomes a
+     * genuine non-leaf frame with no way to describe its unwind info
+     * generically. Left unguarded this is the same failure mode as the
+     * landing stub fixed below: fine until an exception needs to unwind
+     * through it, then STATUS_BAD_FUNCTION_TABLE takes the whole process
+     * down. Refuse rather than risk it. */
+    if (reloc_count > 0) {
+        PyErr_SetString(PyExc_RuntimeError,
+            "Cannot safely hook this native on Windows: its prologue contains a call "
+            "(e.g. a stack probe) that would need its own unwind metadata once copied "
+            "into the resume trampoline, and hlmod cannot hand-build accurate unwind "
+            "info for an arbitrary copied prologue the way it can for its own fixed-shape "
+            "landing stub");
+        return -1;
+    }
+#endif
+
     void *resume = hl_alloc_executable_memory(safe_len + HLMOD_JUMP_SIZE);
     if (!resume) {
         PyErr_NoMemory();
@@ -373,6 +461,9 @@ int hlmod_native_hook_ensure_installed(int findex, hl_type *signature) {
         PyErr_NoMemory();
         return -1;
     }
+#if defined(HL_WIN)
+    register_landing_unwind_info(landing, codesize);
+#endif
 
     if (patch_target(target, landing) != 0) {
         free(hookctx);
