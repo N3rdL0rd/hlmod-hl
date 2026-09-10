@@ -1,6 +1,8 @@
 """Discover literal mod manifests and resolve a deterministic dependency order."""
 
 import ast
+import os
+import sys
 from collections import deque
 from pathlib import Path
 
@@ -45,21 +47,37 @@ def get_mod_info(filepath):
     return None
 
 
+def _search_dirs(mods_dir):
+    """The primary mods directory, plus any directories listed in
+    `HLMOD_EXTRA_MODS` (`os.pathsep`-separated), so a mod's own source can
+    live in its own project directory instead of inside the game's `mods/`.
+    Every directory is added to `sys.path` so `import_module` can find
+    mods placed directly in it, exactly as the primary directory already is."""
+    dirs = [mods_dir]
+    extra = os.environ.get("HLMOD_EXTRA_MODS", "")
+    dirs.extend(path for path in extra.split(os.pathsep) if path)
+    for path in dirs:
+        if path not in sys.path:
+            sys.path.append(path)
+    return dirs
+
+
 def find_mods(mods_dir):
     found = []
-    for path in sorted(Path(mods_dir).iterdir()):
-        if path.name.startswith("_") or path.name == "stubs":
-            continue
-        if path.is_dir():
-            info = get_mod_info(path / "__init__.py")
-            name = path.name
-        elif path.suffix == ".py":
-            info = get_mod_info(path)
-            name = path.stem
-        else:
-            continue
-        if info is not None:
-            found.append({"info": info, "name": name})
+    for search_dir in _search_dirs(mods_dir):
+        for path in sorted(Path(search_dir).iterdir()):
+            if path.name.startswith("_") or path.name == "stubs":
+                continue
+            if path.is_dir():
+                info = get_mod_info(path / "__init__.py")
+                name = path.name
+            elif path.suffix == ".py":
+                info = get_mod_info(path)
+                name = path.stem
+            else:
+                continue
+            if info is not None:
+                found.append({"info": info, "name": name})
     return found
 
 

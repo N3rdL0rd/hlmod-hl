@@ -6,9 +6,10 @@
 #include <hlmodule.h>
 
 /**
- * @brief Extracts native metadata and renders Python proxies; false on failure.
+ * @brief Extracts native metadata and renders Python proxies into
+ * `<mods_dir>/stubs`; false on failure.
  */
-bool hlmod_generate_stubs(hl_code *code);
+bool hlmod_generate_stubs(hl_code *code, const char *mods_dir);
 
 #endif // HLMOD_CODEGEN_H
 

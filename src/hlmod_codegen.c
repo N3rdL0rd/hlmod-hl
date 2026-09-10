@@ -174,9 +174,15 @@ static PyObject *extract_metadata(hl_code *code) {
     return root;
 }
 
-bool hlmod_generate_stubs(hl_code *code) {
+bool hlmod_generate_stubs(hl_code *code, const char *mods_dir) {
     PyObject *metadata = extract_metadata(code);
     if (!metadata) goto error;
+    char stubs_dir[4096];
+    if (snprintf(stubs_dir, sizeof(stubs_dir), "%s/stubs", mods_dir) >= (int)sizeof(stubs_dir)) {
+        fprintf(stderr, "[hlmod] Mods directory path is too long.\n");
+        Py_DECREF(metadata);
+        return false;
+    }
     PyObject *compiled = Py_CompileString(hlmod_stub_renderer_source,
         "<hlmod>/stub_renderer.py", Py_file_input);
     PyObject *module = compiled ? PyImport_ExecCodeModule("_hlmod_codegen", compiled) : NULL;
@@ -185,7 +191,7 @@ bool hlmod_generate_stubs(hl_code *code) {
 #define SOURCE_FILE_SHA256_HASH ""
 #endif
     PyObject *result = module ? PyObject_CallMethod(module, "generate", "Oss",
-        metadata, "./mods/stubs", SOURCE_FILE_SHA256_HASH) : NULL;
+        metadata, stubs_dir, SOURCE_FILE_SHA256_HASH) : NULL;
     Py_XDECREF(module);
     Py_DECREF(metadata);
     if (!result) goto error;

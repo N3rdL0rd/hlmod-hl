@@ -223,13 +223,14 @@ int main(int argc, pchar *argv[]) {
         PyErr_Print();
         goto shutdown;
     }
+    const char* mods_directory = getenv("HLMOD_MODS_DIR");
+    if (mods_directory == NULL) mods_directory = "./mods";
 #ifndef NO_STUBGEN
-    if (!hlmod_generate_stubs(ctx.code)) goto shutdown;
+    if (!hlmod_generate_stubs(ctx.code, mods_directory)) goto shutdown;
 #endif
     if (sdk_only) { exit_code = 0; goto shutdown; }
 
 	printf("[hlmod] Finding mods...\n");
-    const char* mods_directory = "./mods";
 
     PyObject* sys_path = PySys_GetObject("path");
     PyObject* mods_path_obj = PyUnicode_FromString(mods_directory);

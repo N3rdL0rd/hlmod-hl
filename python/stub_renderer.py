@@ -510,9 +510,11 @@ class Renderer:
 
 
 def generate(metadata: dict, base_dir: str, source_hash: str) -> None:
+    root = Path(base_dir)
+    mods_dir = root.parent
     if "docs" not in metadata:
         metadata["docs"] = {}
-        for path in (Path("haxe_docs.json"), Path("mods/haxe_docs.json"), Path("std_doc/haxe_docs.json")):
+        for path in (Path("haxe_docs.json"), mods_dir / "haxe_docs.json", Path("std_doc/haxe_docs.json")):
             try:
                 with path.open(encoding="utf-8") as source:
                     docs = json.load(source)
@@ -525,8 +527,7 @@ def generate(metadata: dict, base_dir: str, source_hash: str) -> None:
                 continue
             metadata["docs"] = docs
             break
-    root = Path(base_dir)
-    overlay_path = Path(os.environ.get("HLMOD_TYPING_OVERLAY", "mods/typing_overlays.json"))
+    overlay_path = Path(os.environ.get("HLMOD_TYPING_OVERLAY", str(mods_dir / "typing_overlays.json")))
     try:
         overlay = json.loads(overlay_path.read_text(encoding="utf-8"))
     except FileNotFoundError:
