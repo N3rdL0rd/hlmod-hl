@@ -2661,6 +2661,78 @@ static double jit_python_double(void *c, hl_type *t, char *stack, void **regs) {
 	vdynamic r = jit_python_call(c,t,stack,regs);
 	return r.v.d;
 }
+#if defined(HL_WIN) && defined(HL_64)
+/* x86-64 SEH requires every non-leaf function - one whose frame could be a
+ * return address sitting on the stack when an exception is dispatched - to
+ * carry unwind metadata describing how to restore the caller's registers.
+ * hl_jit_python_adapter and hl_jit_native_hook_adapter below are hlmod's
+ * own additions to this file (not upstream HashLink); both emit a fixed,
+ * regular `push rbp; mov rbp, rsp` prologue before calling into a real,
+ * normally-compiled C dispatch function, but - unlike everything else this
+ * JIT emits - their own frame can go on to make Python C-API calls, which
+ * on real Windows genuinely can raise: a hardware fault or PyErr-driven
+ * SEH exception surfacing while one of these adapters is on the stack has
+ * nowhere else that first needs to unwind *through* it. Code the OS itself
+ * never linked carries no such metadata by default, so the moment that
+ * happens, `RtlDispatchException` can't compute how to walk past this
+ * frame and the whole process is torn down immediately with
+ * STATUS_BAD_FUNCTION_TABLE, bypassing even hlmod's own top-level SEH
+ * filter (hlmod_setup_handler) entirely. Reproduced on real Windows CI
+ * hardware for both adapters (Wine's own unwinder is far more lenient
+ * about missing tables and let it slide there).
+ *
+ * With the frame register pinned to rbp via UWOP_SET_FPREG, the unwinder
+ * only needs that one fact to walk past this frame correctly - whatever it
+ * does afterwards (further pushes, `sub rsp`, calls) is irrelevant to
+ * unwinding once a frame pointer is established, so this minimal,
+ * hand-built UNWIND_INFO stays correct regardless of how the rest of
+ * either adapter's code generation evolves, as long as both keep starting
+ * with exactly this two-instruction prologue. */
+#pragma pack(push, 1)
+typedef struct HlmodUnwindInfo {
+	unsigned char VersionAndFlags;        /* version 1, flags 0 (UNW_FLAG_NHANDLER) */
+	unsigned char SizeOfProlog;           /* `push rbp` (1) + `mov rbp,rsp` (3) = 4 */
+	unsigned char CountOfCodes;
+	unsigned char FrameRegisterAndOffset; /* rbp, offset 0 */
+	unsigned char CodeOffset0;            /* codes stored in reverse execution order */
+	unsigned char UnwindOpAndInfo0;       /* UWOP_SET_FPREG @ offset 4 */
+	unsigned char CodeOffset1;
+	unsigned char UnwindOpAndInfo1;       /* UWOP_PUSH_NONVOL(rbp) @ offset 1 */
+} HlmodUnwindInfo;
+#pragma pack(pop)
+
+typedef struct HlmodUnwindBlob {
+	HlmodUnwindInfo info;
+	RUNTIME_FUNCTION fn;
+} HlmodUnwindBlob;
+
+#define HLMOD_UWOP_PUSH_NONVOL 0
+#define HLMOD_UWOP_SET_FPREG   3
+#define HLMOD_REG_RBP          5
+
+/* Registers unwind info for a `push rbp; mov rbp, rsp`-prologue JIT stub
+ * allocated at `code`/`codesize` (the buffer hl_alloc_executable_memory
+ * returned for it). `codesize` is always page-rounded by both callers
+ * while the real instructions are a few dozen bytes at most, leaving
+ * plenty of room to tuck the metadata away in the same page without a
+ * second allocation. */
+static void hlmod_register_jit_stub_unwind(void *code, int codesize) {
+	size_t blob_off = ((size_t)codesize - sizeof(HlmodUnwindBlob)) & ~(size_t)3;
+	HlmodUnwindBlob *blob = (HlmodUnwindBlob *)((unsigned char *)code + blob_off);
+	blob->info.VersionAndFlags = 1;
+	blob->info.SizeOfProlog = 4;
+	blob->info.CountOfCodes = 2;
+	blob->info.FrameRegisterAndOffset = HLMOD_REG_RBP;
+	blob->info.CodeOffset0 = 4;
+	blob->info.UnwindOpAndInfo0 = HLMOD_UWOP_SET_FPREG;
+	blob->info.CodeOffset1 = 1;
+	blob->info.UnwindOpAndInfo1 = (unsigned char)(HLMOD_UWOP_PUSH_NONVOL | (HLMOD_REG_RBP << 4));
+	blob->fn.BeginAddress = 0;
+	blob->fn.EndAddress = (DWORD)codesize;
+	blob->fn.UnwindData = (DWORD)blob_off;
+	RtlAddFunctionTable(&blob->fn, 1, (DWORD64)(uintptr_t)code);
+}
+#endif
 
 void *hl_jit_python_adapter(hl_type *signature, void *context, bool closure, int *codesize) {
 	jit_ctx *ctx = hl_jit_alloc();
@@ -2695,7 +2767,12 @@ void *hl_jit_python_adapter(hl_type *signature, void *context, bool closure, int
 	op64(ctx,RET,UNUSED,UNUSED);
 	*codesize = (BUF_POS()+4095)&~4095;
 	code = hl_alloc_executable_memory(*codesize);
-	if( code ) memcpy(code,ctx->startBuf,BUF_POS());
+	if( code ) {
+		memcpy(code,ctx->startBuf,BUF_POS());
+#if defined(HL_WIN) && defined(HL_64)
+		hlmod_register_jit_stub_unwind(code,*codesize);
+#endif
+	}
 	hl_jit_free(ctx,false);
 	return code;
 }
@@ -2796,7 +2873,12 @@ void *hl_jit_native_hook_adapter(hl_type *signature, void *hookctx, int *codesiz
 	op64(ctx,RET,UNUSED,UNUSED);
 	*codesize = (BUF_POS()+4095)&~4095;
 	code = hl_alloc_executable_memory(*codesize);
-	if( code ) memcpy(code,ctx->startBuf,BUF_POS());
+	if( code ) {
+		memcpy(code,ctx->startBuf,BUF_POS());
+#if defined(HL_WIN) && defined(HL_64)
+		hlmod_register_jit_stub_unwind(code,*codesize);
+#endif
+	}
 	hl_jit_free(ctx,false);
 	return code;
 }
