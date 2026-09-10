@@ -57,3 +57,7 @@ args.txt
 /other/benchs/hlc
 
 /src/hlmod_codegen_sig.h
+
+# Python-generated files (python/ ships stub_renderer.py, mod_sorter.py, embed.py)
+__pycache__/
+*.py[oc]
