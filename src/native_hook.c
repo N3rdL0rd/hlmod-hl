@@ -67,16 +67,42 @@ static int modrm_len(const unsigned char *p) {
     return len;
 }
 
+/* True when a ModRM byte at `p` addresses memory as `[rip+disp32]` - the
+ * `mod==0, rm==5` encoding, distinct from the SIB "no base, absolute
+ * disp32" form (which uses a SIB byte and is not RIP-relative). Compilers
+ * emit this constantly for loads of static/constant data (float literals,
+ * globals) from position-independent code. */
+static bool modrm_is_rip_relative(const unsigned char *p) {
+    unsigned char modrm = p[0];
+    return ((modrm >> 6) & 3) == 0 && (modrm & 7) == 5;
+}
+
 /* Decodes exactly one x86-64 instruction at `code`. Returns 1 and fills
  * `*out_len` (and `*is_terminal` for control-flow instructions) on success,
  * or 0 if the encoding is outside the narrow set this decoder recognizes.
  * Only common compiler-emitted prologue instructions are accepted; anything
- * else is treated as unrecognized rather than guessed at. */
-static int decode_one(const unsigned char *code, int *out_len, int *is_terminal, bool *is_call_reloc) {
+ * else is treated as unrecognized rather than guessed at.
+ *
+ * `*reloc_disp_offset` is set to the byte offset (from `code`) of a 4-byte
+ * displacement that is relative to the address of the *next* instruction
+ * and must therefore be recomputed once this instruction is copied
+ * elsewhere - either a `call rel32`'s target, or a `[rip+disp32]` memory
+ * operand (e.g. a constant-pool load) - or -1 if this instruction needs no
+ * such fixup. Both cases use the identical x86-64 invariant "RIP means the
+ * address right after this instruction", so one relocation offset and one
+ * fixup formula (see hlmod_native_hook_ensure_installed) covers both. Only
+ * checked for instructions where the displacement is unambiguously the
+ * last 4 bytes (no trailing immediate); instructions that pair a ModRM
+ * memory operand with a separate immediate (0x69/0x6B/0x80/0x81/0xC6/0xC7)
+ * are refused outright if RIP-relative rather than risk mislocating the
+ * fixup - narrower than strictly necessary, but nothing an x86-64 function
+ * prologue plausibly needs. */
+static int decode_one(const unsigned char *code, int *out_len, int *is_terminal, int *reloc_disp_offset, bool *is_call) {
     int i = 0;
     int rex_w = 0;
     *is_terminal = 0;
-    *is_call_reloc = false;
+    *reloc_disp_offset = -1;
+    *is_call = false;
 
     if (code[0] == 0xF3 && code[1] == 0x0F && code[2] == 0x1E && code[3] == 0xFA) {
         *out_len = 4; /* endbr64 */
@@ -122,7 +148,8 @@ static int decode_one(const unsigned char *code, int *out_len, int *is_terminal,
      * target is arbitrary and may not be the trampoline's own resume point. */
     case 0xE8:
         *out_len = i + 5;
-        *is_call_reloc = true;
+        *reloc_disp_offset = i + 1;
+        *is_call = true;
         return 1;
     case 0xE9:
         *out_len = i + 5;
@@ -159,9 +186,18 @@ static int decode_one(const unsigned char *code, int *out_len, int *is_terminal,
             *is_terminal = 1;
             return 1;
         }
+        /* 0x10/0x11 movups, 0x28/0x29 movaps, 0x2A cvtsi2sd/ss, 0x6F/0x7F
+         * movq/movdqa, 0xEF pxor: the SSE/SSE2 load/store/zero forms GCC
+         * emits for floating-point-returning natives' prologues (spilling
+         * a callee-saved XMM register, zeroing an accumulator, loading a
+         * float constant - see hl_sys_time). */
         if (op2 == 0x1F || op2 == 0xB6 || op2 == 0xB7 || op2 == 0xBE || op2 == 0xBF || op2 == 0xAF ||
-            op2 == 0x10 || op2 == 0x11 || op2 == 0x28 || op2 == 0x29 || op2 == 0x6F || op2 == 0x7F) {
-            *out_len = i + 2 + modrm_len(code + i + 2);
+            op2 == 0x10 || op2 == 0x11 || op2 == 0x28 || op2 == 0x29 || op2 == 0x2A ||
+            op2 == 0x6F || op2 == 0x7F || op2 == 0xEF) {
+            int mstart = i + 2;
+            int mlen = modrm_len(code + mstart);
+            *out_len = mstart + mlen;
+            if (modrm_is_rip_relative(code + mstart)) *reloc_disp_offset = mstart + mlen - 4;
             return 1;
         }
         return 0;
@@ -176,22 +212,30 @@ static int decode_one(const unsigned char *code, int *out_len, int *is_terminal,
     case 0x38: case 0x39: case 0x3A: case 0x3B:
     case 0x84: case 0x85: case 0x86: case 0x87:
     case 0x88: case 0x89: case 0x8A: case 0x8B:
-    case 0x8D:
-        *out_len = i + 1 + modrm_len(code + i + 1);
+    case 0x8D: {
+        int mstart = i + 1;
+        int mlen = modrm_len(code + mstart);
+        *out_len = mstart + mlen;
+        if (modrm_is_rip_relative(code + mstart)) *reloc_disp_offset = mstart + mlen - 4;
         return 1;
+    }
     case 0x69:
+        if (modrm_is_rip_relative(code + i + 1)) return 0; /* disp precedes a trailing imm32; see doc comment */
         *out_len = i + 1 + modrm_len(code + i + 1) + 4;
         return 1;
     case 0x6B:
+        if (modrm_is_rip_relative(code + i + 1)) return 0;
         *out_len = i + 1 + modrm_len(code + i + 1) + 1;
         return 1;
     case 0x80:
     case 0x83:
     case 0xC6:
+        if (modrm_is_rip_relative(code + i + 1)) return 0;
         *out_len = i + 1 + modrm_len(code + i + 1) + 1;
         return 1;
     case 0x81:
     case 0xC7:
+        if (modrm_is_rip_relative(code + i + 1)) return 0;
         *out_len = i + 1 + modrm_len(code + i + 1) + 4;
         return 1;
     case 0xFF: {
@@ -211,21 +255,25 @@ static int decode_one(const unsigned char *code, int *out_len, int *is_terminal,
 /* Walks instructions from `code` until at least `min_len` bytes have been
  * accounted for, refusing (returns -1) on any unrecognized encoding or any
  * unrelocatable control-flow instruction reached before that point.
- * Records the offset of every `call rel32` found (it will need its
- * displacement fixed up once copied to a new address) into `reloc_offsets`,
- * up to `max_relocs` entries; refuses rather than silently dropping one if
- * there are more than that. */
-static int safe_prologue_len_ex(const unsigned char *code, int min_len, int *reloc_offsets, int max_relocs, int *reloc_count) {
+ * Records the offset of every displacement needing RIP-relative fixup
+ * (see decode_one) into `reloc_offsets`, up to `max_relocs` entries;
+ * refuses rather than silently dropping one if there are more than that.
+ * `*call_count` separately counts how many of those relocations are `call
+ * rel32` specifically (as opposed to a RIP-relative data load): only calls
+ * make the copied trampoline a non-leaf frame needing unwind info. */
+static int safe_prologue_len_ex(const unsigned char *code, int min_len, int *reloc_offsets, int max_relocs, int *reloc_count, int *call_count) {
     int offset = 0;
     *reloc_count = 0;
+    *call_count = 0;
     while (offset < min_len) {
-        int len = 0, terminal = 0;
-        bool call_reloc = false;
-        if (!decode_one(code + offset, &len, &terminal, &call_reloc) || len <= 0) return -1;
+        int len = 0, terminal = 0, reloc_disp = -1;
+        bool is_call = false;
+        if (!decode_one(code + offset, &len, &terminal, &reloc_disp, &is_call) || len <= 0) return -1;
         if (terminal) return -1;
-        if (call_reloc) {
+        if (reloc_disp >= 0) {
             if (*reloc_count >= max_relocs) return -1;
-            reloc_offsets[(*reloc_count)++] = offset;
+            reloc_offsets[(*reloc_count)++] = offset + reloc_disp;
+            if (is_call) (*call_count)++;
         }
         offset += len;
         if (offset > min_len + 16) return -1; /* runaway guard */
@@ -233,9 +281,12 @@ static int safe_prologue_len_ex(const unsigned char *code, int min_len, int *rel
     return offset;
 }
 
+
+
+
 static int safe_prologue_len(const unsigned char *code, int min_len) {
-    int reloc_offsets[HLMOD_MAX_RELOCATIONS], reloc_count = 0;
-    return safe_prologue_len_ex(code, min_len, reloc_offsets, HLMOD_MAX_RELOCATIONS, &reloc_count);
+    int reloc_offsets[HLMOD_MAX_RELOCATIONS], reloc_count = 0, call_count = 0;
+    return safe_prologue_len_ex(code, min_len, reloc_offsets, HLMOD_MAX_RELOCATIONS, &reloc_count, &call_count);
 }
 
 #define HLMOD_JUMP_SIZE 14
@@ -320,8 +371,8 @@ int hlmod_native_hook_ensure_installed(int findex, hl_type *signature) {
         return -1;
     }
     target = resolve_jmp_chain(target);
-    int reloc_offsets[HLMOD_MAX_RELOCATIONS], reloc_count = 0;
-    int safe_len = safe_prologue_len_ex((const unsigned char *)target, HLMOD_JUMP_SIZE, reloc_offsets, HLMOD_MAX_RELOCATIONS, &reloc_count);
+    int reloc_offsets[HLMOD_MAX_RELOCATIONS], reloc_count = 0, call_count = 0;
+    int safe_len = safe_prologue_len_ex((const unsigned char *)target, HLMOD_JUMP_SIZE, reloc_offsets, HLMOD_MAX_RELOCATIONS, &reloc_count, &call_count);
     if (safe_len < 0) {
         const unsigned char *b = (const unsigned char *)target;
         PyErr_Format(PyExc_RuntimeError,
@@ -342,7 +393,7 @@ int hlmod_native_hook_ensure_installed(int findex, hl_type *signature) {
      * guards against: fine until an exception needs to unwind through it,
      * then STATUS_BAD_FUNCTION_TABLE takes the whole process down. Refuse
      * rather than risk it. */
-    if (reloc_count > 0) {
+    if (call_count > 0) {
         PyErr_SetString(PyExc_RuntimeError,
             "Cannot safely hook this native on Windows: its prologue contains a call "
             "(e.g. a stack probe) that would need its own unwind metadata once copied "
@@ -359,23 +410,27 @@ int hlmod_native_hook_ensure_installed(int findex, hl_type *signature) {
         return -1;
     }
     memcpy(resume, target, safe_len);
-    /* `call rel32`'s displacement is relative to its own address, which
-     * differs between `target` and `resume`; recompute it so the copied
-     * call still reaches the exact same absolute destination. */
+    /* Every recorded relocation - a `call rel32` target or a
+     * `[rip+disp32]` data reference - stores a 4-byte displacement that is
+     * relative to the address of the instruction immediately following it
+     * (the x86-64 RIP-relative invariant applies identically to both), so
+     * one formula recomputes all of them: read the original absolute
+     * target using `target`'s copy of the displacement, then re-express it
+     * relative to `resume`'s copy at the same offset. */
     for (int i = 0; i < reloc_count; i++) {
         int off = reloc_offsets[i];
         int32_t old_disp;
-        memcpy(&old_disp, (const unsigned char *)target + off + 1, 4);
-        intptr_t call_target = (intptr_t)((const unsigned char *)target + off + 5) + old_disp;
-        intptr_t new_disp_wide = call_target - (intptr_t)((unsigned char *)resume + off + 5);
+        memcpy(&old_disp, (const unsigned char *)target + off, 4);
+        intptr_t abs_target = (intptr_t)((const unsigned char *)target + off + 4) + old_disp;
+        intptr_t new_disp_wide = abs_target - (intptr_t)((unsigned char *)resume + off + 4);
         if (new_disp_wide < INT32_MIN || new_disp_wide > INT32_MAX) {
             hl_free_executable_memory(resume, safe_len + HLMOD_JUMP_SIZE);
             PyErr_SetString(PyExc_RuntimeError,
-                "Cannot safely hook this native: a relocated call's target is out of 32-bit displacement range");
+                "Cannot safely hook this native: a relocated RIP-relative reference's target is out of 32-bit displacement range");
             return -1;
         }
         int32_t new_disp = (int32_t)new_disp_wide;
-        memcpy((unsigned char *)resume + off + 1, &new_disp, 4);
+        memcpy((unsigned char *)resume + off, &new_disp, 4);
     }
     write_jump((unsigned char *)resume + safe_len, (unsigned char *)target + safe_len);
 
