@@ -68,6 +68,7 @@ PyObject *hlmod_py_get_global(PyObject* self, PyObject* args);
 PyObject *hlmod_py_ensure_global(PyObject* self, PyObject* args);
 PyObject *hlmod_py_dump_stack(PyObject *self, PyObject *args);
 PyObject *hlmod_py_findex_for_name(PyObject *self, PyObject *args);
+PyObject *hlmod_py_type_index_for_name(PyObject *self, PyObject *args);
 PyObject *hlmod_py_profile_start(PyObject *self, PyObject *args);
 PyObject *hlmod_py_profile_end(PyObject *self, PyObject *args);
 PyObject *hlmod_py_gc_major(PyObject *self, PyObject *args);

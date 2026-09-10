@@ -55,6 +55,7 @@ static PyMethodDef HlmodMethods[] = {
     {"call_closure", hlmod_py_call_closure, METH_VARARGS, "Calls an HL closure by pointer."},
     {"dump_stack", hlmod_py_dump_stack, METH_NOARGS, "Dumps the current HL stack."},
     {"findex_for_name", hlmod_py_findex_for_name, METH_VARARGS, "Gets the findex for a specific function by its name"},
+    {"type_index_for_name", hlmod_py_type_index_for_name, METH_VARARGS, "Gets the bytecode type index of an obj/struct/enum by its full name."},
     {"native_findex", hlmod_py_native_findex, METH_VARARGS, "Gets the findex of a @:hlNative function by its (lib, name)."},
     {"native_hook_test_prologue", hlmod_py_native_hook_test_prologue, METH_VARARGS,
         "Testing hook: decodes a raw prologue buffer with the native-hook engine's own instruction decoder."},

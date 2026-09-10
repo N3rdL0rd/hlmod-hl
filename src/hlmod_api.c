@@ -271,6 +271,29 @@ PyObject *hlmod_py_findex_for_name(PyObject *self, PyObject *args)
     return NULL;
 }
 
+PyObject *hlmod_py_type_index_for_name(PyObject *self, PyObject *args)
+{
+    const char *name;
+    if (!PyArg_ParseTuple(args, "s", &name)) return NULL;
+    if (!g_code) {
+        PyErr_SetString(PyExc_RuntimeError, "hlmod is not initialized.");
+        return NULL;
+    }
+    for (int i = 0; i < g_code->ntypes; i++) {
+        hl_type *t = &g_code->types[i];
+        const uchar *type_name = NULL;
+        switch (t->kind) {
+            case HOBJ: case HSTRUCT: type_name = t->obj ? t->obj->name : NULL; break;
+            case HENUM: type_name = t->tenum ? t->tenum->name : NULL; break;
+            default: break;
+        }
+        if (!type_name) continue;
+        if (strcmp((char *)hl_to_utf8(type_name), name) == 0) return PyLong_FromLong(i);
+    }
+    PyErr_Format(PyExc_KeyError, "No obj/struct/enum type named \"%s\" in the loaded bytecode", name);
+    return NULL;
+}
+
 #pragma endregion
 #pragma region Call
 
