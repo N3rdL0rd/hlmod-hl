@@ -216,7 +216,10 @@ class Renderer:
                         else:
                             member.annotation = annotation
                 if isinstance(member, ast.FunctionDef):
-                    member.body = [ast.Expr(value=ast.Constant(value=Ellipsis))]
+                    first = member.body[0] if member.body else None
+                    docstring = (first if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                                and isinstance(first.value.value, str) else None)
+                    member.body = ([docstring] if docstring else []) + [ast.Expr(value=ast.Constant(value=Ellipsis))]
                     member.decorator_list = [decorator for decorator in member.decorator_list
                                              if isinstance(decorator, ast.Attribute) and decorator.attr == "staticmethod"]
                     static = bool(member.decorator_list)
@@ -339,6 +342,9 @@ class Renderer:
             prefix.append(f"    @hlfunction({method['findex']})")
         prefix.append(f"    def {name}({parameters}) -> {result}:")
         doc = self.member_doc(t, method["name"], "functions")
+        location = f"{func['file']}:{func['line']}" if "file" in func else None
+        if location:
+            doc = f"{doc}\n\n{location}" if doc else location
         if doc:
             prefix.append(f"        {doc!r}")
         if static_owner:

@@ -120,6 +120,19 @@ static PyObject *constructor_metadata(metadata_context *ctx) {
     return constructors;
 }
 
+/* Best-effort source location for a function's first opcode, when the bytecode
+ * was compiled with -debug. Absent on release builds; callers must tolerate
+ * the metadata keys being omitted. */
+static void add_debug_location(metadata_context *ctx, PyObject *node, hl_function *func) {
+    if (!ctx->code->hasdebug || !func->debug || func->nops <= 0) return;
+    int file = func->debug[0];
+    int line = func->debug[1];
+    if (file < 0 || file >= ctx->code->ndebugfiles) return;
+    set_item(ctx, node, "file", PyUnicode_FromStringAndSize(
+        ctx->code->debugfiles[file], ctx->code->debugfiles_lens[file]));
+    set_item(ctx, node, "line", PyLong_FromLong(line));
+}
+
 static PyObject *extract_metadata(hl_code *code) {
     metadata_context ctx = {.code = code};
     PyObject *root = Py_BuildValue("{s:s,s:i}",
@@ -139,6 +152,7 @@ static PyObject *extract_metadata(hl_code *code) {
                 append_item(&ctx, names, PyUnicode_FromString((const char *)hl_to_utf8(
                     hl_get_ustring(code, func->assigns[j].str_index))));
         }
+        add_debug_location(&ctx, node, func);
         set_item(&ctx, node, "arg_names", names);
         append_item(&ctx, functions, node);
     }
