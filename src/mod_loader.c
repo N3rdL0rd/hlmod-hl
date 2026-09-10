@@ -44,6 +44,7 @@ int get_mod_load_order(const char *mods_dir, PyObject **load_order_list) {
     }
     Py_DECREF(result);
 error:
+    fprintf(stderr, "[hlmod] Failed to resolve mod load order:\n");
     PyErr_Print();
     return 0;
 }
@@ -65,8 +66,8 @@ bool load_mod(PyObject *framework, PyObject *info) {
     printf("    -> Loading `%s`\n", module_name);
     PyObject *mod = PyObject_CallMethod(framework, "load_mod", "OOO", id, name, dependencies);
     if (mod == NULL) {
+        fprintf(stderr, "[hlmod] Failed to load mod '%s' - aborting startup:\n", module_name);
         PyErr_Print();
-        fprintf(stderr, "      [!] Error: Failed to load mod '%s'\n", module_name);
         return false;
     }
     Py_DECREF(mod);
