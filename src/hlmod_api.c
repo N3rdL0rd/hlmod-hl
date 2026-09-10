@@ -164,6 +164,53 @@ PyObject *hlmod_py_dump_stack(PyObject *self, PyObject *args)
     }
     Py_RETURN_NONE;
 }
+/* Exported by gc.c but, like the reflection primitives above, never
+ * declared in any shared header. */
+HL_API void hl_gc_stats( double *total_allocated, double *allocation_count, double *current_memory );
+HL_API void hl_gc_enable( bool b );
+
+PyObject *hlmod_py_gc_major(PyObject *self, PyObject *args)
+{
+    Py_BEGIN_ALLOW_THREADS
+    hl_gc_major();
+    Py_END_ALLOW_THREADS
+    Py_RETURN_NONE;
+}
+
+PyObject *hlmod_py_gc_stats(PyObject *self, PyObject *args)
+{
+    double total_allocated, allocation_count, current_memory;
+    hl_gc_stats(&total_allocated, &allocation_count, &current_memory);
+    return Py_BuildValue("{s:d,s:d,s:d}",
+        "total_allocated", total_allocated,
+        "allocation_count", allocation_count,
+        "current_memory", current_memory);
+}
+
+PyObject *hlmod_py_gc_enable(PyObject *self, PyObject *args)
+{
+    int enabled;
+    if (!PyArg_ParseTuple(args, "p", &enabled)) return NULL;
+    hl_gc_enable(enabled != 0);
+    Py_RETURN_NONE;
+}
+
+PyObject *hlmod_py_is_gc_ptr(PyObject *self, PyObject *args)
+{
+    HlPtr *pointer;
+    if (!PyArg_ParseTuple(args, "O!", &HlPtrType, &pointer)) return NULL;
+    if (hl_is_gc_ptr(pointer->ptr)) Py_RETURN_TRUE;
+    Py_RETURN_FALSE;
+}
+
+PyObject *hlmod_py_gc_memsize(PyObject *self, PyObject *args)
+{
+    HlPtr *pointer;
+    if (!PyArg_ParseTuple(args, "O!", &HlPtrType, &pointer)) return NULL;
+    if (!hl_is_gc_ptr(pointer->ptr)) Py_RETURN_NONE;
+    return PyLong_FromLong(hl_gc_get_memsize(pointer->ptr));
+}
+
 
 PyObject *hlmod_py_profile_start(PyObject *self, PyObject *args)
 {

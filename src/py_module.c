@@ -60,6 +60,11 @@ static PyMethodDef HlmodMethods[] = {
         "Testing hook: decodes a raw prologue buffer with the native-hook engine's own instruction decoder."},
     {"profile_start", hlmod_py_profile_start, METH_VARARGS, "Starts the HL sampling profiler at the given samples/sec (default 1000)."},
     {"profile_end", hlmod_py_profile_end, METH_NOARGS, "Stops the profiler and writes hlprofile.dump."},
+    {"gc_major", hlmod_py_gc_major, METH_NOARGS, "Forces a full GC collection cycle."},
+    {"gc_stats", hlmod_py_gc_stats, METH_NOARGS, "Returns a dict of total_allocated/allocation_count/current_memory."},
+    {"gc_enable", hlmod_py_gc_enable, METH_VARARGS, "Enables or disables the GC."},
+    {"is_gc_ptr", hlmod_py_is_gc_ptr, METH_VARARGS, "Returns whether an HlPtr points into GC-managed memory."},
+    {"gc_memsize", hlmod_py_gc_memsize, METH_VARARGS, "Returns the GC allocation size of an HlPtr, or None if not GC-managed."},
     {NULL, NULL, 0, NULL}
 };
 static struct PyModuleDef hlmod_module_def = {

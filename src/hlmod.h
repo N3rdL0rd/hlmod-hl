@@ -70,6 +70,11 @@ PyObject *hlmod_py_dump_stack(PyObject *self, PyObject *args);
 PyObject *hlmod_py_findex_for_name(PyObject *self, PyObject *args);
 PyObject *hlmod_py_profile_start(PyObject *self, PyObject *args);
 PyObject *hlmod_py_profile_end(PyObject *self, PyObject *args);
+PyObject *hlmod_py_gc_major(PyObject *self, PyObject *args);
+PyObject *hlmod_py_gc_stats(PyObject *self, PyObject *args);
+PyObject *hlmod_py_gc_enable(PyObject *self, PyObject *args);
+PyObject *hlmod_py_is_gc_ptr(PyObject *self, PyObject *args);
+PyObject *hlmod_py_gc_memsize(PyObject *self, PyObject *args);
 
 extern THREAD_LOCAL int64_t g_return_value_int;
 extern THREAD_LOCAL double g_return_value_double;
