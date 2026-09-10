@@ -284,25 +284,44 @@ static int decode_one(const unsigned char *code, int *out_len, int *is_terminal,
         if (modrm_is_rip_relative(code + mstart)) *reloc_disp_offset = mstart + mlen - 4;
         return 1;
     }
-    case 0x69:
-        if (modrm_is_rip_relative(code + i + 1)) return 0; /* disp precedes a trailing imm32; see doc comment */
-        *out_len = i + 1 + modrm_len(code + i + 1) + 4;
+    /* 0x69/0x6B (IMUL r, r/m, imm) and 0x80/0x81/0x83/0xC6/0xC7 (group 1
+     * arithmetic/mov with an immediate) all pair a ModRM memory operand
+     * with a trailing immediate. `modrm_len` only measures the ModRM+SIB
+     * +disp portion - never the immediate after it - so a RIP-relative
+     * disp32 here sits at exactly the same `mstart + mlen - 4` position as
+     * every other case below; the trailing immediate doesn't change that,
+     * it only affects where the *next* instruction starts. */
+    case 0x69: {
+        int mstart = i + 1;
+        int mlen = modrm_len(code + mstart);
+        *out_len = mstart + mlen + 4;
+        if (modrm_is_rip_relative(code + mstart)) *reloc_disp_offset = mstart + mlen - 4;
         return 1;
-    case 0x6B:
-        if (modrm_is_rip_relative(code + i + 1)) return 0;
-        *out_len = i + 1 + modrm_len(code + i + 1) + 1;
+    }
+    case 0x6B: {
+        int mstart = i + 1;
+        int mlen = modrm_len(code + mstart);
+        *out_len = mstart + mlen + 1;
+        if (modrm_is_rip_relative(code + mstart)) *reloc_disp_offset = mstart + mlen - 4;
         return 1;
+    }
     case 0x80:
     case 0x83:
-    case 0xC6:
-        if (modrm_is_rip_relative(code + i + 1)) return 0;
-        *out_len = i + 1 + modrm_len(code + i + 1) + 1;
+    case 0xC6: {
+        int mstart = i + 1;
+        int mlen = modrm_len(code + mstart);
+        *out_len = mstart + mlen + 1;
+        if (modrm_is_rip_relative(code + mstart)) *reloc_disp_offset = mstart + mlen - 4;
         return 1;
+    }
     case 0x81:
-    case 0xC7:
-        if (modrm_is_rip_relative(code + i + 1)) return 0;
-        *out_len = i + 1 + modrm_len(code + i + 1) + 4;
+    case 0xC7: {
+        int mstart = i + 1;
+        int mlen = modrm_len(code + mstart);
+        *out_len = mstart + mlen + 4;
+        if (modrm_is_rip_relative(code + mstart)) *reloc_disp_offset = mstart + mlen - 4;
         return 1;
+    }
     case 0xFF: {
         unsigned char modrm = code[i + 1];
         int reg = (modrm >> 3) & 7;
