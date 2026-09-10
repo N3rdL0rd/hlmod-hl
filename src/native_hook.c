@@ -24,6 +24,7 @@
 #include "native_hook.h"
 #include <string.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #if defined(HL_WIN)
 /* hl.h's own _GUID macro (a native type-signature string constant) collides
@@ -319,7 +320,12 @@ static void register_landing_unwind_info(void *code, int codesize) {
     blob->fn.BeginAddress = 0;
     blob->fn.EndAddress = (DWORD)codesize;
     blob->fn.UnwindData = (DWORD)blob_off;
-    RtlAddFunctionTable(&blob->fn, 1, (DWORD64)(uintptr_t)code);
+    BOOLEAN added = RtlAddFunctionTable(&blob->fn, 1, (DWORD64)(uintptr_t)code);
+    DWORD64 imagebase = 0;
+    PRUNTIME_FUNCTION found = RtlLookupFunctionEntry((DWORD64)(uintptr_t)code, &imagebase, NULL);
+    fprintf(stderr, "HLMOD_DEBUG unwind: added=%d found=%p imagebase=0x%llX code=%p blob_off=%zu\n",
+        (int)added, (void *)found, (unsigned long long)imagebase, code, blob_off);
+    fflush(stderr);
 }
 #endif
 
