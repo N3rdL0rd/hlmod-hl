@@ -167,12 +167,18 @@ HL_PRIM void hl_sys_print( vbyte *msg ) {
 #	if defined(HL_XBO) || defined(HL_XBS)
 	OutputDebugStringW((LPCWSTR)msg);
 #	else
-#	ifdef HL_WIN_DESKTOP
+#	if defined(HL_WIN_DESKTOP) && !defined(HL_MINGW)
+	/* On MinGW, uprintf (hl.h) is hl_mingw_uprintf (ucs2.c): a narrow,
+	 * already-UTF-8-encoded printf, not wprintf - putting stdout into wide
+	 * text mode around a narrow write is undefined behavior on the CRT's
+	 * I/O layer and was observed to silently swallow the output entirely
+	 * rather than garble it. MSVC's uprintf is still the real wprintf, so
+	 * it still needs this toggle. */
 	if( print_flags & PR_WIN_UTF8 ) _setmode(_fileno(stdout),_O_U8TEXT);
 #	endif
 	uprintf(USTR("%s"),(uchar*)msg);
 	if( print_flags & PR_AUTO_FLUSH ) fflush(stdout);
-#	ifdef HL_WIN_DESKTOP
+#	if defined(HL_WIN_DESKTOP) && !defined(HL_MINGW)
 	if( print_flags & PR_WIN_UTF8 ) _setmode(_fileno(stdout),_O_TEXT);
 #	endif
 
