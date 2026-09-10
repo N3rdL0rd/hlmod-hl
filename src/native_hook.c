@@ -36,6 +36,71 @@
 #include <unistd.h>
 #endif
 
+#if defined(HL_WIN) && defined(HL_64)
+/* `hl_alloc_executable_memory` (gc.c) places HL's own JIT arena at a fixed,
+ * far-away address on Windows x64, chosen once for the whole process and
+ * never revisited - fine for JIT'd Haxe code, which never uses RIP-relative
+ * addressing (every constant is baked in as a 64-bit immediate, since it's
+ * hand-emitted, not compiler output). The `resume` trampoline below is
+ * different: it's a byte-for-byte copy of a *compiler-emitted* native's own
+ * prologue, which may contain genuine `[rip+disp32]` references to that
+ * compilation unit's constant pool (see decode_one) - and those only stay
+ * valid after copying if the copy lands within +/-2GB of the original, a
+ * bound the far-away shared JIT arena routinely blows past. This walks the
+ * address space via VirtualQuery outward from `hint` (the native's own
+ * address) looking for a free region close enough, the same technique
+ * inline-hooking libraries (e.g. minhook) use to keep detours relocatable. */
+static void *hlmod_alloc_near(void *hint, size_t size) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    uintptr_t granularity = si.dwAllocationGranularity;
+    uintptr_t base = (uintptr_t)hint & ~(granularity - 1);
+    /* Leave slack below the true +/-2GB rel32 bound: the reference being
+     * relocated can sit anywhere inside this allocation, not just at its
+     * start, and the reachable window is measured from the reference's
+     * own address, not the allocation's. */
+    const uintptr_t max_distance = 0x70000000;
+    uintptr_t lo_probe = base, hi_probe = base;
+    bool lo_alive = true, hi_alive = true;
+    while (lo_alive || hi_alive) {
+        if (hi_alive) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (hi_probe - base > max_distance || VirtualQuery((void *)hi_probe, &mbi, sizeof(mbi)) == 0) {
+                hi_alive = false;
+            } else {
+                uintptr_t region_base = (uintptr_t)mbi.BaseAddress;
+                uintptr_t candidate = region_base > hi_probe ? region_base : hi_probe;
+                candidate = (candidate + granularity - 1) & ~(granularity - 1);
+                if (mbi.State == MEM_FREE && candidate - base <= max_distance &&
+                    region_base + mbi.RegionSize >= candidate + size) {
+                    void *mem = VirtualAlloc((void *)candidate, size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+                    if (mem) return mem;
+                }
+                hi_probe = region_base + mbi.RegionSize;
+            }
+        }
+        if (lo_alive) {
+            MEMORY_BASIC_INFORMATION mbi;
+            if (base - lo_probe > max_distance || lo_probe == 0 || VirtualQuery((void *)(lo_probe - 1), &mbi, sizeof(mbi)) == 0) {
+                lo_alive = false;
+            } else {
+                uintptr_t region_base = (uintptr_t)mbi.BaseAddress;
+                uintptr_t region_end = region_base + mbi.RegionSize;
+                uintptr_t candidate = (region_end >= lo_probe ? lo_probe : region_end);
+                if (candidate > size) candidate -= size; else candidate = 0;
+                candidate &= ~(granularity - 1);
+                if (mbi.State == MEM_FREE && candidate >= region_base && base - candidate <= max_distance) {
+                    void *mem = VirtualAlloc((void *)candidate, size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+                    if (mem) return mem;
+                }
+                lo_probe = region_base;
+            }
+        }
+    }
+    return NULL; /* caller falls back to the far-away shared JIT arena */
+}
+#endif
+
 typedef struct InstalledNativeHook {
     int findex;
     void *landing;
@@ -404,7 +469,15 @@ int hlmod_native_hook_ensure_installed(int findex, hl_type *signature) {
     }
 #endif
 
+#if defined(HL_WIN) && defined(HL_64)
+    /* Only worth the address-space walk when there's something to
+     * relocate; a leaf-shaped resume with no RIP-relative references or
+     * calls is unaffected by where it lands. */
+    void *resume = reloc_count > 0 ? hlmod_alloc_near(target, safe_len + HLMOD_JUMP_SIZE) : NULL;
+    if (!resume) resume = hl_alloc_executable_memory(safe_len + HLMOD_JUMP_SIZE);
+#else
     void *resume = hl_alloc_executable_memory(safe_len + HLMOD_JUMP_SIZE);
+#endif
     if (!resume) {
         PyErr_NoMemory();
         return -1;
