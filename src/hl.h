@@ -244,7 +244,24 @@ typedef wchar_t	uchar;
 #	define USTR(str)	L##str
 #	define HL_NATIVE_UCHAR_FUN
 #	define usprintf		swprintf
-#	define uprintf		wprintf
+#	ifdef HL_MINGW
+/* `_setmode(_fileno(stdout), _O_U8TEXT)` (see hl_sys_print, std/sys.c) only
+ * makes `wprintf` transcode UTF-16 -> UTF-8 on the modern UCRT that MSVC
+ * links against. MinGW-w64 defaults to the legacy `msvcrt.dll`, which
+ * predates `_O_U8TEXT` entirely and silently ignores it, leaving `wprintf`
+ * to write raw UTF-16LE bytes into byte-mode stdout - every reader downstream
+ * (this test suite's own subprocess capture included) then sees only the
+ * first character before the embedded NUL byte that follows it. Route
+ * `uprintf` (used by hl_sys_print and hl_print_uncaught_exception for every
+ * Sys.print/println and uncaught-exception trace) through a hand-rolled,
+ * locale-independent UTF-16 -> UTF-8 encoder and a plain byte-mode
+ * `printf` instead, sidestepping the CRT's console-mode machinery
+ * entirely. MSVC keeps the `wprintf` fast path below unchanged. */
+HL_API void hl_mingw_uprintf( const uchar *fmt, const uchar *str );
+#		define uprintf		hl_mingw_uprintf
+#	else
+#		define uprintf		wprintf
+#	endif
 #	define ustrlen		wcslen
 #	define ustrdup		_wcsdup
 HL_API int uvszprintf( uchar *out, int out_size, const uchar *fmt, va_list arglist );

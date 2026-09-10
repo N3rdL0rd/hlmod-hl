@@ -272,3 +272,75 @@ sprintf_add:
 }
 
 #endif
+
+#ifdef HL_MINGW
+
+/* Self-contained MinGW counterpart to the UTF-16 -> UTF-8 encoder above
+ * (that one is compiled out on Windows by HL_NATIVE_UCHAR_FUN). See the
+ * comment on the `uprintf` macro in hl.h for why MinGW can't just use
+ * `wprintf` + `_setmode(_O_U8TEXT)` the way MSVC does. `fmt` is always one
+ * of hlmod-hl's own fixed format strings ("%s\n" or "Uncaught exception:
+ * %s\n" etc., see error.c/module.c/sys.c) with exactly one `%s`, never
+ * user-controlled - it is encoded byte-for-byte via the same escape below
+ * as `str`, so any literal `%` in a translated message would need
+ * doubling, but none of these format strings contain one. */
+static int hlmod_mingw_utf16_to_utf8_len( const uchar *str ) {
+	int size = 0;
+	while(1) {
+		uchar c = *str++;
+		if( c == 0 ) break;
+		if( c < 0x80 ) size++;
+		else if( c < 0x800 ) size += 2;
+		else if( c >= 0xD800 && c <= 0xDFFF ) { str++; size += 4; }
+		else size += 3;
+	}
+	return size;
+}
+
+static int hlmod_mingw_utf16_to_utf8( char *out, int out_size, const uchar *str ) {
+	char *start = out;
+	char *end = out + out_size - 1;
+	if( out_size <= 0 ) return 0;
+	while( out < end ) {
+		unsigned int c = *str++;
+		if( c == 0 ) break;
+		if( c < 0x80 )
+			*out++ = (char)c;
+		else if( c < 0x800 ) {
+			if( out + 2 > end ) break;
+			*out++ = (char)(0xC0|(c>>6));
+			*out++ = 0x80|(c&63);
+		} else if( c >= 0xD800 && c <= 0xDFFF ) {
+			if( out + 4 > end ) break;
+			unsigned int full = (((c - 0xD800) << 10) | ((*str++) - 0xDC00)) + 0x10000;
+			*out++ = (char)(0xF0|(full>>18));
+			*out++ = 0x80|((full>>12)&63);
+			*out++ = 0x80|((full>>6)&63);
+			*out++ = 0x80|(full&63);
+		} else {
+			if( out + 3 > end ) break;
+			*out++ = (char)(0xE0|(c>>12));
+			*out++ = 0x80|((c>>6)&63);
+			*out++ = 0x80|(c&63);
+		}
+	}
+	*out = 0;
+	return (int)(out - start);
+}
+
+static char *hlmod_mingw_utos( const uchar *s ) {
+	int len = hlmod_mingw_utf16_to_utf8_len(s);
+	char *out = (char*)malloc(len + 1);
+	if( out ) hlmod_mingw_utf16_to_utf8(out,len+1,s);
+	return out;
+}
+
+void hl_mingw_uprintf( const uchar *fmt, const uchar *str ) {
+	char *cfmt = hlmod_mingw_utos(fmt);
+	char *cstr = hlmod_mingw_utos(str);
+	if( cfmt && cstr ) printf(cfmt,cstr);
+	free(cfmt);
+	free(cstr);
+}
+
+#endif
