@@ -4985,10 +4985,30 @@ void *hl_jit_code( jit_ctx *ctx, hl_module *m, int *codesize, hl_debug_infos **d
 	jlist *c;
 	int size = BUF_POS();
 	unsigned char *code;
+#if defined(HL_WIN) && defined(HL_64)
+	/* Guarantee room for the unwind blob hlmod_register_jit_stub_unwind
+	 * writes below, regardless of whether BUF_POS() already happens to be
+	 * page-aligned (in which case plain round-up-to-4096 would add zero
+	 * padding and the blob write would corrupt the tail of real code). */
+	size += sizeof(HlmodUnwindBlob);
+#endif
 	if( size & 4095 ) size += 4096 - (size&4095);
 	code = (unsigned char*)hl_alloc_executable_memory(size);
 	if( code == NULL ) return NULL;
 	memcpy(code,ctx->startBuf,BUF_POS());
+#if defined(HL_WIN) && defined(HL_64)
+	/* Every compiled Haxe function (op_enter, jit.c) and every internal
+	 * trampoline sharing this buffer (jit_c2hl, jit_hl2c, jit_null_access,
+	 * jit_assert, jit_null_field_access) starts with the identical `push
+	 * rbp; mov rbp, rsp` prologue - the same shape hlmod_register_jit_stub_unwind
+	 * already describes for its own two adapters above. One blanket entry
+	 * spanning the whole buffer is therefore enough to keep any exception
+	 * that needs to unwind through a *regular* JIT'd Haxe frame (e.g. one
+	 * that called into a hlmod native hook or Python override, see above)
+	 * from hitting STATUS_BAD_FUNCTION_TABLE, without needing separate,
+	 * precise per-function unwind info. */
+	hlmod_register_jit_stub_unwind(code, size);
+#endif
 	*codesize = size;
 	*debug = ctx->debug;
 	if( !call_jit_c2hl ) {
