@@ -256,6 +256,7 @@ if (WITH_VM)
         src/mod_loader.c
         src/console_proxy.c
         src/py_module.c
+        src/hlmod_repl.c
     )
 
     if(MSVC)

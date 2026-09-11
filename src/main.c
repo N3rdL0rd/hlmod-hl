@@ -30,6 +30,7 @@
 #include <hlmod.h>
 #include <hlmod_codegen.h>
 #include <hlmod_python.h>
+#include "hlmod_repl.h"
 
 #include "platform.h"
 #include "bytecode_loader.h"
@@ -273,6 +274,14 @@ int main(int argc, pchar *argv[]) {
     Py_DECREF(loaded);
     printf("[hlmod] All mods initialized.\n\n");
 
+    const char *repl_port_str = getenv("HLMOD_REPL_PORT");
+    if (repl_port_str != NULL) {
+        int repl_port = atoi(repl_port_str);
+        if (repl_port <= 0 || repl_port > 65535 || !hlmod_repl_start(repl_port)) {
+            fprintf(stderr, "[hlmod] Could not start REPL on port '%s'.\n", repl_port_str);
+        }
+    }
+
 	cl.t = ctx.code->functions[ctx.m->functions_indexes[ctx.m->code->entrypoint]].type;
 	cl.fun = ctx.m->functions_ptrs[ctx.m->code->entrypoint];
 	cl.hasValue = 0;
@@ -289,6 +298,7 @@ int main(int argc, pchar *argv[]) {
     // Re-acquire the GIL before finalizing Python.
     PyEval_RestoreThread(_save);
 shutdown:
+    hlmod_repl_stop();
     if (framework != NULL) {
         PyObject *stopped = PyObject_CallMethod(framework, "shutdown", NULL);
         if (stopped == NULL) { PyErr_Print(); exit_code = 1; }
